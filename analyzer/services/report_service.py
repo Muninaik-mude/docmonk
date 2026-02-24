@@ -37,6 +37,7 @@ COLOR_RULE   = "#dee2e6"
 BG_RED    = "#fde8e8"
 BG_GREEN  = "#d4edda"
 BG_ORANGE = "#fff3cd"
+BG_BLUE   = "#e8f0fe"   # Document Evidence excerpt background
 
 # Risk level colors (text)
 COLOR_RISK = {
@@ -61,6 +62,11 @@ _LEGAL_KEYWORDS = [
     "subletting", "assignment", "permitted use", "entire agreement",
     "force majeure", "jurisdiction", "liabilit",
 ]
+_FINANCIAL_KEYWORDS = [
+    "penalty", "deposit", "escalation", "fine", "compensation",
+    "damages", "payment schedule", "late fee", "interest",
+    "advance", "refund", "forfeit",
+]
 _OPERATIONAL_KEYWORDS = [
     "rent", "lease term", "security deposit", "maintenance", "repair",
     "utilities", "insurance", "renewal", "alteration", "property",
@@ -71,13 +77,14 @@ _PROCESS_KEYWORDS = [
     "signatory", "execution",
 ]
 
-CATEGORY_ORDER = ["Legal Risk", "Operational Risk", "Process Risk", "General"]
+CATEGORY_ORDER = ["Legal Risk", "Financial Risk", "Operational Risk", "Process Risk", "General"]
 
 _CATEGORY_RISK_LEVEL = {
-    "Legal Risk":      ("HIGH",   COLOR_RISK["HIGH"]),
+    "Legal Risk":       ("HIGH",   COLOR_RISK["HIGH"]),
+    "Financial Risk":   ("HIGH",   COLOR_RISK["HIGH"]),
     "Operational Risk": ("MEDIUM", COLOR_RISK["MEDIUM"]),
-    "Process Risk":    ("LOW",    COLOR_RISK["LOW"]),
-    "General":         ("MEDIUM", COLOR_RISK["MEDIUM"]),
+    "Process Risk":     ("LOW",    COLOR_RISK["LOW"]),
+    "General":          ("MEDIUM", COLOR_RISK["MEDIUM"]),
 }
 
 
@@ -85,6 +92,7 @@ def _get_risk_info(clause_title: str) -> tuple[str, str]:
     """
     Returns (category, risk_level) based on clause title keyword matching.
       Legal Risk      → HIGH
+      Financial Risk  → HIGH
       Operational Risk → MEDIUM
       Process Risk    → LOW
     """
@@ -92,6 +100,9 @@ def _get_risk_info(clause_title: str) -> tuple[str, str]:
     for kw in _LEGAL_KEYWORDS:
         if kw in t:
             return "Legal Risk", "HIGH"
+    for kw in _FINANCIAL_KEYWORDS:
+        if kw in t:
+            return "Financial Risk", "HIGH"
     for kw in _OPERATIONAL_KEYWORDS:
         if kw in t:
             return "Operational Risk", "MEDIUM"
@@ -101,7 +112,7 @@ def _get_risk_info(clause_title: str) -> tuple[str, str]:
     return "General", "MEDIUM"
 
 
-# ── Helper ──────────────────────────────────────────────────────────────────────
+# ── ReportLab helpers ────────────────────────────────────────────────────────────
 
 def _bg_row(text: str, bg_hex: str, style: ParagraphStyle) -> Table:
     """Wrap a Paragraph in a full-width single-cell Table with a background color."""
@@ -116,16 +127,44 @@ def _bg_row(text: str, bg_hex: str, style: ParagraphStyle) -> Table:
     return tbl
 
 
+def _dark_header_table(data: list, col_widths: list) -> Table:
+    """Build a table with a dark header row and alternating body rows."""
+    tbl = Table(data, colWidths=col_widths)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor(COLOR_DARK)),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f8f9fa"), colors.white]),
+        ("GRID",           (0, 0), (-1, -1), 0.4, colors.HexColor(COLOR_RULE)),
+        ("TOPPADDING",     (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
+        ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return tbl
+
+
 # ── PDF Report ──────────────────────────────────────────────────────────────────
 
-def generate_pdf_report(analysis_summary: list) -> bytes:
+def generate_pdf_report(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+) -> bytes:
     """
     Generate a color-coded PDF compliance report with:
       - Overall compliance score
-      - Risk category breakdown table (Legal / Operational / Process)
-      - Per-clause risk level badge + status badge
-      - Colored backgrounds for VIOLATION / NOT_FOUND / MATCH
+      - Red Flag summary (top 3 critical issues)
+      - Risk category breakdown table (Legal / Financial / Operational / Process)
+      - Jurisdiction & compliance checklist
+      - Clause conflict detection results
+      - Contract timeline (aggregated key dates/durations)
+      - Per-clause details: risk/status badges, obligations, binding strength,
+        missing values warning, clause content, AI recommendation
     """
+    conflicts = conflicts or []
+    jurisdiction_info = jurisdiction_info or {}
+
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -211,6 +250,11 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
         "RTblCell", parent=S["Normal"],
         fontSize=8, alignment=TA_CENTER,
     )
+    warning_style = ParagraphStyle(
+        "RWarning", parent=S["Normal"],
+        fontSize=8, leading=12, fontName="Helvetica-Oblique",
+        textColor=colors.HexColor(COLOR_ORANGE),
+    )
 
     story = []
 
@@ -259,7 +303,7 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
         summary_style,
     ))
 
-    # ── Overall compliance score (side-by-side: label left, number right) ──────
+    # ── Overall compliance score ──────────────────────────────────────────────
     score_tbl = Table(
         [[
             Paragraph(
@@ -284,6 +328,54 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
     ]))
     story.append(score_tbl)
     story.append(Spacer(1, 8))
+
+    # ── Red Flag Summary ──────────────────────────────────────────────────────
+    red_flags = [e for e in analysis_summary if e["result"] == "VIOLATION"]
+    red_flags += [e for e in analysis_summary if e["result"] == "NOT_FOUND"]
+    red_flags = red_flags[:3]
+
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Critical Issues Requiring Immediate Attention", section_header_style))
+
+    if not red_flags:
+        story.append(Paragraph(
+            f'<font color="{COLOR_GREEN}">No critical issues found.</font>',
+            inner_style,
+        ))
+    else:
+        flag_data = [[
+            Paragraph("Clause", tbl_header_style),
+            Paragraph("Status", tbl_header_style),
+            Paragraph("Issue", tbl_header_style),
+        ]]
+        for flag in red_flags:
+            flag_color = COLOR_RED if flag["result"] == "VIOLATION" else COLOR_ORANGE
+            flag_data.append([
+                Paragraph(flag["clause_title"], tbl_cell_style),
+                Paragraph(
+                    f'<font color="{flag_color}"><b>{flag["result"]}</b></font>',
+                    tbl_cell_style,
+                ),
+                Paragraph(flag.get("reason", ""), tbl_cell_style),
+            ])
+        flag_tbl = Table(
+            flag_data,
+            colWidths=[PAGE_USABLE_W * 0.30, PAGE_USABLE_W * 0.18, PAGE_USABLE_W * 0.52],
+        )
+        flag_tbl.setStyle(TableStyle([
+            ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor(COLOR_DARK)),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.HexColor(BG_RED), colors.HexColor("#fff5f5")]),
+            ("GRID",           (0, 0), (-1, -1), 0.4, colors.HexColor(COLOR_RULE)),
+            ("TOPPADDING",     (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
+            ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(flag_tbl)
+    story.append(Spacer(1, 10))
 
     # ── Risk Category Breakdown table ─────────────────────────────────────────
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
@@ -320,10 +412,10 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
     cat_tbl = Table(
         cat_data,
         colWidths=[
-            PAGE_USABLE_W * 0.30,
+            PAGE_USABLE_W * 0.28,
             PAGE_USABLE_W * 0.18,
-            PAGE_USABLE_W * 0.17,
-            PAGE_USABLE_W * 0.17,
+            PAGE_USABLE_W * 0.18,
+            PAGE_USABLE_W * 0.18,
             PAGE_USABLE_W * 0.18,
         ],
     )
@@ -340,6 +432,117 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
     story.append(cat_tbl)
     story.append(Spacer(1, 10))
 
+    # ── Jurisdiction & Compliance Checklist ───────────────────────────────────
+    if jurisdiction_info:
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Jurisdiction & Compliance Checklist", section_header_style))
+
+        juris     = jurisdiction_info.get("jurisdiction", "Unknown")
+        agmt_type = jurisdiction_info.get("agreement_type", "Unknown")
+        laws      = ", ".join(jurisdiction_info.get("applicable_laws", []))
+
+        story.append(Paragraph(
+            f'<b>Jurisdiction:</b> {juris} &nbsp;&nbsp; <b>Agreement Type:</b> {agmt_type}',
+            inner_style,
+        ))
+        if laws:
+            story.append(Paragraph(f'<b>Applicable Laws:</b> {laws}', inner_style))
+        story.append(Spacer(1, 4))
+
+        checklist = jurisdiction_info.get("checklist", [])
+        if checklist:
+            chk_data = [[
+                Paragraph("Requirement", tbl_header_style),
+                Paragraph("Status",      tbl_header_style),
+            ]]
+            for item in checklist:
+                is_required = item.get("required", False)
+                req_label   = "Required" if is_required else "Optional"
+                req_color   = COLOR_RED if is_required else COLOR_GREEN
+                chk_data.append([
+                    Paragraph(item.get("item", ""), tbl_cell_style),
+                    Paragraph(
+                        f'<font color="{req_color}"><b>{req_label}</b></font>',
+                        tbl_cell_style,
+                    ),
+                ])
+            story.append(_dark_header_table(
+                chk_data,
+                [PAGE_USABLE_W * 0.75, PAGE_USABLE_W * 0.25],
+            ))
+        story.append(Spacer(1, 10))
+
+    # ── Clause Conflicts ──────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Clause Conflicts", section_header_style))
+
+    if not conflicts:
+        story.append(Paragraph(
+            f'<font color="{COLOR_GREEN}">No contradictions detected.</font>',
+            inner_style,
+        ))
+    else:
+        conf_data = [[
+            Paragraph("Clause A",            tbl_header_style),
+            Paragraph("Clause B",            tbl_header_style),
+            Paragraph("Conflict Description", tbl_header_style),
+        ]]
+        for conflict in conflicts:
+            conf_data.append([
+                Paragraph(conflict.get("clause_a", ""),  tbl_cell_style),
+                Paragraph(conflict.get("clause_b", ""),  tbl_cell_style),
+                Paragraph(conflict.get("conflict", ""),  tbl_cell_style),
+            ])
+        conf_tbl = Table(
+            conf_data,
+            colWidths=[PAGE_USABLE_W * 0.27, PAGE_USABLE_W * 0.27, PAGE_USABLE_W * 0.46],
+        )
+        conf_tbl.setStyle(TableStyle([
+            ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor(COLOR_DARK)),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.HexColor(BG_ORANGE), colors.HexColor("#fffdf5")]),
+            ("GRID",           (0, 0), (-1, -1), 0.4, colors.HexColor(COLOR_RULE)),
+            ("TOPPADDING",     (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
+            ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(conf_tbl)
+    story.append(Spacer(1, 10))
+
+    # ── Contract Timeline ─────────────────────────────────────────────────────
+    timeline_rows = [
+        (entry["clause_title"], dt)
+        for entry in analysis_summary
+        for dt in entry.get("key_dates_durations", [])
+        if dt
+    ]
+
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Contract Timeline", section_header_style))
+
+    if not timeline_rows:
+        story.append(Paragraph("No key dates or durations identified.", inner_style))
+    else:
+        tl_data = [[
+            Paragraph("Clause",        tbl_header_style),
+            Paragraph("Timeline Item", tbl_header_style),
+        ]]
+        for clause_title, tl_item in timeline_rows:
+            tl_data.append([
+                Paragraph(clause_title, tbl_cell_style),
+                Paragraph(tl_item,      tbl_cell_style),
+            ])
+        story.append(_dark_header_table(
+            tl_data,
+            [PAGE_USABLE_W * 0.40, PAGE_USABLE_W * 0.60],
+        ))
+    story.append(Spacer(1, 10))
+
     # ── Clause details section ────────────────────────────────────────────────
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
     story.append(Spacer(1, 6))
@@ -351,6 +554,10 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
         clause_title   = entry.get("clause_title", "")
         clause_content = entry.get("clause_content", "")
         ai_text        = entry.get("ai_added_text", "")
+        relevant_text  = entry.get("relevant_text") or ""
+        parties        = entry.get("parties_obligated", [])
+        binding        = entry.get("binding_strength", "VAGUE")
+        missing        = entry.get("missing_values", [])
 
         category, risk_level = _get_risk_info(clause_title)
         risk_color = COLOR_RISK[risk_level]
@@ -373,6 +580,14 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
             clause_bg    = None
             ai_bg        = None
             ai_label     = None
+
+        # Binding strength color
+        if binding == "MUST/SHALL":
+            binding_color = COLOR_GREEN
+        elif binding == "SHOULD":
+            binding_color = COLOR_ORANGE
+        else:
+            binding_color = COLOR_RED
 
         # ── Header row: "N. Title"  |  [RISK LEVEL]  |  [STATUS] ──────────────
         header_tbl = Table(
@@ -402,12 +617,54 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
         ]))
         story.append(header_tbl)
 
+        # ── Obligations + Binding Strength ────────────────────────────────────
+        parties_str = " / ".join(parties) if parties else "—"
+        meta_tbl = Table(
+            [[
+                Paragraph(
+                    f'<font color="{COLOR_GREY}">Obligations: <b>{parties_str}</b></font>',
+                    inner_style,
+                ),
+                Paragraph(
+                    f'<font color="{binding_color}"><b>Binding: {binding}</b></font>',
+                    risk_badge_style,
+                ),
+            ]],
+            colWidths=[PAGE_USABLE_W * 0.60, PAGE_USABLE_W * 0.40],
+        )
+        meta_tbl.setStyle(TableStyle([
+            ("TOPPADDING",    (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ]))
+        story.append(meta_tbl)
+
+        # ── Missing Values warning ────────────────────────────────────────────
+        if missing:
+            warning_text = "Missing values: " + "; ".join(missing)
+            story.append(_bg_row(f"\u26a0  {warning_text}", BG_ORANGE, warning_style))
+            story.append(Spacer(1, 2))
+
         # ── Clause content row ────────────────────────────────────────────────
         if clause_content:
             if clause_bg:
                 story.append(_bg_row(f"Clause: {clause_content}", clause_bg, inner_style))
             else:
                 story.append(Paragraph(f"Clause: {clause_content}", plain_text_style))
+            story.append(Spacer(1, 2))
+
+        # ── Document Evidence row (relevant_text from PDF) ────────────────────
+        if relevant_text:
+            doc_evidence_style = ParagraphStyle(
+                f"RDocEvidence_{idx}", parent=inner_italic_style,
+                textColor=colors.HexColor("#1a3a5c"),
+            )
+            story.append(_bg_row(
+                f'<font color="#1a3a5c"><b>Document Evidence:</b></font> {relevant_text}',
+                BG_BLUE,
+                doc_evidence_style,
+            ))
             story.append(Spacer(1, 2))
 
         # ── AI recommendation row ─────────────────────────────────────────────
@@ -424,11 +681,16 @@ def generate_pdf_report(analysis_summary: list) -> bytes:
 
 # ── Markdown Report ─────────────────────────────────────────────────────────────
 
-def generate_markdown_report(analysis_summary: list) -> str:
-    """
-    Generate a Markdown compliance report from analysis_summary.
-    Includes compliance score and risk category breakdown.
-    """
+def generate_markdown_report(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+) -> str:
+    """Generate a Markdown compliance report with all 8 enhancement sections."""
+    conflicts = conflicts or []
+    jurisdiction_info = jurisdiction_info or {}
+
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
     violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
@@ -468,12 +730,31 @@ def generate_markdown_report(analysis_summary: list) -> str:
         "|:---:|:---:|:---:|:---:|",
         f"| **{total}** | **{match_count}** | **{violation_count}** | **{not_found_count}** |",
         "",
+    ]
+
+    # ── Red Flag Summary ──────────────────────────────────────────────────────
+    lines += ["## Critical Issues Requiring Immediate Attention", ""]
+    red_flags = [e for e in analysis_summary if e["result"] == "VIOLATION"]
+    red_flags += [e for e in analysis_summary if e["result"] == "NOT_FOUND"]
+    red_flags = red_flags[:3]
+    if not red_flags:
+        lines.append("No critical issues found. ✓")
+    else:
+        lines += [
+            "| Clause | Status | Issue |",
+            "|:---|:---:|:---|",
+        ]
+        for flag in red_flags:
+            lines.append(f"| {flag['clause_title']} | **{flag['result']}** | {flag.get('reason', '')} |")
+    lines += ["", "---", ""]
+
+    # ── Risk Category Breakdown ───────────────────────────────────────────────
+    lines += [
         "## Risk Category Breakdown",
         "",
         "| Category | Risk Level | Total | Compliant | Issues |",
         "|:---|:---:|:---:|:---:|:---:|",
     ]
-
     risk_badges = {"HIGH": "🔴 HIGH", "MEDIUM": "🟠 MEDIUM", "LOW": "🟢 LOW"}
     for cat in CATEGORY_ORDER:
         if cat not in category_stats:
@@ -483,15 +764,76 @@ def generate_markdown_report(analysis_summary: list) -> str:
         lines.append(
             f"| {cat} | {risk_badges[risk_lv]} | {s['total']} | {s['compliant']} | {s['issues']} |"
         )
+    lines += ["", "---", ""]
 
+    # ── Jurisdiction & Compliance Checklist ───────────────────────────────────
+    lines += ["## Jurisdiction & Compliance Checklist", ""]
+    if jurisdiction_info:
+        juris     = jurisdiction_info.get("jurisdiction", "Unknown")
+        agmt_type = jurisdiction_info.get("agreement_type", "Unknown")
+        laws      = ", ".join(jurisdiction_info.get("applicable_laws", []))
+        lines.append(f"**Jurisdiction:** {juris} &nbsp; **Agreement Type:** {agmt_type}")
+        if laws:
+            lines.append(f"**Applicable Laws:** {laws}")
+        lines.append("")
+        checklist = jurisdiction_info.get("checklist", [])
+        if checklist:
+            lines += [
+                "| Requirement | Status |",
+                "|:---|:---:|",
+            ]
+            for item in checklist:
+                req_label = "**Required**" if item.get("required") else "Optional"
+                lines.append(f"| {item.get('item', '')} | {req_label} |")
+    else:
+        lines.append("Jurisdiction information not available.")
+    lines += ["", "---", ""]
+
+    # ── Clause Conflicts ──────────────────────────────────────────────────────
+    lines += ["## Clause Conflicts", ""]
+    if not conflicts:
+        lines.append("No contradictions detected. ✓")
+    else:
+        lines += [
+            "| Clause A | Clause B | Conflict Description |",
+            "|:---|:---|:---|",
+        ]
+        for c in conflicts:
+            lines.append(
+                f"| {c.get('clause_a', '')} | {c.get('clause_b', '')} | {c.get('conflict', '')} |"
+            )
+    lines += ["", "---", ""]
+
+    # ── Contract Timeline ─────────────────────────────────────────────────────
+    lines += ["## Contract Timeline", ""]
+    timeline_rows = [
+        (entry["clause_title"], dt)
+        for entry in analysis_summary
+        for dt in entry.get("key_dates_durations", [])
+        if dt
+    ]
+    if not timeline_rows:
+        lines.append("No key dates or durations identified.")
+    else:
+        lines += [
+            "| Clause | Timeline Item |",
+            "|:---|:---|",
+        ]
+        for clause_title, tl_item in timeline_rows:
+            lines.append(f"| {clause_title} | {tl_item} |")
     lines += ["", "---", "", "## Clause Details", ""]
 
+    # ── Clause Details ────────────────────────────────────────────────────────
     for idx, entry in enumerate(analysis_summary, start=1):
         result         = entry.get("result", "NOT_FOUND")
         clause_title   = entry.get("clause_title", "")
         clause_id      = entry.get("clause_id", "")
         clause_content = entry.get("clause_content", "")
         ai_text        = entry.get("ai_added_text", "")
+        relevant_text  = entry.get("relevant_text") or ""
+        parties        = entry.get("parties_obligated", [])
+        binding        = entry.get("binding_strength", "VAGUE")
+        missing        = entry.get("missing_values", [])
         category, risk_level = _get_risk_info(clause_title)
 
         if result == "VIOLATION":
@@ -508,8 +850,17 @@ def generate_markdown_report(analysis_summary: list) -> str:
         lines.append("")
         lines.append(f"**ID:** `{clause_id}` &nbsp; **Category:** {category}")
 
+        parties_str = " / ".join(parties) if parties else "—"
+        lines.append(f"**Obligations:** {parties_str} &nbsp; **Binding:** `{binding}`")
+
+        if missing:
+            lines.append(f"> ⚠️ **Missing values:** {'; '.join(missing)}")
+
         if clause_content:
             lines.append(f"**Clause:** {clause_content}")
+
+        if relevant_text:
+            lines.append(f"> 📄 **Document Evidence:** *{relevant_text}*")
 
         if ai_text and ai_label:
             lines.append("")
@@ -522,7 +873,7 @@ def generate_markdown_report(analysis_summary: list) -> str:
     return "\n".join(lines)
 
 
-# ── DOCX Report ──────────────────────────────────────────────────────────────────
+# ── DOCX helpers ─────────────────────────────────────────────────────────────────
 
 def _hex_to_rgb(hex_color: str) -> RGBColor:
     """Convert '#RRGGBB' to docx RGBColor."""
@@ -550,11 +901,62 @@ def _set_paragraph_shading(paragraph, hex_color: str):
     shd.set(qn("w:fill"), hex_color.lstrip("#"))
 
 
-def generate_docx_report(analysis_summary: list) -> bytes:
+def _docx_dark_header_table(doc, headers: list, rows: list, col_widths_pct: list = None):
     """
-    Generate a DOCX compliance report.
-    Unlike the PDF report, this includes the 'reason' field for each clause.
+    Build a docx table with a dark header row.
+    headers: list of str
+    rows: list of list of str (or list of (str, color_hex) tuples for colored cells)
+    col_widths_pct: optional list of fractional widths (must sum to 1.0)
+    Returns the table object.
     """
+    tbl = doc.add_table(rows=1, cols=len(headers))
+    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, hdr in enumerate(headers):
+        cell = tbl.rows[0].cells[i]
+        cell.text = hdr
+        _set_cell_shading(cell, COLOR_DARK)
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for r in p.runs:
+                r.bold = True
+                r.font.color.rgb = RGBColor(255, 255, 255)
+                r.font.size = Pt(9)
+    for row_data in rows:
+        row = tbl.add_row()
+        for i, cell_data in enumerate(row_data):
+            if isinstance(cell_data, tuple):
+                text, color_hex = cell_data
+                cell = row.cells[i]
+                cell.text = ""
+                p = cell.paragraphs[0]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = p.add_run(text)
+                r.bold = True
+                r.font.size = Pt(9)
+                r.font.color.rgb = _hex_to_rgb(color_hex)
+            else:
+                row.cells[i].text = str(cell_data)
+                for p in row.cells[i].paragraphs:
+                    for r in p.runs:
+                        r.font.size = Pt(9)
+    return tbl
+
+
+# ── DOCX Report ──────────────────────────────────────────────────────────────────
+
+def generate_docx_report(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+) -> bytes:
+    """
+    Generate a DOCX compliance report with all 8 enhancement sections.
+    Includes the 'reason' field (not shown in PDF).
+    """
+    conflicts = conflicts or []
+    jurisdiction_info = jurisdiction_info or {}
+
     doc = Document()
 
     style = doc.styles["Normal"]
@@ -607,7 +1009,7 @@ def generate_docx_report(analysis_summary: list) -> bytes:
     summary_tbl = doc.add_table(rows=2, cols=4)
     summary_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     headers = ["Total", "Match", "Violation", "Not Found"]
-    values = [str(total), str(match_count), str(violation_count), str(not_found_count)]
+    values  = [str(total), str(match_count), str(violation_count), str(not_found_count)]
     val_colors = [None, COLOR_GREEN, COLOR_RED, COLOR_ORANGE]
 
     for i, header in enumerate(headers):
@@ -638,15 +1040,38 @@ def generate_docx_report(analysis_summary: list) -> bytes:
     run.font.size = Pt(14)
     run.font.color.rgb = _hex_to_rgb(score_color)
 
-    # ── Risk Category Breakdown ──────────────────────────────────────────────
+    # ── Red Flag Summary ──────────────────────────────────────────────────────
+    doc.add_heading("Critical Issues Requiring Immediate Attention", level=1)
+
+    red_flags = [e for e in analysis_summary if e["result"] == "VIOLATION"]
+    red_flags += [e for e in analysis_summary if e["result"] == "NOT_FOUND"]
+    red_flags = red_flags[:3]
+
+    if not red_flags:
+        p = doc.add_paragraph()
+        run = p.add_run("No critical issues found.")
+        run.font.color.rgb = _hex_to_rgb(COLOR_GREEN)
+        run.font.size = Pt(10)
+    else:
+        flag_rows = []
+        for flag in red_flags:
+            flag_color = COLOR_RED if flag["result"] == "VIOLATION" else COLOR_ORANGE
+            flag_rows.append([
+                flag["clause_title"],
+                (flag["result"], flag_color),
+                flag.get("reason", ""),
+            ])
+        _docx_dark_header_table(doc, ["Clause", "Status", "Issue"], flag_rows)
+
+    # ── Risk Category Breakdown ───────────────────────────────────────────────
     doc.add_heading("Risk Category Breakdown", level=1)
 
     cat_tbl = doc.add_table(rows=1, cols=5)
     cat_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     cat_headers = ["Category", "Risk Level", "Total", "Compliant", "Issues"]
-    for i, header in enumerate(cat_headers):
+    for i, hdr in enumerate(cat_headers):
         cell = cat_tbl.rows[0].cells[i]
-        cell.text = header
+        cell.text = hdr
         _set_cell_shading(cell, COLOR_DARK)
         for p in cell.paragraphs:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -666,7 +1091,6 @@ def generate_docx_report(analysis_summary: list) -> bytes:
         row.cells[3].text = str(stats["compliant"])
         row.cells[4].text = str(stats["issues"])
 
-        # Risk level with color
         risk_cell = row.cells[1]
         risk_cell.text = ""
         rp = risk_cell.paragraphs[0]
@@ -682,6 +1106,74 @@ def generate_docx_report(analysis_summary: list) -> bytes:
                 for r in p.runs:
                     r.font.size = Pt(9)
 
+    # ── Jurisdiction & Compliance Checklist ───────────────────────────────────
+    doc.add_heading("Jurisdiction & Compliance Checklist", level=1)
+
+    if jurisdiction_info:
+        juris_para = doc.add_paragraph()
+        run = juris_para.add_run("Jurisdiction: ")
+        run.bold = True
+        run.font.size = Pt(10)
+        run = juris_para.add_run(jurisdiction_info.get("jurisdiction", "Unknown"))
+        run.font.size = Pt(10)
+        run = juris_para.add_run("    Agreement Type: ")
+        run.bold = True
+        run.font.size = Pt(10)
+        run = juris_para.add_run(jurisdiction_info.get("agreement_type", "Unknown"))
+        run.font.size = Pt(10)
+
+        laws = jurisdiction_info.get("applicable_laws", [])
+        if laws:
+            laws_para = doc.add_paragraph()
+            run = laws_para.add_run("Applicable Laws: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run = laws_para.add_run(", ".join(laws))
+            run.font.size = Pt(10)
+
+        checklist = jurisdiction_info.get("checklist", [])
+        if checklist:
+            chk_rows = []
+            for item in checklist:
+                is_req = item.get("required", False)
+                req_label = "Required" if is_req else "Optional"
+                req_color = COLOR_RED if is_req else COLOR_GREEN
+                chk_rows.append([item.get("item", ""), (req_label, req_color)])
+            _docx_dark_header_table(doc, ["Requirement", "Status"], chk_rows)
+    else:
+        p = doc.add_paragraph()
+        p.add_run("Jurisdiction information not available.").font.size = Pt(10)
+
+    # ── Clause Conflicts ──────────────────────────────────────────────────────
+    doc.add_heading("Clause Conflicts", level=1)
+
+    if not conflicts:
+        p = doc.add_paragraph()
+        run = p.add_run("No contradictions detected.")
+        run.font.color.rgb = _hex_to_rgb(COLOR_GREEN)
+        run.font.size = Pt(10)
+    else:
+        conf_rows = [
+            [c.get("clause_a", ""), c.get("clause_b", ""), c.get("conflict", "")]
+            for c in conflicts
+        ]
+        _docx_dark_header_table(doc, ["Clause A", "Clause B", "Conflict Description"], conf_rows)
+
+    # ── Contract Timeline ─────────────────────────────────────────────────────
+    doc.add_heading("Contract Timeline", level=1)
+
+    timeline_rows = [
+        (entry["clause_title"], dt)
+        for entry in analysis_summary
+        for dt in entry.get("key_dates_durations", [])
+        if dt
+    ]
+    if not timeline_rows:
+        doc.add_paragraph("No key dates or durations identified.")
+    else:
+        tl_rows = [[ct, ti] for ct, ti in timeline_rows]
+        _docx_dark_header_table(doc, ["Clause", "Timeline Item"], tl_rows)
+
     # ── Clause Details ───────────────────────────────────────────────────────
     doc.add_heading("Clause Details", level=1)
 
@@ -692,6 +1184,10 @@ def generate_docx_report(analysis_summary: list) -> bytes:
         clause_content = entry.get("clause_content", "")
         ai_text        = entry.get("ai_added_text", "")
         reason         = entry.get("reason", "")
+        relevant_text  = entry.get("relevant_text") or ""
+        parties        = entry.get("parties_obligated", [])
+        binding        = entry.get("binding_strength", "VAGUE")
+        missing        = entry.get("missing_values", [])
 
         category, risk_level = _get_risk_info(clause_title)
         risk_color = COLOR_RISK[risk_level]
@@ -715,6 +1211,14 @@ def generate_docx_report(analysis_summary: list) -> bytes:
             ai_bg        = None
             ai_label     = None
 
+        # Binding strength color
+        if binding == "MUST/SHALL":
+            binding_color = COLOR_GREEN
+        elif binding == "SHOULD":
+            binding_color = COLOR_ORANGE
+        else:
+            binding_color = COLOR_RED
+
         # Clause heading with risk + status badges
         heading_para = doc.add_paragraph()
         run = heading_para.add_run(f"{idx}. {clause_title}  ")
@@ -737,6 +1241,32 @@ def generate_docx_report(analysis_summary: list) -> bytes:
         run.font.size = Pt(9)
         run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
 
+        # Obligations + Binding Strength
+        parties_str = " / ".join(parties) if parties else "—"
+        meta_para = doc.add_paragraph()
+        run = meta_para.add_run("Obligations: ")
+        run.bold = True
+        run.font.size = Pt(9)
+        run = meta_para.add_run(parties_str + "    ")
+        run.font.size = Pt(9)
+        run = meta_para.add_run("Binding: ")
+        run.bold = True
+        run.font.size = Pt(9)
+        run.font.color.rgb = _hex_to_rgb(binding_color)
+        run = meta_para.add_run(binding)
+        run.font.size = Pt(9)
+        run.bold = True
+        run.font.color.rgb = _hex_to_rgb(binding_color)
+
+        # Missing Values warning
+        if missing:
+            warn_para = doc.add_paragraph()
+            run = warn_para.add_run("\u26a0  Missing values: " + "; ".join(missing))
+            run.font.size = Pt(9)
+            run.italic = True
+            run.font.color.rgb = _hex_to_rgb(COLOR_ORANGE)
+            _set_paragraph_shading(warn_para, BG_ORANGE)
+
         # Clause content — red background for VIOLATION
         if clause_content:
             cp = doc.add_paragraph()
@@ -758,6 +1288,19 @@ def generate_docx_report(analysis_summary: list) -> bytes:
             run = rp.add_run(reason)
             run.font.size = Pt(10)
             run.italic = True
+
+        # Document Evidence — actual text extracted from the PDF
+        if relevant_text:
+            ep = doc.add_paragraph()
+            run = ep.add_run("Document Evidence: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb("#1a3a5c")
+            run = ep.add_run(relevant_text)
+            run.font.size = Pt(9)
+            run.italic = True
+            run.font.color.rgb = _hex_to_rgb("#1a3a5c")
+            _set_paragraph_shading(ep, BG_BLUE)
 
         # AI recommendation — green background for VIOLATION, orange for NOT_FOUND
         if ai_text and ai_label:
