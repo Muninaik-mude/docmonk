@@ -539,6 +539,17 @@ def _set_cell_shading(cell, hex_color: str):
     shading.set(qn("w:val"), "clear")
 
 
+def _set_paragraph_shading(paragraph, hex_color: str):
+    """Set background shading on a docx paragraph."""
+    from docx.oxml.ns import qn
+    from lxml import etree
+    pPr = paragraph._element.get_or_add_pPr()
+    shd = etree.SubElement(pPr, qn("w:shd"))
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color.lstrip("#"))
+
+
 def generate_docx_report(analysis_summary: list) -> bytes:
     """
     Generate a DOCX compliance report.
@@ -688,14 +699,20 @@ def generate_docx_report(analysis_summary: list) -> bytes:
         if result == "VIOLATION":
             status_color = COLOR_RED
             status_label = "VIOLATION"
+            clause_bg    = BG_RED
+            ai_bg        = BG_GREEN
             ai_label     = "Corrective Action"
         elif result == "NOT_FOUND":
             status_color = COLOR_ORANGE
             status_label = "NOT FOUND"
+            clause_bg    = None
+            ai_bg        = BG_ORANGE
             ai_label     = "Recommended Addition"
         else:
             status_color = COLOR_GREEN
             status_label = "MATCH"
+            clause_bg    = None
+            ai_bg        = None
             ai_label     = None
 
         # Clause heading with risk + status badges
@@ -720,7 +737,7 @@ def generate_docx_report(analysis_summary: list) -> bytes:
         run.font.size = Pt(9)
         run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
 
-        # Clause content
+        # Clause content — red background for VIOLATION
         if clause_content:
             cp = doc.add_paragraph()
             run = cp.add_run("Clause: ")
@@ -728,6 +745,8 @@ def generate_docx_report(analysis_summary: list) -> bytes:
             run.font.size = Pt(10)
             run = cp.add_run(clause_content)
             run.font.size = Pt(10)
+            if clause_bg:
+                _set_paragraph_shading(cp, clause_bg)
 
         # REASON field — DOCX only, not shown in PDF
         if reason:
@@ -740,7 +759,7 @@ def generate_docx_report(analysis_summary: list) -> bytes:
             run.font.size = Pt(10)
             run.italic = True
 
-        # AI recommendation
+        # AI recommendation — green background for VIOLATION, orange for NOT_FOUND
         if ai_text and ai_label:
             ap = doc.add_paragraph()
             run = ap.add_run(f"{ai_label}: ")
@@ -750,6 +769,8 @@ def generate_docx_report(analysis_summary: list) -> bytes:
             run = ap.add_run(ai_text)
             run.font.size = Pt(10)
             run.italic = True
+            if ai_bg:
+                _set_paragraph_shading(ap, ai_bg)
 
         doc.add_paragraph("_" * 80)
 

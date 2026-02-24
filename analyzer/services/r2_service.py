@@ -103,7 +103,9 @@ def save_file_locally(file_bytes: bytes, filename: str) -> str:
 
 
 def is_r2_configured() -> bool:
-    """Check if R2 credentials are properly configured."""
+    """Return True only if STORAGE_BACKEND=r2 AND all R2 credentials are present."""
+    if getattr(settings, 'STORAGE_BACKEND', 'r2') == 'local':
+        return False
     return all([
         settings.R2_ENDPOINT_URL,
         settings.R2_ACCESS_KEY_ID,
