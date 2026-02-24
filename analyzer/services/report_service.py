@@ -3,6 +3,11 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
@@ -515,3 +520,240 @@ def generate_markdown_report(analysis_summary: list) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ── DOCX Report ──────────────────────────────────────────────────────────────────
+
+def _hex_to_rgb(hex_color: str) -> RGBColor:
+    """Convert '#RRGGBB' to docx RGBColor."""
+    h = hex_color.lstrip("#")
+    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _set_cell_shading(cell, hex_color: str):
+    """Set background shading on a docx table cell."""
+    from docx.oxml.ns import qn
+    from lxml import etree
+    shading = etree.SubElement(cell._element.get_or_add_tcPr(), qn("w:shd"))
+    shading.set(qn("w:fill"), hex_color.lstrip("#"))
+    shading.set(qn("w:val"), "clear")
+
+
+def generate_docx_report(analysis_summary: list) -> bytes:
+    """
+    Generate a DOCX compliance report.
+    Unlike the PDF report, this includes the 'reason' field for each clause.
+    """
+    doc = Document()
+
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    # ── Pre-compute stats ────────────────────────────────────────────────────
+    match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
+    violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
+    not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
+    total           = len(analysis_summary)
+    compliance_score = round((match_count / total) * 100) if total else 0
+    generated_at     = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
+
+    if compliance_score >= 80:
+        score_status = "Compliant"
+        score_color  = COLOR_SCORE_HIGH
+    elif compliance_score >= 50:
+        score_status = "Needs Attention"
+        score_color  = COLOR_SCORE_MED
+    else:
+        score_status = "Critical"
+        score_color  = COLOR_SCORE_LOW
+
+    # Category stats
+    category_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "compliant": 0, "issues": 0})
+    for entry in analysis_summary:
+        cat, _ = _get_risk_info(entry.get("clause_title", ""))
+        category_stats[cat]["total"] += 1
+        if entry["result"] == "MATCH":
+            category_stats[cat]["compliant"] += 1
+        else:
+            category_stats[cat]["issues"] += 1
+
+    # ── Title ────────────────────────────────────────────────────────────────
+    title = doc.add_heading("CLAUSE COMPLIANCE ANALYSIS REPORT", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = meta.add_run(f"Generated on {generated_at}")
+    run.font.size = Pt(9)
+    run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
+
+    doc.add_paragraph("_" * 80)
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    doc.add_heading("Summary", level=1)
+
+    summary_tbl = doc.add_table(rows=2, cols=4)
+    summary_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    headers = ["Total", "Match", "Violation", "Not Found"]
+    values = [str(total), str(match_count), str(violation_count), str(not_found_count)]
+    val_colors = [None, COLOR_GREEN, COLOR_RED, COLOR_ORANGE]
+
+    for i, header in enumerate(headers):
+        cell = summary_tbl.rows[0].cells[i]
+        cell.text = header
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for r in p.runs:
+                r.bold = True
+                r.font.size = Pt(9)
+
+    for i, val in enumerate(values):
+        cell = summary_tbl.rows[1].cells[i]
+        cell.text = val
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for r in p.runs:
+                r.font.size = Pt(10)
+                r.bold = True
+                if val_colors[i]:
+                    r.font.color.rgb = _hex_to_rgb(val_colors[i])
+
+    # Score line
+    score_para = doc.add_paragraph()
+    score_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = score_para.add_run(f"\nOverall Compliance Score: {compliance_score}% — {score_status}")
+    run.bold = True
+    run.font.size = Pt(14)
+    run.font.color.rgb = _hex_to_rgb(score_color)
+
+    # ── Risk Category Breakdown ──────────────────────────────────────────────
+    doc.add_heading("Risk Category Breakdown", level=1)
+
+    cat_tbl = doc.add_table(rows=1, cols=5)
+    cat_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cat_headers = ["Category", "Risk Level", "Total", "Compliant", "Issues"]
+    for i, header in enumerate(cat_headers):
+        cell = cat_tbl.rows[0].cells[i]
+        cell.text = header
+        _set_cell_shading(cell, COLOR_DARK)
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for r in p.runs:
+                r.bold = True
+                r.font.size = Pt(9)
+                r.font.color.rgb = RGBColor(255, 255, 255)
+
+    for cat in CATEGORY_ORDER:
+        if cat not in category_stats:
+            continue
+        stats = category_stats[cat]
+        risk_lv, risk_col = _CATEGORY_RISK_LEVEL[cat]
+        row = cat_tbl.add_row()
+        row.cells[0].text = cat
+        row.cells[2].text = str(stats["total"])
+        row.cells[3].text = str(stats["compliant"])
+        row.cells[4].text = str(stats["issues"])
+
+        # Risk level with color
+        risk_cell = row.cells[1]
+        risk_cell.text = ""
+        rp = risk_cell.paragraphs[0]
+        rp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        rr = rp.add_run(risk_lv)
+        rr.bold = True
+        rr.font.size = Pt(9)
+        rr.font.color.rgb = _hex_to_rgb(risk_col)
+
+        for i in [0, 2, 3, 4]:
+            for p in row.cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for r in p.runs:
+                    r.font.size = Pt(9)
+
+    # ── Clause Details ───────────────────────────────────────────────────────
+    doc.add_heading("Clause Details", level=1)
+
+    for idx, entry in enumerate(analysis_summary, start=1):
+        result         = entry.get("result", "NOT_FOUND")
+        clause_title   = entry.get("clause_title", "")
+        clause_id      = entry.get("clause_id", "")
+        clause_content = entry.get("clause_content", "")
+        ai_text        = entry.get("ai_added_text", "")
+        reason         = entry.get("reason", "")
+
+        category, risk_level = _get_risk_info(clause_title)
+        risk_color = COLOR_RISK[risk_level]
+
+        if result == "VIOLATION":
+            status_color = COLOR_RED
+            status_label = "VIOLATION"
+            ai_label     = "Corrective Action"
+        elif result == "NOT_FOUND":
+            status_color = COLOR_ORANGE
+            status_label = "NOT FOUND"
+            ai_label     = "Recommended Addition"
+        else:
+            status_color = COLOR_GREEN
+            status_label = "MATCH"
+            ai_label     = None
+
+        # Clause heading with risk + status badges
+        heading_para = doc.add_paragraph()
+        run = heading_para.add_run(f"{idx}. {clause_title}  ")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        run = heading_para.add_run(f"[{risk_level} RISK]  ")
+        run.bold = True
+        run.font.size = Pt(9)
+        run.font.color.rgb = _hex_to_rgb(risk_color)
+
+        run = heading_para.add_run(f"[{status_label}]")
+        run.bold = True
+        run.font.size = Pt(9)
+        run.font.color.rgb = _hex_to_rgb(status_color)
+
+        # ID + Category
+        id_para = doc.add_paragraph()
+        run = id_para.add_run(f"ID: {clause_id}    Category: {category}")
+        run.font.size = Pt(9)
+        run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
+
+        # Clause content
+        if clause_content:
+            cp = doc.add_paragraph()
+            run = cp.add_run("Clause: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run = cp.add_run(clause_content)
+            run.font.size = Pt(10)
+
+        # REASON field — DOCX only, not shown in PDF
+        if reason:
+            rp = doc.add_paragraph()
+            run = rp.add_run("Reason: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_DARK)
+            run = rp.add_run(reason)
+            run.font.size = Pt(10)
+            run.italic = True
+
+        # AI recommendation
+        if ai_text and ai_label:
+            ap = doc.add_paragraph()
+            run = ap.add_run(f"{ai_label}: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(status_color)
+            run = ap.add_run(ai_text)
+            run.font.size = Pt(10)
+            run.italic = True
+
+        doc.add_paragraph("_" * 80)
+
+    # Save to bytes
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()

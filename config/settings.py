@@ -72,10 +72,6 @@ R2_BUCKET_NAME = os.getenv('R2_BUCKET_NAME')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
 
-# SambaNova AI (fallback)
-SAMBANOVA_API_KEY = os.getenv('SAMBANOVA_API_KEY')
-SAMBANOVA_MODEL = os.getenv('SAMBANOVA_MODEL', 'DeepSeek-R1-0528')
-
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = BASE_DIR / 'annotated_pdfs'
 ANNOTATED_PDF_DIR.mkdir(exist_ok=True)

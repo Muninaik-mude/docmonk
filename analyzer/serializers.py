@@ -18,7 +18,7 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     pdf_presigned_url = serializers.URLField()
     clauses = ClauseSerializer(many=True)
     report_format = serializers.ChoiceField(
-        choices=["pdf", "markdown", "both"],
+        choices=["pdf", "markdown", "docx", "both"],
         default="pdf",
         required=False,
     )

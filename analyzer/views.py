@@ -100,6 +100,8 @@ class ClauseAnalyzerView(APIView):
                     status=status.HTTP_503_SERVICE_UNAVAILABLE,
                 )
 
+            ai_result.pop("_provider", None)
+
             result_status = ai_result["result"]
             highlight_color = STATUS_HIGHLIGHT_COLOR.get(result_status)
             insertion_color = STATUS_INSERTION_COLOR.get(result_status)
@@ -110,6 +112,7 @@ class ClauseAnalyzerView(APIView):
                 "clause_title": clause["title"],
                 "clause_content": clause.get("content") or clause.get("value", ""),
                 "result": result_status,
+                "reason": ai_result.get("reason"),
                 "color": None,
                 "ai_added_text": None,
             }
@@ -180,11 +183,20 @@ class ClauseAnalyzerView(APIView):
                 response_data["report_markdown_expires_in"] = result["expires_in"]
                 logger.info("Markdown report generated and stored: %s", md_filename)
 
+            if report_format == "docx":
+                docx_bytes = report_service.generate_docx_report(analysis_summary)
+                docx_filename = f"report_{run_id}.docx"
+                result = _upload_or_save(
+                    docx_bytes, docx_filename,
+                    prefix="reports",
+                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                response_data["report_docx_url"] = result["url"]
+                response_data["report_docx_expires_in"] = result["expires_in"]
+                logger.info("DOCX report generated and stored: %s", docx_filename)
+
         except Exception as e:
             logger.error("Report generation/upload failed: %s", e)
-            return Response(
-                {"status": "error", "message": f"Report generation failed: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            response_data["report_error"] = f"Report could not be generated/uploaded: {str(e)}"
 
         return Response(response_data, status=status.HTTP_200_OK)

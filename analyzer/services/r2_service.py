@@ -3,6 +3,7 @@ import uuid
 
 import boto3
 import requests
+from botocore.config import Config
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,19 @@ def download_pdf_from_presigned_url(presigned_url: str) -> bytes:
 
 def _get_r2_client():
     """Create a boto3 S3 client configured for Cloudflare R2."""
+    config = Config(
+        retries={"max_attempts": 2, "mode": "standard"},
+        connect_timeout=10,
+        read_timeout=30,
+        s3={"addressing_style": "path"},
+    )
     return boto3.client(
         's3',
         endpoint_url=settings.R2_ENDPOINT_URL,
         aws_access_key_id=settings.R2_ACCESS_KEY_ID,
         aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
         region_name='auto',
+        config=config,
     )
 
 

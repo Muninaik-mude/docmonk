@@ -2,12 +2,57 @@ import json
 import logging
 
 from groq import Groq
-from openai import OpenAI
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1"
+# Max chars sent to AI per clause — keeps every call within any model's context window
+# ~5,000 chars ≈ 1,250 tokens (vs 3,000,000 chars for a 1000-page PDF)
+_EXCERPT_CHARS = 5_000
+
+
+def _get_relevant_excerpt(full_text: str, clause_title: str, clause_content: str) -> str:
+    """
+    Extract the most relevant portion of the document for the given clause.
+
+    For small documents (<= 5,000 chars) returns the full text.
+    For large documents slides a 5,000-char window across the text in steps of 2,500 chars,
+    scores each window by keyword overlap with the clause title + content,
+    and returns the highest-scoring window.
+
+    This ensures every Groq call stays well within the model's context window
+    regardless of the PDF size (even 1000-page / 78 MB documents).
+    """
+    if len(full_text) <= _EXCERPT_CHARS:
+        return full_text
+
+    query = (clause_title + " " + clause_content).lower()
+    query_words = {w for w in query.split() if len(w) > 3}
+
+    if not query_words:
+        return full_text[:_EXCERPT_CHARS]
+
+    step = _EXCERPT_CHARS // 2
+    best_score = -1
+    best_pos = 0
+    pos = 0
+
+    while pos < len(full_text):
+        end = min(pos + _EXCERPT_CHARS, len(full_text))
+        chunk_words = set(full_text[pos:end].lower().split())
+        score = len(query_words & chunk_words)
+        if score > best_score:
+            best_score = score
+            best_pos = pos
+        pos += step
+
+    excerpt = full_text[best_pos: best_pos + _EXCERPT_CHARS]
+    logger.debug(
+        "Excerpt for clause '%s': pos=%d, score=%d, len=%d",
+        clause_title, best_pos, best_score, len(excerpt),
+    )
+    return excerpt
+
 
 SYSTEM_PROMPT = """You are a legal contract compliance analyzer. Analyze whether a given clause is present, compliant, violated, or missing in the provided document text.
 
@@ -59,72 +104,43 @@ def _call_groq(user_message: str) -> str:
         ],
         model=settings.GROQ_MODEL,
         temperature=0.1,
-        max_tokens=1024,
-    )
-    return chat_completion.choices[0].message.content.strip()
-
-
-def _call_sambanova(user_message: str) -> str:
-    """Call SambaNova AI and return the raw response text."""
-    client = OpenAI(
-        api_key=settings.SAMBANOVA_API_KEY,
-        base_url=SAMBANOVA_BASE_URL,
-    )
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        model=settings.SAMBANOVA_MODEL,
-        temperature=0.1,
-        max_tokens=1024,
+        max_tokens=512,
     )
     return chat_completion.choices[0].message.content.strip()
 
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     """
-    Analyze clause compliance using Groq AI (primary).
-    Falls back to SambaNova AI if Groq fails for any reason.
+    Analyze clause compliance using Groq AI.
     Returns dict with: result, reason, relevant_text, ai_recommendation
     """
+    title = clause["title"]
+    content = clause.get("content") or clause.get("value", "")
+
+    excerpt = _get_relevant_excerpt(pdf_text, title, content)
+
     user_message = USER_PROMPT_TEMPLATE.format(
-        title=clause["title"],
-        content=clause.get("content") or clause.get("value", ""),
-        pdf_text=pdf_text,
+        title=title,
+        content=content,
+        pdf_text=excerpt,
     )
 
-    # Primary: Groq
     try:
         response_text = _call_groq(user_message)
-        logger.info("Groq responded for clause '%s'", clause["title"])
-        return _parse_response(response_text)
+        result = _parse_response(response_text)
+        result["_provider"] = "groq"
+        return result
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse Groq JSON response: %s", e)
+        logger.error("Failed to parse Groq JSON response for clause '%s': %s", title, e)
         return {
             "result": "NOT_FOUND",
             "reason": "AI response could not be parsed",
             "relevant_text": None,
-            "ai_recommendation": f"Clause '{clause['title']}' could not be analyzed. Manual review recommended.",
+            "ai_recommendation": f"Clause '{title}' could not be analyzed. Manual review recommended.",
+            "_provider": "groq",
         }
     except Exception as e:
-        logger.warning("Groq failed for clause '%s': %s — falling back to SambaNova", clause["title"], e)
-
-    # Fallback: SambaNova
-    try:
-        response_text = _call_sambanova(user_message)
-        logger.info("SambaNova (fallback) responded for clause '%s'", clause["title"])
-        return _parse_response(response_text)
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse SambaNova JSON response: %s", e)
-        return {
-            "result": "NOT_FOUND",
-            "reason": "AI response could not be parsed",
-            "relevant_text": None,
-            "ai_recommendation": f"Clause '{clause['title']}' could not be analyzed. Manual review recommended.",
-        }
-    except Exception as e:
-        logger.error("SambaNova also failed for clause '%s': %s", clause["title"], e)
+        logger.error("Groq failed for clause '%s': %s", title, e)
         raise
 
 
