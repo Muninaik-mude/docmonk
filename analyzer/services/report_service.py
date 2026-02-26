@@ -928,11 +928,30 @@ def _md_agreement_block(agreement_meta: dict) -> list:
 
 _MD_DIFF_CSS = """\
 <style>
-.diff-container { font-family: 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; color: #000000 !important; }
-.diff-group { border-radius: 6px; margin: 12px 0; overflow: hidden; }
+.diff-container { font-family: 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; color: #000000 !important; background: #ffffff; padding: 16px; }
+.diff-group { border-radius: 6px; margin: 12px 0; overflow: visible; position: relative; }
 .diff-line { display: flex; align-items: flex-start; padding: 6px 10px; color: #000000 !important; }
 .diff-line .gutter { flex: 0 0 24px; font-weight: bold; text-align: center; }
 .diff-line .line-content { flex: 1; color: #000000 !important; }
+
+/* Reason info icon — top-right corner of each group */
+.reason-icon {
+  position: absolute; top: 6px; right: 8px;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #6c757d; color: #fff !important;
+  font-size: 12px; font-weight: bold; font-style: normal;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; z-index: 2; flex-shrink: 0;
+}
+.reason-icon:hover { background: #495057; }
+.reason-icon .reason-tooltip {
+  display: none; position: absolute; top: 28px; right: 0;
+  background: #212529; color: #fff !important; padding: 10px 20px;
+  border-radius: 6px; font-size: 12px; font-weight: normal;
+  white-space: normal; width: 500px; line-height: 1.3;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 10;
+}
+.reason-icon:hover .reason-tooltip { display: block; }
 
 /* Violation (modified) — deleted = red, added = green */
 .diff-group[data-type="modified"] .diff-line.deleted { background-color: #fde8e8; }
@@ -980,17 +999,29 @@ def generate_markdown_report(
     segments = _build_inline_segments(full_text, analysis_summary)
     lines = [_MD_DIFF_CSS, '<div class="diff-container">', ""]
 
+    def _icon_html(reason: str) -> str:
+        """Return the hover info-icon HTML if reason exists, else empty."""
+        if not reason:
+            return ""
+        safe = reason.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+        return (
+            f'<span class="reason-icon">i'
+            f'<span class="reason-tooltip">{safe}</span>'
+            f'</span>'
+        )
+
     i = 0
     while i < len(segments):
         seg   = segments[i]
         stype = seg["type"]
         text  = seg["text"]
         reason = seg.get("reason", "")
-        tooltip = f' data-tooltip="{reason}"' if reason else ""
+        icon   = _icon_html(reason)
 
         if stype == "violation":
             # Modified group: deleted (red) + added (green)
-            lines.append(f'<div class="diff-group" data-type="modified"{tooltip}>')
+            lines.append(f'<div class="diff-group" data-type="modified">')
+            lines.append(icon) if icon else None
             lines.append('  <div class="diff-line deleted">')
             lines.append('    <div class="gutter">&minus;</div>')
             lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
@@ -1007,7 +1038,8 @@ def generate_markdown_report(
 
         elif stype == "partial":
             # Partial group: deleted (orange) + added (green)
-            lines.append(f'<div class="diff-group" data-type="partial"{tooltip}>')
+            lines.append(f'<div class="diff-group" data-type="partial">')
+            lines.append(icon) if icon else None
             lines.append('  <div class="diff-line deleted">')
             lines.append('    <div class="gutter">&minus;</div>')
             lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
@@ -1024,7 +1056,8 @@ def generate_markdown_report(
 
         elif stype == "not_found_ai":
             # New clause group (blue)
-            lines.append(f'<div class="diff-group" data-type="new"{tooltip}>')
+            lines.append(f'<div class="diff-group" data-type="new">')
+            lines.append(icon) if icon else None
             lines.append('  <div class="diff-line new-clause">')
             lines.append('    <div class="gutter">+</div>')
             lines.append(f'    <div class="line-content">{text}</div>')
