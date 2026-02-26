@@ -8,3 +8,5 @@ python-dotenv
 requests
 reportlab
 python-docx
+gunicorn
+whitenoise

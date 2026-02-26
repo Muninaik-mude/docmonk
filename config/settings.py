@@ -7,9 +7,12 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-dev-key')
-DEBUG = os.getenv('DEBUG', 'True').lower() in ('true', '1', 'yes')
+DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ['*']
+# In production set ALLOWED_HOSTS to your Leapcell domain, e.g.:
+# ALLOWED_HOSTS=your-app.leapcell.dev
+_allowed_hosts_env = os.getenv('ALLOWED_HOSTS', '')
+ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(',') if h.strip()] or ['*']
 
 INSTALLED_APPS = [
     'django.contrib.auth',
@@ -21,6 +24,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.common.CommonMiddleware',
 ]
 
@@ -54,15 +58,19 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
     'DEFAULT_PARSER_CLASSES': [
         'rest_framework.parsers.JSONParser',
+        'rest_framework.parsers.MultiPartParser',
     ],
 }
 
-# Storage backend: "r2" (default) or "local" (force local even if R2 is configured)
+# Storage backend: "r2" (default) or "local"
 STORAGE_BACKEND = os.getenv('STORAGE_BACKEND', 'r2').lower()
 
 # Cloudflare R2
@@ -77,4 +85,4 @@ GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
 
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = BASE_DIR / 'annotated_pdfs'
-ANNOTATED_PDF_DIR.mkdir(exist_ok=True)
+ANNOTATED_PDF_DIR.mkdir(parents=True, exist_ok=True)
