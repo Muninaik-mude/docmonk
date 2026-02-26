@@ -180,7 +180,7 @@ def _parse_response(response_text: str) -> dict:
 
 def _call_groq(user_message: str) -> str:
     """Call Groq AI and return the raw response text."""
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
     chat_completion = client.chat.completions.create(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -230,7 +230,17 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
         }
     except Exception as e:
         logger.error("Groq failed for clause '%s': %s", title, e)
-        raise
+        return {
+            "result": "NOT_FOUND",
+            "reason": f"AI analysis failed: {type(e).__name__}",
+            "relevant_text": None,
+            "ai_recommendation": f"Clause '{title}' could not be analyzed due to API error. Manual review recommended.",
+            "parties_obligated": [],
+            "missing_values": [],
+            "binding_strength": "VAGUE",
+            "key_dates_durations": [],
+            "_provider": "groq",
+        }
 
 
 # ── Document-level analysis ──────────────────────────────────────────────────────
@@ -268,7 +278,7 @@ def detect_jurisdiction(pdf_text: str) -> dict:
     """
     excerpt = pdf_text[:3000]
     user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
     try:
         chat_completion = client.chat.completions.create(
             messages=[
@@ -335,7 +345,7 @@ def detect_conflicts(analysis_summary: list) -> list:
     clause_summary_text = "\n".join(lines)
 
     user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
     try:
         chat_completion = client.chat.completions.create(
             messages=[

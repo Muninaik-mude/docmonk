@@ -9,10 +9,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-dev-key')
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
 
-# In production set ALLOWED_HOSTS to your Leapcell domain, e.g.:
-# ALLOWED_HOSTS=your-app.leapcell.dev
 _allowed_hosts_env = os.getenv('ALLOWED_HOSTS', '')
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(',') if h.strip()] or ['*']
+
+# Railway serves behind a proxy over HTTPS
+CSRF_TRUSTED_ORIGINS = [f"https://{h}" for h in ALLOWED_HOSTS if h != '*']
 
 INSTALLED_APPS = [
     'django.contrib.auth',
@@ -59,7 +60,7 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -84,5 +85,10 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
 
 # Annotated PDFs output directory (fallback when R2 is not configured)
-ANNOTATED_PDF_DIR = BASE_DIR / 'annotated_pdfs'
-ANNOTATED_PDF_DIR.mkdir(parents=True, exist_ok=True)
+ANNOTATED_PDF_DIR = Path(os.getenv('ANNOTATED_PDF_DIR', str(BASE_DIR / 'annotated_pdfs')))
+try:
+    ANNOTATED_PDF_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    # Read-only filesystem (e.g. Leapcell); use /tmp as fallback
+    ANNOTATED_PDF_DIR = Path('/tmp/annotated_pdfs')
+    ANNOTATED_PDF_DIR.mkdir(parents=True, exist_ok=True)
