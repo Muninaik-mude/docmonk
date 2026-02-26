@@ -9,11 +9,13 @@ COLORS = {
 
 STATUS_HIGHLIGHT_COLOR = {
     "MATCH": None,
-    "NOT_FOUND": COLORS["orange"],
+    "NOT_FOUND": None,
     "VIOLATION": COLORS["red"],
+    "PARTIALLY_SATISFIED": COLORS["orange"],
 }
 
 STATUS_INSERTION_COLOR = {
     "NOT_FOUND": COLORS["orange"],
     "VIOLATION": COLORS["green"],
+    "PARTIALLY_SATISFIED": COLORS["green"],
 }

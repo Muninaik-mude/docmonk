@@ -68,10 +68,10 @@ DOCUMENT TEXT:
 
 Analyze the clause against the document and respond in this EXACT JSON format:
 {{
-    "result": "MATCH" or "NOT_FOUND" or "VIOLATION",
+    "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
     "reason": "brief explanation",
     "relevant_text": "the part of document that relates to this clause, or null",
-    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION: write a corrective clause. If MATCH: null",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION: write a corrective clause. If PARTIALLY_SATISFIED: write the improved/completed clause. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
     "missing_values": ["commencement date not specified", "deposit amount blank"] or [],
     "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",
@@ -79,7 +79,8 @@ Analyze the clause against the document and respond in this EXACT JSON format:
 }}
 
 Rules:
-- MATCH: clause content is present and compliant in the document
+- MATCH: clause content is present and fully compliant in the document
+- PARTIALLY_SATISFIED: clause topic exists but is incomplete, vague, or only partly meets the requirement
 - NOT_FOUND: clause topic is completely absent from the document
 - VIOLATION: clause topic exists but contradicts or violates the clause requirement
 - parties_obligated: list which party carries obligations under this clause (["Tenant"], ["Landlord"], ["Both"], or [] if not applicable)
@@ -160,7 +161,7 @@ def _parse_response(response_text: str) -> dict:
     """Parse and validate the AI JSON response."""
     result = _safe_json_parse(response_text)
 
-    if result.get("result") not in ("MATCH", "NOT_FOUND", "VIOLATION"):
+    if result.get("result") not in ("MATCH", "NOT_FOUND", "VIOLATION", "PARTIALLY_SATISFIED"):
         logger.warning("Invalid result value: %s, defaulting to NOT_FOUND", result.get("result"))
         result["result"] = "NOT_FOUND"
 

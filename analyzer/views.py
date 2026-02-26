@@ -137,7 +137,7 @@ class ClauseAnalyzerView(APIView):
             }
 
             if result_status == "NOT_FOUND":
-                summary_entry["color"] = "orange"
+                summary_entry["color"] = "blue"
                 summary_entry["ai_added_text"] = ai_text
                 if text_blocks:
                     last_block = text_blocks[-1]
@@ -146,6 +146,25 @@ class ClauseAnalyzerView(APIView):
                         "bbox": last_block["bbox"],
                         "highlight_color": highlight_color,
                         "inserted_text": f"[MISSING - {clause['title']}]: {ai_text}" if ai_text else None,
+                        "inserted_text_color": insertion_color,
+                    })
+
+            elif result_status == "PARTIALLY_SATISFIED":
+                summary_entry["color"] = "orange"
+                summary_entry["ai_added_text"] = ai_text
+                relevant_text = ai_result.get("relevant_text")
+                location = groq_service.find_text_location_in_pdf(text_blocks, relevant_text)
+                if not location:
+                    location = groq_service.find_text_location_in_pdf(text_blocks, clause["title"])
+                if not location and text_blocks:
+                    last_block = text_blocks[-1]
+                    location = {"page_num": last_block["page_num"], "bbox": last_block["bbox"]}
+                if location:
+                    annotations.append({
+                        "page_num": location["page_num"],
+                        "bbox": location["bbox"],
+                        "highlight_color": highlight_color,
+                        "inserted_text": f"[PARTIAL - {clause['title']}]: {ai_text}" if ai_text else None,
                         "inserted_text_color": insertion_color,
                     })
 

@@ -237,31 +237,35 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
       {"type": "normal",       "text": str}  — unmatched line, no colour
       {"type": "violation",    "text": str}  — VIOLATION original text  → red bg + strikethrough
       {"type": "ai",           "text": str}  — AI correction/addition   → green bg
-      {"type": "partial",      "text": str}  — NOT_FOUND relevant_text  → orange bg (no strikethrough)
-      {"type": "match",        "text": str}  — MATCH relevant_text      → blue colour
-      {"type": "not_found_ai", "text": str}  — NOT_FOUND AI (no rt)    → orange bg, appended at end
+      {"type": "partial",      "text": str}  — PARTIALLY_SATISFIED text → orange bg
+      {"type": "match",        "text": str}  — MATCH relevant_text      → no colour
+      {"type": "not_found_ai", "text": str}  — NOT_FOUND AI (no rt)    → blue bg, appended at end
     """
-    violation_map  = {}   # text → ai_text
-    partial_map    = {}   # text → ai_text  (NOT_FOUND with relevant_text)
-    match_set      = []   # list of relevant/clause text keys
-    not_found_list = []   # ai_text for NOT_FOUND without relevant_text
+    violation_map  = {}   # text → (ai_text, reason)  VIOLATION
+    partial_map    = {}   # text → (ai_text, reason)  PARTIALLY_SATISFIED
+    match_set      = []   # list of relevant/clause text keys (MATCH)
+    not_found_list = []   # (ai_text, reason) for NOT_FOUND
 
     for entry in analysis_summary:
         result  = entry.get("result", "")
         rt      = (entry.get("relevant_text") or "").strip()
         cc      = (entry.get("clause_content", "")).strip()
         ai_text = entry.get("ai_added_text", "") or ""
+        reason  = entry.get("reason", "") or ""
 
         if result == "VIOLATION":
             key = rt or cc
             if key:
-                violation_map[key] = ai_text
+                violation_map[key] = (ai_text, reason)
+
+        elif result == "PARTIALLY_SATISFIED":
+            key = rt or cc
+            if key:
+                partial_map[key] = (ai_text, reason)
 
         elif result == "NOT_FOUND":
-            if rt:
-                partial_map[rt] = ai_text
-            elif ai_text:
-                not_found_list.append(ai_text)
+            if ai_text:
+                not_found_list.append((ai_text, reason))
 
         elif result == "MATCH":
             key = rt or cc
@@ -293,33 +297,47 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
 
     # Accumulators: consecutive lines from the same block are joined into ONE
     # paragraph so they share a single background row and AI shows only once.
-    pending_v_key   = None
-    pending_v_lines = []   # text lines accumulated for this violation block
-    pending_v_ai    = None
+    pending_v_key    = None
+    pending_v_lines  = []
+    pending_v_ai     = None
+    pending_v_reason = ""
 
-    pending_p_key   = None
-    pending_p_lines = []
-    pending_p_ai    = None
+    pending_p_key    = None
+    pending_p_lines  = []
+    pending_p_ai     = None
+    pending_p_reason = ""
+
+    pending_m_key    = None
+    pending_m_lines  = []
 
     def _flush_violation():
-        nonlocal pending_v_key, pending_v_lines, pending_v_ai
+        nonlocal pending_v_key, pending_v_lines, pending_v_ai, pending_v_reason
         if pending_v_lines:
-            segments.append({"type": "violation", "text": " ".join(pending_v_lines)})
+            segments.append({"type": "violation", "text": " ".join(pending_v_lines), "reason": pending_v_reason})
             if pending_v_ai:
                 segments.append({"type": "ai", "text": pending_v_ai})
-        pending_v_key   = None
-        pending_v_lines = []
-        pending_v_ai    = None
+        pending_v_key    = None
+        pending_v_lines  = []
+        pending_v_ai     = None
+        pending_v_reason = ""
 
     def _flush_partial():
-        nonlocal pending_p_key, pending_p_lines, pending_p_ai
+        nonlocal pending_p_key, pending_p_lines, pending_p_ai, pending_p_reason
         if pending_p_lines:
-            segments.append({"type": "partial", "text": " ".join(pending_p_lines)})
+            segments.append({"type": "partial", "text": " ".join(pending_p_lines), "reason": pending_p_reason})
             if pending_p_ai:
                 segments.append({"type": "ai", "text": pending_p_ai})
-        pending_p_key   = None
-        pending_p_lines = []
-        pending_p_ai    = None
+        pending_p_key    = None
+        pending_p_lines  = []
+        pending_p_ai     = None
+        pending_p_reason = ""
+
+    def _flush_match():
+        nonlocal pending_m_key, pending_m_lines
+        if pending_m_lines:
+            segments.append({"type": "match", "text": " ".join(pending_m_lines)})
+        pending_m_key   = None
+        pending_m_lines = []
 
     for line in (full_text or "").split("\n"):
         stripped = line.strip()
@@ -327,67 +345,84 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
             continue
 
         # ── 1. Violation check ─────────────────────────────────────────────
-        matched_v_key = None
-        matched_v_ai  = None
-        for key, ai_text in violation_map.items():
+        matched_v_key    = None
+        matched_v_ai     = None
+        matched_v_reason = ""
+        for key, (ai_text, reason) in violation_map.items():
             if _line_matches(stripped, key):
-                matched_v_key = key
-                matched_v_ai  = ai_text
+                matched_v_key    = key
+                matched_v_ai     = ai_text
+                matched_v_reason = reason
                 break
 
         if matched_v_key is not None:
             _flush_partial()
+            _flush_match()
             if matched_v_key == pending_v_key:
-                # Continuation — append to same paragraph
                 pending_v_lines.append(stripped)
             else:
-                # New block — flush previous, start accumulator
                 _flush_violation()
-                pending_v_key   = matched_v_key
-                pending_v_lines = [stripped]
-                pending_v_ai    = matched_v_ai
+                pending_v_key    = matched_v_key
+                pending_v_lines  = [stripped]
+                pending_v_ai     = matched_v_ai
+                pending_v_reason = matched_v_reason
             continue
 
-        # Not a violation — flush any open violation block
         _flush_violation()
+        _flush_match()
 
-        # ── 2. Partial (NOT_FOUND with relevant_text) check ───────────────
-        matched_p_key = None
-        matched_p_ai  = None
-        for key, ai_text in partial_map.items():
+        # ── 2. Partial (PARTIALLY_SATISFIED) check ────────────────────────
+        matched_p_key    = None
+        matched_p_ai     = None
+        matched_p_reason = ""
+        for key, (ai_text, reason) in partial_map.items():
             if _line_matches(stripped, key):
-                matched_p_key = key
-                matched_p_ai  = ai_text
+                matched_p_key    = key
+                matched_p_ai     = ai_text
+                matched_p_reason = reason
                 break
 
         if matched_p_key is not None:
+            _flush_match()
             if matched_p_key == pending_p_key:
                 pending_p_lines.append(stripped)
             else:
                 _flush_partial()
-                pending_p_key   = matched_p_key
-                pending_p_lines = [stripped]
-                pending_p_ai    = matched_p_ai
+                pending_p_key    = matched_p_key
+                pending_p_lines  = [stripped]
+                pending_p_ai     = matched_p_ai
+                pending_p_reason = matched_p_reason
             continue
 
-        # Not a partial — flush any open partial block
         _flush_partial()
 
         # ── 3. Match check ─────────────────────────────────────────────────
-        if any(_line_matches(stripped, key) for key in match_set):
-            segments.append({"type": "match", "text": stripped})
+        matched_m_key = None
+        for key in match_set:
+            if _line_matches(stripped, key):
+                matched_m_key = key
+                break
+
+        if matched_m_key is not None:
+            if matched_m_key == pending_m_key:
+                pending_m_lines.append(stripped)
+            else:
+                _flush_match()
+                pending_m_key   = matched_m_key
+                pending_m_lines = [stripped]
             continue
+
+        _flush_match()
 
         # ── 4. Normal ──────────────────────────────────────────────────────
         segments.append({"type": "normal", "text": stripped})
 
-    # Flush any still-open blocks at end of document
     _flush_violation()
     _flush_partial()
+    _flush_match()
 
-    # NOT_FOUND AI suggestions without a located anchor → appended at end
-    for ai_text in not_found_list:
-        segments.append({"type": "not_found_ai", "text": ai_text})
+    for ai_text, reason in not_found_list:
+        segments.append({"type": "not_found_ai", "text": ai_text, "reason": reason})
 
     return segments
 
@@ -436,6 +471,11 @@ def generate_pdf_report(
         fontSize=9, leading=14,
         textColor=colors.HexColor("#155724"),
     )
+    partial_style = ParagraphStyle(
+        "RPartial", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor("#856404"),
+    )
     nf_style = ParagraphStyle(
         "RNf", parent=S["Normal"],
         fontSize=9, leading=14,
@@ -468,15 +508,15 @@ def generate_pdf_report(
             story.append(Spacer(1, 4))
 
         elif stype == "partial":
-            # Blue bg — NOT_FOUND with relevant text
+            # Orange bg — PARTIALLY_SATISFIED original text
             story.append(_bg_row(
-                f'<font color="{COLOR_BLUE}">\u25cf</font> {text}',
-                BG_BLUE, nf_style,
+                f'<font color="{COLOR_ORANGE}"><b>\u2212</b></font> <strike>{text}</strike>',
+                BG_ORANGE, partial_style,
             ))
             story.append(Spacer(1, 1))
 
         elif stype == "not_found_ai":
-            # Blue bg — NOT_FOUND AI suggestion (no anchor in doc)
+            # Blue bg — NOT_FOUND AI suggestion
             story.append(_bg_row(
                 f'<font color="{COLOR_BLUE}"><b>+</b></font> {text}',
                 BG_BLUE, nf_style,
@@ -591,6 +631,7 @@ def generate_pdf_summary(
     # ── Pre-compute stats ─────────────────────────────────────────────────────
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
     violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
+    partial_count   = sum(1 for c in analysis_summary if c["result"] == "PARTIALLY_SATISFIED")
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
     total           = len(analysis_summary)
     compliance_score = round((match_count / total) * 100) if total else 0
@@ -619,7 +660,8 @@ def generate_pdf_summary(
         f'<b>Clause Summary</b> &nbsp;&nbsp; Total: <b>{total}</b> &nbsp;|&nbsp; '
         f'<font color="{COLOR_GREEN}">Match: <b>{match_count}</b></font> &nbsp;|&nbsp; '
         f'<font color="{COLOR_RED}">Violation: <b>{violation_count}</b></font> &nbsp;|&nbsp; '
-        f'<font color="{COLOR_ORANGE}">Not Found: <b>{not_found_count}</b></font>',
+        f'<font color="{COLOR_ORANGE}">Partial: <b>{partial_count}</b></font> &nbsp;|&nbsp; '
+        f'<font color="{COLOR_BLUE}">Not Found: <b>{not_found_count}</b></font>',
         summary_style,
     ))
 
@@ -884,6 +926,41 @@ def _md_agreement_block(agreement_meta: dict) -> list:
     return lines
 
 
+_MD_DIFF_CSS = """\
+<style>
+.diff-container { font-family: 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; color: #000000 !important; }
+.diff-group { border-radius: 6px; margin: 12px 0; overflow: hidden; }
+.diff-line { display: flex; align-items: flex-start; padding: 6px 10px; color: #000000 !important; }
+.diff-line .gutter { flex: 0 0 24px; font-weight: bold; text-align: center; }
+.diff-line .line-content { flex: 1; color: #000000 !important; }
+
+/* Violation (modified) — deleted = red, added = green */
+.diff-group[data-type="modified"] .diff-line.deleted { background-color: #fde8e8; }
+.diff-group[data-type="modified"] .diff-line.deleted .gutter { color: #dc3545 !important; }
+.diff-group[data-type="modified"] .diff-line.deleted .old-text { color: #6b1015 !important; text-decoration: line-through; }
+.diff-group[data-type="modified"] .diff-line.added { background-color: #d4edda; }
+.diff-group[data-type="modified"] .diff-line.added .gutter { color: #28a745 !important; }
+.diff-group[data-type="modified"] .diff-line.added .line-content { color: #155724 !important; }
+
+/* Partially satisfied — deleted = orange, added = green */
+.diff-group[data-type="partial"] .diff-line.deleted { background-color: #fff3cd; }
+.diff-group[data-type="partial"] .diff-line.deleted .gutter { color: #fd7e14 !important; }
+.diff-group[data-type="partial"] .diff-line.deleted .old-text { color: #856404 !important; text-decoration: line-through; }
+.diff-group[data-type="partial"] .diff-line.added { background-color: #d4edda; }
+.diff-group[data-type="partial"] .diff-line.added .gutter { color: #28a745 !important; }
+.diff-group[data-type="partial"] .diff-line.added .line-content { color: #155724 !important; }
+
+/* Not found — new clause = blue */
+.diff-group[data-type="new"] .diff-line.new-clause { background-color: #e8f0fe; }
+.diff-group[data-type="new"] .diff-line.new-clause .gutter { color: #0d6efd !important; }
+.diff-group[data-type="new"] .diff-line.new-clause .line-content { color: #0a3577 !important; }
+
+/* Unchanged — match and normal: no bg, pure black text */
+.diff-group[data-type="unchanged"] .diff-line .line-content { color: #000000 !important; }
+</style>
+"""
+
+
 def generate_markdown_report(
     analysis_summary: list,
     *,
@@ -893,67 +970,97 @@ def generate_markdown_report(
     agreement_meta: dict = None,
 ) -> str:
     """
-    Generate a redline-style Markdown report using HTML for colors.
-    Shows the original document inline — violations struck through (red bg),
-    AI answers in green bg immediately after. No separate clause sections.
-    """
-    # Inline redline — no title/header/agreement block; uses HTML for background colors
-    lines = []
-    segments = _build_inline_segments(full_text, analysis_summary)
+    Generate a redline-style Markdown report using semantic diff HTML.
 
-    for seg in segments:
+    Each segment is wrapped in a .diff-group container with:
+      data-type="modified|partial|new|unchanged"
+      data-tooltip="<reason from AI>"
+    Inside: .diff-line.deleted / .added / .new-clause / .unchanged
+    """
+    segments = _build_inline_segments(full_text, analysis_summary)
+    lines = [_MD_DIFF_CSS, '<div class="diff-container">', ""]
+
+    i = 0
+    while i < len(segments):
+        seg   = segments[i]
         stype = seg["type"]
         text  = seg["text"]
+        reason = seg.get("reason", "")
+        tooltip = f' data-tooltip="{reason}"' if reason else ""
 
         if stype == "violation":
-            # Red background + strikethrough (VIOLATION)
-            lines.append(
-                f'<p style="background-color:#fde8e8; padding:6px 10px; margin:2px 0;">'
-                f'<span style="color:#dc3545; font-weight:bold;">&#8722;</span>&nbsp;'
-                f'<span style="color:#6b1015; text-decoration:line-through;">{text}</span>'
-                f'</p>'
-            )
-
-        elif stype == "ai":
-            # Green background — AI correction/addition
-            lines.append(
-                f'<p style="background-color:#d4edda; padding:6px 10px; margin:2px 0;">'
-                f'<span style="color:#28a745; font-weight:bold;">+</span>&nbsp;'
-                f'<span style="color:#155724;">{text}</span>'
-                f'</p>'
-            )
+            # Modified group: deleted (red) + added (green)
+            lines.append(f'<div class="diff-group" data-type="modified"{tooltip}>')
+            lines.append('  <div class="diff-line deleted">')
+            lines.append('    <div class="gutter">&minus;</div>')
+            lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
+            lines.append("  </div>")
+            if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
+                i += 1
+                ai_text = segments[i]["text"]
+                lines.append('  <div class="diff-line added">')
+                lines.append('    <div class="gutter">+</div>')
+                lines.append(f'    <div class="line-content">{ai_text}</div>')
+                lines.append("  </div>")
+            lines.append("</div>")
             lines.append("")
 
         elif stype == "partial":
-            # Blue background — NOT_FOUND with relevant text
-            lines.append(
-                f'<p style="background-color:#e8f0fe; padding:6px 10px; margin:2px 0;">'
-                f'<span style="color:#0d6efd; font-weight:bold;">&#9679;</span>&nbsp;'
-                f'<span style="color:#0a3577;">{text}</span>'
-                f'</p>'
-            )
+            # Partial group: deleted (orange) + added (green)
+            lines.append(f'<div class="diff-group" data-type="partial"{tooltip}>')
+            lines.append('  <div class="diff-line deleted">')
+            lines.append('    <div class="gutter">&minus;</div>')
+            lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
+            lines.append("  </div>")
+            if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
+                i += 1
+                ai_text = segments[i]["text"]
+                lines.append('  <div class="diff-line added">')
+                lines.append('    <div class="gutter">+</div>')
+                lines.append(f'    <div class="line-content">{ai_text}</div>')
+                lines.append("  </div>")
+            lines.append("</div>")
+            lines.append("")
 
         elif stype == "not_found_ai":
-            # Blue background — NOT_FOUND AI suggestion (no anchor in doc)
-            lines.append(
-                f'<p style="background-color:#e8f0fe; padding:6px 10px; margin:2px 0;">'
-                f'<span style="color:#0d6efd; font-weight:bold;">+</span>&nbsp;'
-                f'<span style="color:#0a3577;">{text}</span>'
-                f'</p>'
-            )
+            # New clause group (blue)
+            lines.append(f'<div class="diff-group" data-type="new"{tooltip}>')
+            lines.append('  <div class="diff-line new-clause">')
+            lines.append('    <div class="gutter">+</div>')
+            lines.append(f'    <div class="line-content">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
             lines.append("")
 
         elif stype == "match":
-            # No color — satisfied/match clause (plain text)
-            lines.append(
-                f'<p style="margin:2px 0; padding:2px 0;">{text}</p>'
-            )
+            # Match — no bg, no tick, plain black text
+            lines.append('<div class="diff-group" data-type="unchanged">')
+            lines.append('  <div class="diff-line normal">')
+            lines.append(f'    <div class="line-content">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
 
-        else:  # normal
-            lines.append(
-                f'<p style="margin:2px 0; padding:2px 0;">{text}</p>'
-            )
+        elif stype == "normal":
+            # Normal — no background
+            lines.append('<div class="diff-group" data-type="unchanged">')
+            lines.append('  <div class="diff-line normal">')
+            lines.append(f'    <div class="line-content">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
 
+        elif stype == "ai":
+            # Orphan AI
+            lines.append('<div class="diff-group" data-type="modified">')
+            lines.append('  <div class="diff-line added">')
+            lines.append('    <div class="gutter">+</div>')
+            lines.append(f'    <div class="line-content">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
+            lines.append("")
+
+        i += 1
+
+    lines.append("</div>")
     return "\n".join(lines)
 
 
@@ -975,6 +1082,7 @@ def generate_markdown_summary(
 
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
     violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
+    partial_count   = sum(1 for c in analysis_summary if c["result"] == "PARTIALLY_SATISFIED")
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
     total           = len(analysis_summary)
     compliance_score = round((match_count / total) * 100) if total else 0
@@ -1000,9 +1108,9 @@ def generate_markdown_summary(
         "",
         f"**Overall Compliance Score: {compliance_score}% — {score_status}**",
         "",
-        "| Total | Match | Violation | Not Found |",
-        "|:---:|:---:|:---:|:---:|",
-        f"| **{total}** | **{match_count}** | **{violation_count}** | **{not_found_count}** |",
+        "| Total | Match | Violation | Partial | Not Found |",
+        "|:---:|:---:|:---:|:---:|:---:|",
+        f"| **{total}** | **{match_count}** | **{violation_count}** | **{partial_count}** | **{not_found_count}** |",
         "",
     ]
 
@@ -1271,15 +1379,17 @@ def generate_docx_report(
             _set_paragraph_shading(ap, BG_GREEN)
 
         elif stype == "partial":
-            # Blue bg — NOT_FOUND with relevant text
+            # Orange bg — PARTIALLY_SATISFIED original text
             pp = doc.add_paragraph()
-            run = pp.add_run("\u25cf ")
+            run = pp.add_run("\u2212 ")
+            run.bold = True
             run.font.size = Pt(10)
-            run.font.color.rgb = _hex_to_rgb(COLOR_BLUE)
+            run.font.color.rgb = _hex_to_rgb(COLOR_ORANGE)
             run = pp.add_run(text)
             run.font.size = Pt(10)
-            run.font.color.rgb = _hex_to_rgb("#0a3577")
-            _set_paragraph_shading(pp, BG_BLUE)
+            run.font.color.rgb = _hex_to_rgb(COLOR_ORANGE)
+            run.font.strikethrough = True
+            _set_paragraph_shading(pp, BG_ORANGE)
 
         elif stype == "not_found_ai":
             # Blue bg — NOT_FOUND AI (no anchor found in doc)
@@ -1337,6 +1447,7 @@ def generate_docx_summary(
     # ── Pre-compute stats ────────────────────────────────────────────────────
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
     violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
+    partial_count   = sum(1 for c in analysis_summary if c["result"] == "PARTIALLY_SATISFIED")
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
     total           = len(analysis_summary)
     compliance_score = round((match_count / total) * 100) if total else 0
@@ -1363,11 +1474,11 @@ def generate_docx_summary(
     # ── Summary table ────────────────────────────────────────────────────────
     doc.add_heading("Summary", level=1)
 
-    summary_tbl = doc.add_table(rows=2, cols=4)
+    summary_tbl = doc.add_table(rows=2, cols=5)
     summary_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-    headers = ["Total", "Match", "Violation", "Not Found"]
-    values  = [str(total), str(match_count), str(violation_count), str(not_found_count)]
-    val_colors = [None, COLOR_GREEN, COLOR_RED, COLOR_ORANGE]
+    headers = ["Total", "Match", "Violation", "Partial", "Not Found"]
+    values  = [str(total), str(match_count), str(violation_count), str(partial_count), str(not_found_count)]
+    val_colors = [None, COLOR_GREEN, COLOR_RED, COLOR_ORANGE, COLOR_BLUE]
 
     for i, header in enumerate(headers):
         cell = summary_tbl.rows[0].cells[i]
