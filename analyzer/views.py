@@ -6,7 +6,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .serializers import ClauseAnalyzerSerializer, MAX_PDF_SIZE_BYTES, MAX_PDF_SIZE_MB
+from .serializers import ClauseAnalyzerSerializer, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
 from .services import r2_service, pdf_service, groq_service, report_service
 from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLOR
 
@@ -48,7 +48,7 @@ class ClauseAnalyzerView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        pdf_url = serializer.validated_data["pdf_presigned_url"]
+        doc_url = serializer.validated_data["document_presigned_url"]
         clauses = serializer.validated_data["clauses"]
         report_format = serializer.validated_data.get("report_format", "pdf")
 
@@ -60,35 +60,36 @@ class ClauseAnalyzerView(APIView):
             "property":          serializer.validated_data.get("property") or {},
         }
 
-        # Step 1: Download PDF
+        # Step 1: Download document (PDF, DOCX, Markdown, TXT)
         try:
-            pdf_bytes = r2_service.download_pdf_from_presigned_url(pdf_url)
-            logger.info("PDF downloaded successfully (%d bytes)", len(pdf_bytes))
+            doc_bytes = r2_service.download_document_from_presigned_url(doc_url)
+            logger.info("Document downloaded successfully (%d bytes)", len(doc_bytes))
         except Exception as e:
-            logger.error("PDF download failed: %s", e)
+            logger.error("Document download failed: %s", e)
             return Response(
-                {"status": "error", "message": f"Failed to download PDF: {str(e)}"},
+                {"status": "error", "message": f"Failed to download document: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Validate PDF size (max 100 MB)
-        pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-        if len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
+        # Validate file size (max 100 MB)
+        file_size_mb = len(doc_bytes) / (1024 * 1024)
+        if len(doc_bytes) > MAX_FILE_SIZE_BYTES:
             return Response(
                 {
                     "status": "error",
                     "message": (
-                        f"PDF file size {pdf_size_mb:.2f} MB exceeds "
-                        f"the maximum allowed size of {MAX_PDF_SIZE_MB} MB."
+                        f"File size {file_size_mb:.2f} MB exceeds "
+                        f"the maximum allowed size of {MAX_FILE_SIZE_MB} MB."
                     ),
                 },
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
 
-        # Step 2: Extract text with positions
-        text_blocks = pdf_service.extract_text_with_positions(pdf_bytes)
+        # Step 2: Detect file type and extract text
+        file_type = pdf_service.detect_file_type(doc_url, doc_bytes)
+        text_blocks = pdf_service.extract_text_blocks(doc_url, doc_bytes)
         full_text = pdf_service.get_full_text(text_blocks)
-        logger.info("Extracted %d text blocks from PDF", len(text_blocks))
+        logger.info("Extracted %d text blocks from %s", len(text_blocks), file_type)
 
         if not full_text.strip():
             return Response(

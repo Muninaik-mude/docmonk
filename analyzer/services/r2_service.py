@@ -11,12 +11,16 @@ logger = logging.getLogger(__name__)
 
 def download_pdf_from_presigned_url(presigned_url: str) -> bytes:
     """Download PDF bytes from a presigned S3/R2 URL."""
+    return download_document_from_presigned_url(presigned_url)
+
+
+def download_document_from_presigned_url(presigned_url: str) -> bytes:
+    """Download document bytes (PDF, DOCX, Markdown, TXT) from a presigned URL."""
     response = requests.get(presigned_url, timeout=30)
     response.raise_for_status()
 
-    content_type = response.headers.get('Content-Type', '')
-    if 'pdf' not in content_type and not response.content[:5] == b'%PDF-':
-        raise ValueError("Downloaded content does not appear to be a PDF")
+    if not response.content:
+        raise ValueError("Downloaded content is empty")
 
     return response.content
 

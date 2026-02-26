@@ -41,12 +41,15 @@ class PropertySerializer(serializers.Serializer):
 
 
 MAX_CLAUSES = 100
-MAX_PDF_SIZE_MB = 100
-MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024  # 104,857,600 bytes
+MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024  # 104,857,600 bytes
+
+SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".md", ".txt")
 
 
 class ClauseAnalyzerSerializer(serializers.Serializer):
-    pdf_presigned_url = serializers.URLField()
+    document_presigned_url = serializers.URLField(required=False)
+    pdf_presigned_url = serializers.URLField(required=False)  # backward compat
     agreement_type = serializers.CharField(required=False, default="")
     agreement_details = AgreementDetailsSerializer(required=False)
     parties = PartiesSerializer(required=False)
@@ -57,6 +60,15 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
         default="pdf",
         required=False,
     )
+
+    def validate(self, attrs):
+        doc_url = attrs.get("document_presigned_url") or attrs.get("pdf_presigned_url")
+        if not doc_url:
+            raise serializers.ValidationError(
+                "Either 'document_presigned_url' or 'pdf_presigned_url' is required."
+            )
+        attrs["document_presigned_url"] = doc_url
+        return attrs
 
     def validate_clauses(self, value):
         if not value:

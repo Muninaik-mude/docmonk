@@ -1,6 +1,10 @@
+import io
 import logging
+import os
+from urllib.parse import urlparse
 
 import fitz  # PyMuPDF
+from docx import Document as DocxDocument
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,91 @@ def extract_text_with_positions(pdf_bytes: bytes) -> list[dict]:
 def get_full_text(text_blocks: list[dict]) -> str:
     """Concatenate all text blocks into a single string."""
     return "\n".join(block["text"] for block in text_blocks)
+
+
+def detect_file_type(url: str, file_bytes: bytes) -> str:
+    """
+    Detect the document type from the URL path or file magic bytes.
+    Returns one of: 'pdf', 'docx', 'markdown', 'txt'.
+    """
+    # Strip query params and get extension from URL path
+    path = urlparse(url).path.lower()
+    ext = os.path.splitext(path)[1]
+
+    if ext == ".pdf" or file_bytes[:5] == b"%PDF-":
+        return "pdf"
+    if ext == ".docx" or file_bytes[:4] == b"PK\x03\x04":
+        return "docx"
+    if ext in (".md", ".markdown"):
+        return "markdown"
+    if ext == ".txt":
+        return "txt"
+
+    # Fallback: try PDF magic bytes first, then assume text
+    if file_bytes[:5] == b"%PDF-":
+        return "pdf"
+    if file_bytes[:4] == b"PK\x03\x04":
+        return "docx"
+
+    # Default to text/markdown
+    return "txt"
+
+
+def extract_text_from_docx(file_bytes: bytes) -> list[dict]:
+    """
+    Extract text blocks from a DOCX file.
+    Returns same format as extract_text_with_positions for compatibility:
+    [{page_num, text, bbox}]
+    """
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    text_blocks = []
+
+    for i, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        if text:
+            text_blocks.append({
+                "page_num": 0,
+                "text": text,
+                "bbox": (30, 30 + i * 20, 550, 50 + i * 20),
+            })
+
+    return text_blocks
+
+
+def extract_text_from_markdown(file_bytes: bytes) -> list[dict]:
+    """
+    Extract text blocks from a Markdown or plain text file.
+    Returns same format as extract_text_with_positions for compatibility.
+    """
+    content = file_bytes.decode("utf-8", errors="replace")
+    text_blocks = []
+
+    for i, line in enumerate(content.split("\n")):
+        text = line.strip()
+        if text:
+            text_blocks.append({
+                "page_num": 0,
+                "text": text,
+                "bbox": (30, 30 + i * 20, 550, 50 + i * 20),
+            })
+
+    return text_blocks
+
+
+def extract_text_blocks(url: str, file_bytes: bytes) -> list[dict]:
+    """
+    Auto-detect file type and extract text blocks.
+    Unified entry point for PDF, DOCX, Markdown, and TXT files.
+    """
+    file_type = detect_file_type(url, file_bytes)
+    logger.info("Detected file type: %s", file_type)
+
+    if file_type == "pdf":
+        return extract_text_with_positions(file_bytes)
+    elif file_type == "docx":
+        return extract_text_from_docx(file_bytes)
+    else:
+        return extract_text_from_markdown(file_bytes)
 
 
 def annotate_pdf(pdf_bytes: bytes, annotations: list[dict]) -> bytes:
