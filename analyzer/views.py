@@ -35,9 +35,9 @@ class ClauseAnalyzerView(APIView):
     4. Detect jurisdiction (one AI call)
     5. Analyze each clause via Groq AI + annotate original PDF
     6. Detect cross-clause conflicts (one AI call)
-    7. Generate report (PDF / Markdown / DOCX / both) from analysis_summary
+    7. Generate report (redline) + summary (analytics)
     8. Upload report(s) to S3/R2 or save locally
-    9. Return analysis_summary + report download URL(s) + conflicts + jurisdiction
+    9. Return analysis_summary + report/summary download URL(s) + conflicts + jurisdiction
     """
 
     def post(self, request):
@@ -51,6 +51,14 @@ class ClauseAnalyzerView(APIView):
         pdf_url = serializer.validated_data["pdf_presigned_url"]
         clauses = serializer.validated_data["clauses"]
         report_format = serializer.validated_data.get("report_format", "pdf")
+
+        # Agreement metadata (all optional)
+        agreement_meta = {
+            "agreement_type":    serializer.validated_data.get("agreement_type", ""),
+            "agreement_details": serializer.validated_data.get("agreement_details") or {},
+            "parties":           serializer.validated_data.get("parties") or {},
+            "property":          serializer.validated_data.get("property") or {},
+        }
 
         # Step 1: Download PDF
         try:
@@ -119,10 +127,9 @@ class ClauseAnalyzerView(APIView):
                 "clause_content": clause.get("content") or clause.get("value", ""),
                 "result": result_status,
                 "reason": ai_result.get("reason"),
-                "relevant_text": ai_result.get("relevant_text"),   # actual PDF excerpt
+                "relevant_text": ai_result.get("relevant_text"),
                 "color": None,
                 "ai_added_text": None,
-                # New enrichment fields
                 "parties_obligated": ai_result.get("parties_obligated", []),
                 "missing_values": ai_result.get("missing_values", []),
                 "binding_strength": ai_result.get("binding_strength", "VAGUE"),
@@ -168,7 +175,7 @@ class ClauseAnalyzerView(APIView):
         conflicts = groq_service.detect_conflicts(analysis_summary)
         logger.info("Detected %d clause conflict(s)", len(conflicts))
 
-        # Step 6: Generate report(s) from analysis_summary
+        # Step 6: Generate report(s) + summary from analysis_summary
         run_id = uuid.uuid4()
         response_data = {
             "status": "success",
@@ -177,12 +184,18 @@ class ClauseAnalyzerView(APIView):
             "jurisdiction": jurisdiction_info,
         }
 
+        report_kwargs = dict(
+            conflicts=conflicts,
+            jurisdiction_info=jurisdiction_info,
+            full_text=full_text,
+            agreement_meta=agreement_meta,
+        )
+
         try:
             if report_format in ("pdf", "both"):
+                # Redline report
                 pdf_report_bytes = report_service.generate_pdf_report(
-                    analysis_summary,
-                    conflicts=conflicts,
-                    jurisdiction_info=jurisdiction_info,
+                    analysis_summary, **report_kwargs,
                 )
                 pdf_report_filename = f"report_{run_id}.pdf"
                 result = _upload_or_save(
@@ -191,13 +204,25 @@ class ClauseAnalyzerView(APIView):
                 )
                 response_data["report_pdf_url"] = result["url"]
                 response_data["report_pdf_expires_in"] = result["expires_in"]
-                logger.info("PDF report generated and stored: %s", pdf_report_filename)
+                logger.info("PDF report generated: %s", pdf_report_filename)
+
+                # Analytics summary
+                pdf_summary_bytes = report_service.generate_pdf_summary(
+                    analysis_summary, **report_kwargs,
+                )
+                pdf_summary_filename = f"summary_{run_id}.pdf"
+                result = _upload_or_save(
+                    pdf_summary_bytes, pdf_summary_filename,
+                    prefix="reports", content_type="application/pdf",
+                )
+                response_data["summary_pdf_url"] = result["url"]
+                response_data["summary_pdf_expires_in"] = result["expires_in"]
+                logger.info("PDF summary generated: %s", pdf_summary_filename)
 
             if report_format in ("markdown", "both"):
+                # Redline report
                 md_content = report_service.generate_markdown_report(
-                    analysis_summary,
-                    conflicts=conflicts,
-                    jurisdiction_info=jurisdiction_info,
+                    analysis_summary, **report_kwargs,
                 )
                 md_bytes = md_content.encode("utf-8")
                 md_filename = f"report_{run_id}.md"
@@ -207,13 +232,26 @@ class ClauseAnalyzerView(APIView):
                 )
                 response_data["report_markdown_url"] = result["url"]
                 response_data["report_markdown_expires_in"] = result["expires_in"]
-                logger.info("Markdown report generated and stored: %s", md_filename)
+                logger.info("Markdown report generated: %s", md_filename)
+
+                # Analytics summary
+                md_summary = report_service.generate_markdown_summary(
+                    analysis_summary, **report_kwargs,
+                )
+                md_summary_bytes = md_summary.encode("utf-8")
+                md_summary_filename = f"summary_{run_id}.md"
+                result = _upload_or_save(
+                    md_summary_bytes, md_summary_filename,
+                    prefix="reports", content_type="text/markdown",
+                )
+                response_data["summary_markdown_url"] = result["url"]
+                response_data["summary_markdown_expires_in"] = result["expires_in"]
+                logger.info("Markdown summary generated: %s", md_summary_filename)
 
             if report_format == "docx":
+                # Redline report
                 docx_bytes = report_service.generate_docx_report(
-                    analysis_summary,
-                    conflicts=conflicts,
-                    jurisdiction_info=jurisdiction_info,
+                    analysis_summary, **report_kwargs,
                 )
                 docx_filename = f"report_{run_id}.docx"
                 result = _upload_or_save(
@@ -223,7 +261,21 @@ class ClauseAnalyzerView(APIView):
                 )
                 response_data["report_docx_url"] = result["url"]
                 response_data["report_docx_expires_in"] = result["expires_in"]
-                logger.info("DOCX report generated and stored: %s", docx_filename)
+                logger.info("DOCX report generated: %s", docx_filename)
+
+                # Analytics summary
+                docx_summary_bytes = report_service.generate_docx_summary(
+                    analysis_summary, **report_kwargs,
+                )
+                docx_summary_filename = f"summary_{run_id}.docx"
+                result = _upload_or_save(
+                    docx_summary_bytes, docx_summary_filename,
+                    prefix="reports",
+                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                response_data["summary_docx_url"] = result["url"]
+                response_data["summary_docx_expires_in"] = result["expires_in"]
+                logger.info("DOCX summary generated: %s", docx_summary_filename)
 
         except Exception as e:
             logger.error("Report generation/upload failed: %s", e)

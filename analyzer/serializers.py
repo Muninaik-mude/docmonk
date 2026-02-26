@@ -9,6 +9,37 @@ class ClauseSerializer(serializers.Serializer):
     category = serializers.CharField(required=False, default="")
 
 
+class AgreementDetailsSerializer(serializers.Serializer):
+    agreement_date = serializers.CharField(required=False, default="")
+    city = serializers.CharField(required=False, default="")
+    state = serializers.CharField(required=False, default="")
+
+
+class LandlordSerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, default="")
+    address = serializers.CharField(required=False, default="")
+    contact = serializers.CharField(required=False, default="")
+
+
+class TenantSerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, default="")
+    company_name = serializers.CharField(required=False, default="")
+    authorized_signatory = serializers.CharField(required=False, default="")
+    address = serializers.CharField(required=False, default="")
+    contact = serializers.CharField(required=False, default="")
+
+
+class PartiesSerializer(serializers.Serializer):
+    landlord = LandlordSerializer(required=False)
+    tenant = TenantSerializer(required=False)
+
+
+class PropertySerializer(serializers.Serializer):
+    type = serializers.CharField(required=False, default="")
+    area_sqft = serializers.IntegerField(required=False, allow_null=True)
+    address = serializers.CharField(required=False, default="")
+
+
 MAX_CLAUSES = 100
 MAX_PDF_SIZE_MB = 100
 MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024  # 104,857,600 bytes
@@ -16,6 +47,10 @@ MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024  # 104,857,600 bytes
 
 class ClauseAnalyzerSerializer(serializers.Serializer):
     pdf_presigned_url = serializers.URLField()
+    agreement_type = serializers.CharField(required=False, default="")
+    agreement_details = AgreementDetailsSerializer(required=False)
+    parties = PartiesSerializer(required=False)
+    property = PropertySerializer(required=False)
     clauses = ClauseSerializer(many=True)
     report_format = serializers.ChoiceField(
         choices=["pdf", "markdown", "docx", "both"],

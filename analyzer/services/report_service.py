@@ -1,7 +1,7 @@
 import io
 import logging
+import re
 from collections import defaultdict
-from datetime import datetime, timezone
 
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 COLOR_RED    = "#dc3545"
 COLOR_GREEN  = "#28a745"
 COLOR_ORANGE = "#fd7e14"
+COLOR_BLUE   = "#0d6efd"
 COLOR_BLACK  = "#212529"
 COLOR_GREY   = "#6c757d"
 COLOR_DARK   = "#1a1a2e"
@@ -37,7 +38,7 @@ COLOR_RULE   = "#dee2e6"
 BG_RED    = "#fde8e8"
 BG_GREEN  = "#d4edda"
 BG_ORANGE = "#fff3cd"
-BG_BLUE   = "#e8f0fe"   # Document Evidence excerpt background
+BG_BLUE   = "#e8f0fe"
 
 # Risk level colors (text)
 COLOR_RISK = {
@@ -89,13 +90,7 @@ _CATEGORY_RISK_LEVEL = {
 
 
 def _get_risk_info(clause_title: str) -> tuple[str, str]:
-    """
-    Returns (category, risk_level) based on clause title keyword matching.
-      Legal Risk      → HIGH
-      Financial Risk  → HIGH
-      Operational Risk → MEDIUM
-      Process Risk    → LOW
-    """
+    """Returns (category, risk_level) based on clause title keyword matching."""
     t = clause_title.lower()
     for kw in _LEGAL_KEYWORDS:
         if kw in t:
@@ -143,26 +138,386 @@ def _dark_header_table(data: list, col_widths: list) -> Table:
     return tbl
 
 
-# ── PDF Report ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════
+#  PDF REPORT (Redline-style) — full PDF text + per-clause AI suggestions
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _pdf_agreement_block(story, agreement_meta: dict, styles: dict):
+    """Render the Agreement Details block into a ReportLab story list."""
+    if not agreement_meta:
+        return
+
+    section_header_style = styles["section_header"]
+    inner_style          = styles["inner"]
+    tbl_header_style     = styles["tbl_header"]
+    tbl_cell_style       = styles["tbl_cell"]
+
+    story.append(Paragraph("<b>Agreement Details</b>", section_header_style))
+    story.append(Spacer(1, 4))
+
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+    parties   = agreement_meta.get("parties") or {}
+    prop      = agreement_meta.get("property") or {}
+
+    # Agreement type + date/city/state
+    info_rows = []
+    if agmt_type:
+        info_rows.append(("Agreement Type", agmt_type))
+    if agmt_det.get("agreement_date"):
+        info_rows.append(("Agreement Date", agmt_det["agreement_date"]))
+    if agmt_det.get("city") or agmt_det.get("state"):
+        place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
+        info_rows.append(("Location", place))
+
+    if info_rows:
+        tbl_data = [[Paragraph("Field", tbl_header_style), Paragraph("Details", tbl_header_style)]]
+        for label, value in info_rows:
+            tbl_data.append([Paragraph(label, tbl_cell_style), Paragraph(value, tbl_cell_style)])
+        story.append(_dark_header_table(tbl_data, [PAGE_USABLE_W * 0.30, PAGE_USABLE_W * 0.70]))
+        story.append(Spacer(1, 6))
+
+    # Parties
+    landlord = parties.get("landlord") or {}
+    tenant   = parties.get("tenant") or {}
+    party_rows = []
+    if landlord.get("name"):
+        party_rows.append(("Landlord Name",    landlord["name"]))
+    if landlord.get("address"):
+        party_rows.append(("Landlord Address", landlord["address"]))
+    if landlord.get("contact"):
+        party_rows.append(("Landlord Contact", landlord["contact"]))
+
+    tenant_name = tenant.get("company_name") or tenant.get("name", "")
+    if tenant_name:
+        party_rows.append(("Tenant",           tenant_name))
+    if tenant.get("authorized_signatory"):
+        party_rows.append(("Authorized By",    tenant["authorized_signatory"]))
+    if tenant.get("address"):
+        party_rows.append(("Tenant Address",   tenant["address"]))
+    if tenant.get("contact"):
+        party_rows.append(("Tenant Contact",   tenant["contact"]))
+
+    if party_rows:
+        story.append(Paragraph("<b>Parties</b>", section_header_style))
+        story.append(Spacer(1, 2))
+        tbl_data = [[Paragraph("Field", tbl_header_style), Paragraph("Details", tbl_header_style)]]
+        for label, value in party_rows:
+            tbl_data.append([Paragraph(label, tbl_cell_style), Paragraph(value, tbl_cell_style)])
+        story.append(_dark_header_table(tbl_data, [PAGE_USABLE_W * 0.30, PAGE_USABLE_W * 0.70]))
+        story.append(Spacer(1, 6))
+
+    # Property
+    prop_rows = []
+    if prop.get("type"):
+        prop_rows.append(("Property Type",    prop["type"]))
+    if prop.get("area_sqft"):
+        prop_rows.append(("Area (sq ft)",     str(prop["area_sqft"])))
+    if prop.get("address"):
+        prop_rows.append(("Property Address", prop["address"]))
+
+    if prop_rows:
+        story.append(Paragraph("<b>Property</b>", section_header_style))
+        story.append(Spacer(1, 2))
+        tbl_data = [[Paragraph("Field", tbl_header_style), Paragraph("Details", tbl_header_style)]]
+        for label, value in prop_rows:
+            tbl_data.append([Paragraph(label, tbl_cell_style), Paragraph(value, tbl_cell_style)])
+        story.append(_dark_header_table(tbl_data, [PAGE_USABLE_W * 0.30, PAGE_USABLE_W * 0.70]))
+        story.append(Spacer(1, 6))
+
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor(COLOR_DARK)))
+    story.append(Spacer(1, 10))
+
+
+def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
+    """
+    Merge the full document text with per-clause AI answers inline.
+
+    Segment types returned:
+      {"type": "normal",       "text": str}  — unmatched line, no colour
+      {"type": "violation",    "text": str}  — VIOLATION original text  → red bg + strikethrough
+      {"type": "ai",           "text": str}  — AI correction/addition   → green bg
+      {"type": "partial",      "text": str}  — NOT_FOUND relevant_text  → orange bg (no strikethrough)
+      {"type": "match",        "text": str}  — MATCH relevant_text      → blue colour
+      {"type": "not_found_ai", "text": str}  — NOT_FOUND AI (no rt)    → orange bg, appended at end
+    """
+    violation_map  = {}   # text → ai_text
+    partial_map    = {}   # text → ai_text  (NOT_FOUND with relevant_text)
+    match_set      = []   # list of relevant/clause text keys
+    not_found_list = []   # ai_text for NOT_FOUND without relevant_text
+
+    for entry in analysis_summary:
+        result  = entry.get("result", "")
+        rt      = (entry.get("relevant_text") or "").strip()
+        cc      = (entry.get("clause_content", "")).strip()
+        ai_text = entry.get("ai_added_text", "") or ""
+
+        if result == "VIOLATION":
+            key = rt or cc
+            if key:
+                violation_map[key] = ai_text
+
+        elif result == "NOT_FOUND":
+            if rt:
+                partial_map[rt] = ai_text
+            elif ai_text:
+                not_found_list.append(ai_text)
+
+        elif result == "MATCH":
+            key = rt or cc
+            if key:
+                match_set.append(key)
+
+    # Skip lines that are only junk: digits, dots, dashes, underscores,
+    # bullet characters (•·◦◉), whitespace — e.g. "1.", "•", "...", "___"
+    _junk = re.compile(r'^[\d\.\-_\s\u2022\u00b7\u25cf\u25cb\u25cc\u25e6\*]+$')
+
+    # Strips leading "16. " or "16. Registration: " style prefixes so that
+    # a line like "16. Registration: This Agreement..." still matches a key
+    # that starts with "This Agreement..."
+    _num_prefix = re.compile(r'^\d+[\.\)]\s*(?:[A-Z][A-Za-z ,]+:\s*)?')
+
+    def _line_matches(s: str, key: str) -> bool:
+        """Return True if document line s matches violation/partial key."""
+        if not key or not s:
+            return False
+        if key in s or s in key:
+            return True
+        # Try again after stripping leading section-number prefix
+        clean = _num_prefix.sub('', s).strip()
+        if clean and len(clean) > 6 and (clean in key or key in clean):
+            return True
+        return False
+
+    segments = []
+
+    # Accumulators: consecutive lines from the same block are joined into ONE
+    # paragraph so they share a single background row and AI shows only once.
+    pending_v_key   = None
+    pending_v_lines = []   # text lines accumulated for this violation block
+    pending_v_ai    = None
+
+    pending_p_key   = None
+    pending_p_lines = []
+    pending_p_ai    = None
+
+    def _flush_violation():
+        nonlocal pending_v_key, pending_v_lines, pending_v_ai
+        if pending_v_lines:
+            segments.append({"type": "violation", "text": " ".join(pending_v_lines)})
+            if pending_v_ai:
+                segments.append({"type": "ai", "text": pending_v_ai})
+        pending_v_key   = None
+        pending_v_lines = []
+        pending_v_ai    = None
+
+    def _flush_partial():
+        nonlocal pending_p_key, pending_p_lines, pending_p_ai
+        if pending_p_lines:
+            segments.append({"type": "partial", "text": " ".join(pending_p_lines)})
+            if pending_p_ai:
+                segments.append({"type": "ai", "text": pending_p_ai})
+        pending_p_key   = None
+        pending_p_lines = []
+        pending_p_ai    = None
+
+    for line in (full_text or "").split("\n"):
+        stripped = line.strip()
+        if not stripped or _junk.match(stripped):
+            continue
+
+        # ── 1. Violation check ─────────────────────────────────────────────
+        matched_v_key = None
+        matched_v_ai  = None
+        for key, ai_text in violation_map.items():
+            if _line_matches(stripped, key):
+                matched_v_key = key
+                matched_v_ai  = ai_text
+                break
+
+        if matched_v_key is not None:
+            _flush_partial()
+            if matched_v_key == pending_v_key:
+                # Continuation — append to same paragraph
+                pending_v_lines.append(stripped)
+            else:
+                # New block — flush previous, start accumulator
+                _flush_violation()
+                pending_v_key   = matched_v_key
+                pending_v_lines = [stripped]
+                pending_v_ai    = matched_v_ai
+            continue
+
+        # Not a violation — flush any open violation block
+        _flush_violation()
+
+        # ── 2. Partial (NOT_FOUND with relevant_text) check ───────────────
+        matched_p_key = None
+        matched_p_ai  = None
+        for key, ai_text in partial_map.items():
+            if _line_matches(stripped, key):
+                matched_p_key = key
+                matched_p_ai  = ai_text
+                break
+
+        if matched_p_key is not None:
+            if matched_p_key == pending_p_key:
+                pending_p_lines.append(stripped)
+            else:
+                _flush_partial()
+                pending_p_key   = matched_p_key
+                pending_p_lines = [stripped]
+                pending_p_ai    = matched_p_ai
+            continue
+
+        # Not a partial — flush any open partial block
+        _flush_partial()
+
+        # ── 3. Match check ─────────────────────────────────────────────────
+        if any(_line_matches(stripped, key) for key in match_set):
+            segments.append({"type": "match", "text": stripped})
+            continue
+
+        # ── 4. Normal ──────────────────────────────────────────────────────
+        segments.append({"type": "normal", "text": stripped})
+
+    # Flush any still-open blocks at end of document
+    _flush_violation()
+    _flush_partial()
+
+    # NOT_FOUND AI suggestions without a located anchor → appended at end
+    for ai_text in not_found_list:
+        segments.append({"type": "not_found_ai", "text": ai_text})
+
+    return segments
+
 
 def generate_pdf_report(
     analysis_summary: list,
     *,
     conflicts: list = None,
     jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
 ) -> bytes:
     """
-    Generate a color-coded PDF compliance report with:
-      - Overall compliance score
-      - Red Flag summary (top 3 critical issues)
-      - Risk category breakdown table (Legal / Financial / Operational / Process)
-      - Jurisdiction & compliance checklist
-      - Clause conflict detection results
-      - Contract timeline (aggregated key dates/durations)
-      - Per-clause details: risk/status badges, obligations, binding strength,
-        missing values warning, clause content, AI recommendation
+    Generate a redline-style PDF report:
+      - Agreement details block
+      - Original document rendered inline:
+          violation lines: red bg + strikethrough + − icon
+          AI answer:       green bg + + icon immediately after
+          normal lines:    plain text
+          NOT_FOUND:       green/orange addition appended at end
     """
-    conflicts = conflicts or []
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+    )
+
+    S = getSampleStyleSheet()
+
+    inner_style = ParagraphStyle(
+        "RInner", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor(COLOR_BLACK),
+    )
+    violation_style = ParagraphStyle(
+        "RViolation", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor("#6b1015"),
+    )
+    ai_style = ParagraphStyle(
+        "RAi", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor("#155724"),
+    )
+    nf_style = ParagraphStyle(
+        "RNf", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor("#0a3577"),
+    )
+
+    story = []
+
+    # Inline redline document — no title, no header, no agreement block
+    segments = _build_inline_segments(full_text, analysis_summary)
+
+    for seg in segments:
+        stype = seg["type"]
+        text  = seg["text"]
+
+        if stype == "violation":
+            # Red bg + strikethrough
+            story.append(_bg_row(
+                f'<font color="{COLOR_RED}"><b>\u2212</b></font> <strike>{text}</strike>',
+                BG_RED, violation_style,
+            ))
+            story.append(Spacer(1, 1))
+
+        elif stype == "ai":
+            # Green bg — AI correction/addition
+            story.append(_bg_row(
+                f'<font color="{COLOR_GREEN}"><b>+</b></font> {text}',
+                BG_GREEN, ai_style,
+            ))
+            story.append(Spacer(1, 4))
+
+        elif stype == "partial":
+            # Blue bg — NOT_FOUND with relevant text
+            story.append(_bg_row(
+                f'<font color="{COLOR_BLUE}">\u25cf</font> {text}',
+                BG_BLUE, nf_style,
+            ))
+            story.append(Spacer(1, 1))
+
+        elif stype == "not_found_ai":
+            # Blue bg — NOT_FOUND AI suggestion (no anchor in doc)
+            story.append(_bg_row(
+                f'<font color="{COLOR_BLUE}"><b>+</b></font> {text}',
+                BG_BLUE, nf_style,
+            ))
+            story.append(Spacer(1, 4))
+
+        elif stype == "match":
+            # No color — satisfied/match clause (plain text)
+            story.append(Paragraph(text, inner_style))
+            story.append(Spacer(1, 1))
+
+        else:  # normal
+            story.append(Paragraph(text, inner_style))
+            story.append(Spacer(1, 1))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+#  PDF SUMMARY (Analytics) — score, tables, jurisdiction, timeline
+#  (No Clause Conflicts section)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def generate_pdf_summary(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
+) -> bytes:
+    """
+    Generate a PDF analytics summary with:
+      - Agreement details block
+      - Overall compliance score
+      - Critical Issues (Red Flag) table
+      - Risk Category Breakdown table
+      - Jurisdiction & Compliance Checklist
+      - Contract Timeline
+    """
     jurisdiction_info = jurisdiction_info or {}
 
     buffer = io.BytesIO()
@@ -177,7 +532,6 @@ def generate_pdf_report(
 
     S = getSampleStyleSheet()
 
-    # ── Paragraph styles ──────────────────────────────────────────────────────
     title_style = ParagraphStyle(
         "RTitle", parent=S["Title"],
         fontSize=16, fontName="Helvetica-Bold",
@@ -210,36 +564,10 @@ def generate_pdf_report(
         textColor=colors.HexColor(COLOR_DARK),
         spaceBefore=6, spaceAfter=4,
     )
-    clause_header_style = ParagraphStyle(
-        "RClauseHeader", parent=S["Normal"],
-        fontSize=10, fontName="Helvetica-Bold",
-        textColor=colors.HexColor(COLOR_DARK),
-        spaceBefore=0, spaceAfter=2,
-    )
-    risk_badge_style = ParagraphStyle(
-        "RRisk", parent=S["Normal"],
-        fontSize=8, fontName="Helvetica-Bold",
-        alignment=TA_CENTER, spaceBefore=0, spaceAfter=2,
-    )
-    status_label_style = ParagraphStyle(
-        "RStatus", parent=S["Normal"],
-        fontSize=9, fontName="Helvetica-Bold",
-        alignment=TA_RIGHT, spaceBefore=0, spaceAfter=2,
-    )
     inner_style = ParagraphStyle(
         "RInner", parent=S["Normal"],
         fontSize=9, leading=13,
         textColor=colors.HexColor(COLOR_BLACK),
-    )
-    inner_italic_style = ParagraphStyle(
-        "RInnerItalic", parent=S["Normal"],
-        fontSize=9, leading=13, fontName="Helvetica-Oblique",
-        textColor=colors.HexColor(COLOR_BLACK),
-    )
-    plain_text_style = ParagraphStyle(
-        "RPlainText", parent=S["Normal"],
-        fontSize=9, leading=13, leftIndent=8,
-        spaceAfter=3, textColor=colors.HexColor(COLOR_BLACK),
     )
     tbl_header_style = ParagraphStyle(
         "RTblHeader", parent=S["Normal"],
@@ -250,11 +578,13 @@ def generate_pdf_report(
         "RTblCell", parent=S["Normal"],
         fontSize=8, alignment=TA_CENTER,
     )
-    warning_style = ParagraphStyle(
-        "RWarning", parent=S["Normal"],
-        fontSize=8, leading=12, fontName="Helvetica-Oblique",
-        textColor=colors.HexColor(COLOR_ORANGE),
-    )
+
+    _styles = {
+        "section_header": section_header_style,
+        "inner": inner_style,
+        "tbl_header": tbl_header_style,
+        "tbl_cell": tbl_cell_style,
+    }
 
     story = []
 
@@ -275,7 +605,6 @@ def generate_pdf_report(
         score_color  = COLOR_SCORE_LOW
         score_status = "Critical"
 
-    # Build per-category stats
     category_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "compliant": 0, "issues": 0})
     for entry in analysis_summary:
         cat, _ = _get_risk_info(entry.get("clause_title", ""))
@@ -284,15 +613,6 @@ def generate_pdf_report(
             category_stats[cat]["compliant"] += 1
         else:
             category_stats[cat]["issues"] += 1
-
-    # ── Title block ───────────────────────────────────────────────────────────
-    story.append(Paragraph("CLAUSE COMPLIANCE ANALYSIS REPORT", title_style))
-    story.append(Paragraph(
-        f"Generated on {datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M UTC')}",
-        meta_style,
-    ))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor(COLOR_DARK)))
-    story.append(Spacer(1, 8))
 
     # ── Clause counts summary line ────────────────────────────────────────────
     story.append(Paragraph(
@@ -473,46 +793,6 @@ def generate_pdf_report(
             ))
         story.append(Spacer(1, 10))
 
-    # ── Clause Conflicts ──────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph("Clause Conflicts", section_header_style))
-
-    if not conflicts:
-        story.append(Paragraph(
-            f'<font color="{COLOR_GREEN}">No contradictions detected.</font>',
-            inner_style,
-        ))
-    else:
-        conf_data = [[
-            Paragraph("Clause A",            tbl_header_style),
-            Paragraph("Clause B",            tbl_header_style),
-            Paragraph("Conflict Description", tbl_header_style),
-        ]]
-        for conflict in conflicts:
-            conf_data.append([
-                Paragraph(conflict.get("clause_a", ""),  tbl_cell_style),
-                Paragraph(conflict.get("clause_b", ""),  tbl_cell_style),
-                Paragraph(conflict.get("conflict", ""),  tbl_cell_style),
-            ])
-        conf_tbl = Table(
-            conf_data,
-            colWidths=[PAGE_USABLE_W * 0.27, PAGE_USABLE_W * 0.27, PAGE_USABLE_W * 0.46],
-        )
-        conf_tbl.setStyle(TableStyle([
-            ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor(COLOR_DARK)),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.HexColor(BG_ORANGE), colors.HexColor("#fffdf5")]),
-            ("GRID",           (0, 0), (-1, -1), 0.4, colors.HexColor(COLOR_RULE)),
-            ("TOPPADDING",     (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING",  (0, 0), (-1, -1), 5),
-            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
-            ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(conf_tbl)
-    story.append(Spacer(1, 10))
-
     # ── Contract Timeline ─────────────────────────────────────────────────────
     timeline_rows = [
         (entry["clause_title"], dt)
@@ -543,152 +823,154 @@ def generate_pdf_report(
         ))
     story.append(Spacer(1, 10))
 
-    # ── Clause details section ────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor(COLOR_RULE)))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph("Clause Details", section_header_style))
-    story.append(Spacer(1, 4))
-
-    for idx, entry in enumerate(analysis_summary, start=1):
-        result         = entry.get("result", "NOT_FOUND")
-        clause_title   = entry.get("clause_title", "")
-        clause_content = entry.get("clause_content", "")
-        ai_text        = entry.get("ai_added_text", "")
-        relevant_text  = entry.get("relevant_text") or ""
-        parties        = entry.get("parties_obligated", [])
-        binding        = entry.get("binding_strength", "VAGUE")
-        missing        = entry.get("missing_values", [])
-
-        category, risk_level = _get_risk_info(clause_title)
-        risk_color = COLOR_RISK[risk_level]
-
-        if result == "VIOLATION":
-            status_color = COLOR_RED
-            status_label = "VIOLATION"
-            clause_bg    = BG_RED
-            ai_bg        = BG_GREEN
-            ai_label     = "Corrective Action"
-        elif result == "NOT_FOUND":
-            status_color = COLOR_ORANGE
-            status_label = "NOT FOUND"
-            clause_bg    = None
-            ai_bg        = BG_ORANGE
-            ai_label     = "Recommended Addition"
-        else:
-            status_color = COLOR_GREEN
-            status_label = "MATCH"
-            clause_bg    = None
-            ai_bg        = None
-            ai_label     = None
-
-        # Binding strength color
-        if binding == "MUST/SHALL":
-            binding_color = COLOR_GREEN
-        elif binding == "SHOULD":
-            binding_color = COLOR_ORANGE
-        else:
-            binding_color = COLOR_RED
-
-        # ── Header row: "N. Title"  |  [RISK LEVEL]  |  [STATUS] ──────────────
-        header_tbl = Table(
-            [[
-                Paragraph(f"<b>{idx}. {clause_title}</b>", clause_header_style),
-                Paragraph(
-                    f'<font color="{risk_color}"><b>[{risk_level} RISK]</b></font>',
-                    risk_badge_style,
-                ),
-                Paragraph(
-                    f'<font color="{status_color}"><b>[{status_label}]</b></font>',
-                    status_label_style,
-                ),
-            ]],
-            colWidths=[
-                PAGE_USABLE_W * 0.55,
-                PAGE_USABLE_W * 0.22,
-                PAGE_USABLE_W * 0.23,
-            ],
-        )
-        header_tbl.setStyle(TableStyle([
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-        ]))
-        story.append(header_tbl)
-
-        # ── Obligations + Binding Strength ────────────────────────────────────
-        parties_str = " / ".join(parties) if parties else "—"
-        meta_tbl = Table(
-            [[
-                Paragraph(
-                    f'<font color="{COLOR_GREY}">Obligations: <b>{parties_str}</b></font>',
-                    inner_style,
-                ),
-                Paragraph(
-                    f'<font color="{binding_color}"><b>Binding: {binding}</b></font>',
-                    risk_badge_style,
-                ),
-            ]],
-            colWidths=[PAGE_USABLE_W * 0.60, PAGE_USABLE_W * 0.40],
-        )
-        meta_tbl.setStyle(TableStyle([
-            ("TOPPADDING",    (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-        ]))
-        story.append(meta_tbl)
-
-        # ── Missing Values warning ────────────────────────────────────────────
-        if missing:
-            warning_text = "Missing values: " + "; ".join(missing)
-            story.append(_bg_row(f"\u26a0  {warning_text}", BG_ORANGE, warning_style))
-            story.append(Spacer(1, 2))
-
-        # ── Clause content row ────────────────────────────────────────────────
-        if clause_content:
-            if clause_bg:
-                story.append(_bg_row(f"Clause: {clause_content}", clause_bg, inner_style))
-            else:
-                story.append(Paragraph(f"Clause: {clause_content}", plain_text_style))
-            story.append(Spacer(1, 2))
-
-        # ── Document Evidence row (relevant_text from PDF) ────────────────────
-        if relevant_text:
-            doc_evidence_style = ParagraphStyle(
-                f"RDocEvidence_{idx}", parent=inner_italic_style,
-                textColor=colors.HexColor("#1a3a5c"),
-            )
-            story.append(_bg_row(
-                f'<font color="#1a3a5c"><b>Document Evidence:</b></font> {relevant_text}',
-                BG_BLUE,
-                doc_evidence_style,
-            ))
-            story.append(Spacer(1, 2))
-
-        # ── AI recommendation row ─────────────────────────────────────────────
-        if ai_text and ai_bg:
-            story.append(_bg_row(f"{ai_label}: {ai_text}", ai_bg, inner_italic_style))
-            story.append(Spacer(1, 2))
-
-        story.append(HRFlowable(width="100%", thickness=0.3, color=colors.HexColor(COLOR_RULE)))
-        story.append(Spacer(1, 6))
-
     doc.build(story)
     return buffer.getvalue()
 
 
-# ── Markdown Report ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════
+#  MARKDOWN REPORT (Redline-style) — no risk titles, full text + AI suggestions
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _md_agreement_block(agreement_meta: dict) -> list:
+    """Return Markdown lines for the Agreement Details block."""
+    if not agreement_meta:
+        return []
+
+    lines = ["## Agreement Details", ""]
+
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+    parties   = agreement_meta.get("parties") or {}
+    prop      = agreement_meta.get("property") or {}
+
+    if agmt_type:
+        lines.append(f"**Agreement Type:** {agmt_type}")
+    if agmt_det.get("agreement_date"):
+        lines.append(f"**Agreement Date:** {agmt_det['agreement_date']}")
+    place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
+    if place:
+        lines.append(f"**Location:** {place}")
+
+    landlord = parties.get("landlord") or {}
+    tenant   = parties.get("tenant") or {}
+    if any(landlord.values()) or any(tenant.values()):
+        lines += ["", "### Parties", ""]
+        if landlord.get("name"):
+            lines.append(f"**Landlord:** {landlord['name']}")
+        if landlord.get("address"):
+            lines.append(f"**Landlord Address:** {landlord['address']}")
+        if landlord.get("contact"):
+            lines.append(f"**Landlord Contact:** {landlord['contact']}")
+        tenant_name = tenant.get("company_name") or tenant.get("name", "")
+        if tenant_name:
+            lines.append(f"**Tenant:** {tenant_name}")
+        if tenant.get("authorized_signatory"):
+            lines.append(f"**Authorized By:** {tenant['authorized_signatory']}")
+        if tenant.get("address"):
+            lines.append(f"**Tenant Address:** {tenant['address']}")
+        if tenant.get("contact"):
+            lines.append(f"**Tenant Contact:** {tenant['contact']}")
+
+    if any(prop.values()):
+        lines += ["", "### Property", ""]
+        if prop.get("type"):
+            lines.append(f"**Type:** {prop['type']}")
+        if prop.get("area_sqft"):
+            lines.append(f"**Area:** {prop['area_sqft']} sq ft")
+        if prop.get("address"):
+            lines.append(f"**Address:** {prop['address']}")
+
+    lines += ["", "---", ""]
+    return lines
+
 
 def generate_markdown_report(
     analysis_summary: list,
     *,
     conflicts: list = None,
     jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
 ) -> str:
-    """Generate a Markdown compliance report with all 8 enhancement sections."""
-    conflicts = conflicts or []
+    """
+    Generate a redline-style Markdown report using HTML for colors.
+    Shows the original document inline — violations struck through (red bg),
+    AI answers in green bg immediately after. No separate clause sections.
+    """
+    # Inline redline — no title/header/agreement block; uses HTML for background colors
+    lines = []
+    segments = _build_inline_segments(full_text, analysis_summary)
+
+    for seg in segments:
+        stype = seg["type"]
+        text  = seg["text"]
+
+        if stype == "violation":
+            # Red background + strikethrough (VIOLATION)
+            lines.append(
+                f'<p style="background-color:#fde8e8; padding:6px 10px; margin:2px 0;">'
+                f'<span style="color:#dc3545; font-weight:bold;">&#8722;</span>&nbsp;'
+                f'<span style="color:#6b1015; text-decoration:line-through;">{text}</span>'
+                f'</p>'
+            )
+
+        elif stype == "ai":
+            # Green background — AI correction/addition
+            lines.append(
+                f'<p style="background-color:#d4edda; padding:6px 10px; margin:2px 0;">'
+                f'<span style="color:#28a745; font-weight:bold;">+</span>&nbsp;'
+                f'<span style="color:#155724;">{text}</span>'
+                f'</p>'
+            )
+            lines.append("")
+
+        elif stype == "partial":
+            # Blue background — NOT_FOUND with relevant text
+            lines.append(
+                f'<p style="background-color:#e8f0fe; padding:6px 10px; margin:2px 0;">'
+                f'<span style="color:#0d6efd; font-weight:bold;">&#9679;</span>&nbsp;'
+                f'<span style="color:#0a3577;">{text}</span>'
+                f'</p>'
+            )
+
+        elif stype == "not_found_ai":
+            # Blue background — NOT_FOUND AI suggestion (no anchor in doc)
+            lines.append(
+                f'<p style="background-color:#e8f0fe; padding:6px 10px; margin:2px 0;">'
+                f'<span style="color:#0d6efd; font-weight:bold;">+</span>&nbsp;'
+                f'<span style="color:#0a3577;">{text}</span>'
+                f'</p>'
+            )
+            lines.append("")
+
+        elif stype == "match":
+            # No color — satisfied/match clause (plain text)
+            lines.append(
+                f'<p style="margin:2px 0; padding:2px 0;">{text}</p>'
+            )
+
+        else:  # normal
+            lines.append(
+                f'<p style="margin:2px 0; padding:2px 0;">{text}</p>'
+            )
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+#  MARKDOWN SUMMARY (Analytics) — no Clause Conflicts
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def generate_markdown_summary(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
+) -> str:
+    """Generate a Markdown analytics summary — score, tables, jurisdiction, timeline.
+    No Clause Conflicts section."""
     jurisdiction_info = jurisdiction_info or {}
 
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
@@ -696,16 +978,14 @@ def generate_markdown_report(
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
     total           = len(analysis_summary)
     compliance_score = round((match_count / total) * 100) if total else 0
-    generated_at     = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
 
     if compliance_score >= 80:
-        score_status = "✅ Compliant"
+        score_status = "Compliant"
     elif compliance_score >= 50:
-        score_status = "⚠️ Needs Attention"
+        score_status = "Needs Attention"
     else:
-        score_status = "🔴 Critical"
+        score_status = "Critical"
 
-    # Category stats
     category_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "compliant": 0, "issues": 0})
     for entry in analysis_summary:
         cat, _ = _get_risk_info(entry.get("clause_title", ""))
@@ -716,12 +996,6 @@ def generate_markdown_report(
             category_stats[cat]["issues"] += 1
 
     lines = [
-        "# Clause Compliance Analysis Report",
-        "",
-        f"> Generated on {generated_at}",
-        "",
-        "---",
-        "",
         "## Summary",
         "",
         f"**Overall Compliance Score: {compliance_score}% — {score_status}**",
@@ -738,7 +1012,7 @@ def generate_markdown_report(
     red_flags += [e for e in analysis_summary if e["result"] == "NOT_FOUND"]
     red_flags = red_flags[:3]
     if not red_flags:
-        lines.append("No critical issues found. ✓")
+        lines.append("No critical issues found.")
     else:
         lines += [
             "| Clause | Status | Issue |",
@@ -755,14 +1029,13 @@ def generate_markdown_report(
         "| Category | Risk Level | Total | Compliant | Issues |",
         "|:---|:---:|:---:|:---:|:---:|",
     ]
-    risk_badges = {"HIGH": "🔴 HIGH", "MEDIUM": "🟠 MEDIUM", "LOW": "🟢 LOW"}
     for cat in CATEGORY_ORDER:
         if cat not in category_stats:
             continue
         risk_lv, _ = _CATEGORY_RISK_LEVEL[cat]
         s = category_stats[cat]
         lines.append(
-            f"| {cat} | {risk_badges[risk_lv]} | {s['total']} | {s['compliant']} | {s['issues']} |"
+            f"| {cat} | {risk_lv} | {s['total']} | {s['compliant']} | {s['issues']} |"
         )
     lines += ["", "---", ""]
 
@@ -772,7 +1045,7 @@ def generate_markdown_report(
         juris     = jurisdiction_info.get("jurisdiction", "Unknown")
         agmt_type = jurisdiction_info.get("agreement_type", "Unknown")
         laws      = ", ".join(jurisdiction_info.get("applicable_laws", []))
-        lines.append(f"**Jurisdiction:** {juris} &nbsp; **Agreement Type:** {agmt_type}")
+        lines.append(f"**Jurisdiction:** {juris}   **Agreement Type:** {agmt_type}")
         if laws:
             lines.append(f"**Applicable Laws:** {laws}")
         lines.append("")
@@ -787,21 +1060,6 @@ def generate_markdown_report(
                 lines.append(f"| {item.get('item', '')} | {req_label} |")
     else:
         lines.append("Jurisdiction information not available.")
-    lines += ["", "---", ""]
-
-    # ── Clause Conflicts ──────────────────────────────────────────────────────
-    lines += ["## Clause Conflicts", ""]
-    if not conflicts:
-        lines.append("No contradictions detected. ✓")
-    else:
-        lines += [
-            "| Clause A | Clause B | Conflict Description |",
-            "|:---|:---|:---|",
-        ]
-        for c in conflicts:
-            lines.append(
-                f"| {c.get('clause_a', '')} | {c.get('clause_b', '')} | {c.get('conflict', '')} |"
-            )
     lines += ["", "---", ""]
 
     # ── Contract Timeline ─────────────────────────────────────────────────────
@@ -821,54 +1079,7 @@ def generate_markdown_report(
         ]
         for clause_title, tl_item in timeline_rows:
             lines.append(f"| {clause_title} | {tl_item} |")
-    lines += ["", "---", "", "## Clause Details", ""]
-
-    # ── Clause Details ────────────────────────────────────────────────────────
-    for idx, entry in enumerate(analysis_summary, start=1):
-        result         = entry.get("result", "NOT_FOUND")
-        clause_title   = entry.get("clause_title", "")
-        clause_id      = entry.get("clause_id", "")
-        clause_content = entry.get("clause_content", "")
-        ai_text        = entry.get("ai_added_text", "")
-        relevant_text  = entry.get("relevant_text") or ""
-        parties        = entry.get("parties_obligated", [])
-        binding        = entry.get("binding_strength", "VAGUE")
-        missing        = entry.get("missing_values", [])
-        category, risk_level = _get_risk_info(clause_title)
-
-        if result == "VIOLATION":
-            badge    = "🔴 VIOLATION"
-            ai_label = "Corrective Action"
-        elif result == "NOT_FOUND":
-            badge    = "🟠 NOT FOUND"
-            ai_label = "Recommended Addition"
-        else:
-            badge    = "✅ MATCH"
-            ai_label = None
-
-        lines.append(f"### {idx}. {clause_title} — {badge} | {risk_badges[risk_level]}")
-        lines.append("")
-        lines.append(f"**ID:** `{clause_id}` &nbsp; **Category:** {category}")
-
-        parties_str = " / ".join(parties) if parties else "—"
-        lines.append(f"**Obligations:** {parties_str} &nbsp; **Binding:** `{binding}`")
-
-        if missing:
-            lines.append(f"> ⚠️ **Missing values:** {'; '.join(missing)}")
-
-        if clause_content:
-            lines.append(f"**Clause:** {clause_content}")
-
-        if relevant_text:
-            lines.append(f"> 📄 **Document Evidence:** *{relevant_text}*")
-
-        if ai_text and ai_label:
-            lines.append("")
-            lines.append(f"> **{ai_label}:** {ai_text}")
-
-        lines.append("")
-        lines.append("---")
-        lines.append("")
+    lines += [""]
 
     return "\n".join(lines)
 
@@ -902,13 +1113,7 @@ def _set_paragraph_shading(paragraph, hex_color: str):
 
 
 def _docx_dark_header_table(doc, headers: list, rows: list, col_widths_pct: list = None):
-    """
-    Build a docx table with a dark header row.
-    headers: list of str
-    rows: list of list of str (or list of (str, color_hex) tuples for colored cells)
-    col_widths_pct: optional list of fractional widths (must sum to 1.0)
-    Returns the table object.
-    """
+    """Build a docx table with a dark header row."""
     tbl = doc.add_table(rows=1, cols=len(headers))
     tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     for i, hdr in enumerate(headers):
@@ -942,19 +1147,185 @@ def _docx_dark_header_table(doc, headers: list, rows: list, col_widths_pct: list
     return tbl
 
 
-# ── DOCX Report ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════
+#  DOCX REPORT (Redline-style) — full PDF text + per-clause AI suggestions
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _docx_agreement_block(doc, agreement_meta: dict):
+    """Render Agreement Details block into a DOCX document."""
+    if not agreement_meta:
+        return
+
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+    parties   = agreement_meta.get("parties") or {}
+    prop      = agreement_meta.get("property") or {}
+
+    doc.add_heading("Agreement Details", level=1)
+
+    # Basic info table
+    info_rows = []
+    if agmt_type:
+        info_rows.append(("Agreement Type", agmt_type))
+    if agmt_det.get("agreement_date"):
+        info_rows.append(("Agreement Date", agmt_det["agreement_date"]))
+    place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
+    if place:
+        info_rows.append(("Location", place))
+
+    if info_rows:
+        _docx_dark_header_table(doc, ["Field", "Details"],
+                                [[lbl, val] for lbl, val in info_rows])
+
+    # Parties
+    landlord = parties.get("landlord") or {}
+    tenant   = parties.get("tenant") or {}
+    party_rows = []
+    if landlord.get("name"):
+        party_rows.append(("Landlord Name",    landlord["name"]))
+    if landlord.get("address"):
+        party_rows.append(("Landlord Address", landlord["address"]))
+    if landlord.get("contact"):
+        party_rows.append(("Landlord Contact", landlord["contact"]))
+    tenant_name = tenant.get("company_name") or tenant.get("name", "")
+    if tenant_name:
+        party_rows.append(("Tenant",           tenant_name))
+    if tenant.get("authorized_signatory"):
+        party_rows.append(("Authorized By",    tenant["authorized_signatory"]))
+    if tenant.get("address"):
+        party_rows.append(("Tenant Address",   tenant["address"]))
+    if tenant.get("contact"):
+        party_rows.append(("Tenant Contact",   tenant["contact"]))
+
+    if party_rows:
+        doc.add_heading("Parties", level=2)
+        _docx_dark_header_table(doc, ["Field", "Details"],
+                                [[lbl, val] for lbl, val in party_rows])
+
+    # Property
+    prop_rows = []
+    if prop.get("type"):
+        prop_rows.append(("Property Type",    prop["type"]))
+    if prop.get("area_sqft"):
+        prop_rows.append(("Area (sq ft)",     str(prop["area_sqft"])))
+    if prop.get("address"):
+        prop_rows.append(("Property Address", prop["address"]))
+
+    if prop_rows:
+        doc.add_heading("Property", level=2)
+        _docx_dark_header_table(doc, ["Field", "Details"],
+                                [[lbl, val] for lbl, val in prop_rows])
+
+    doc.add_paragraph("_" * 80)
+
 
 def generate_docx_report(
     analysis_summary: list,
     *,
     conflicts: list = None,
     jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
 ) -> bytes:
     """
-    Generate a DOCX compliance report with all 8 enhancement sections.
-    Includes the 'reason' field (not shown in PDF).
+    Generate a redline-style DOCX report:
+      - Agreement details block
+      - Full original PDF text (red bg)
+      - Per clause: title + status, PDF data (red bg), AI suggestion (green bg)
     """
-    conflicts = conflicts or []
+    doc = Document()
+
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    # ── Inline redline: original text + AI answers merged — no header/agreement ─
+    segments = _build_inline_segments(full_text, analysis_summary)
+    for seg in segments:
+        stype = seg["type"]
+        text  = seg["text"]
+
+        if stype == "violation":
+            # Red bg + strikethrough (VIOLATION)
+            vp = doc.add_paragraph()
+            run = vp.add_run("\u2212 ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_RED)
+            run = vp.add_run(text)
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_RED)
+            run.font.strikethrough = True
+            _set_paragraph_shading(vp, BG_RED)
+
+        elif stype == "ai":
+            # Green bg — AI correction/addition
+            ap = doc.add_paragraph()
+            run = ap.add_run("+ ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_GREEN)
+            run = ap.add_run(text)
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb("#155724")
+            _set_paragraph_shading(ap, BG_GREEN)
+
+        elif stype == "partial":
+            # Blue bg — NOT_FOUND with relevant text
+            pp = doc.add_paragraph()
+            run = pp.add_run("\u25cf ")
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_BLUE)
+            run = pp.add_run(text)
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb("#0a3577")
+            _set_paragraph_shading(pp, BG_BLUE)
+
+        elif stype == "not_found_ai":
+            # Blue bg — NOT_FOUND AI (no anchor found in doc)
+            nfp = doc.add_paragraph()
+            run = nfp.add_run("+ ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb(COLOR_BLUE)
+            run = nfp.add_run(text)
+            run.font.size = Pt(10)
+            run.font.color.rgb = _hex_to_rgb("#0a3577")
+            _set_paragraph_shading(nfp, BG_BLUE)
+
+        elif stype == "match":
+            # No color — satisfied/match clause (plain text)
+            mp = doc.add_paragraph()
+            run = mp.add_run(text)
+            run.font.size = Pt(10)
+
+        else:  # normal
+            np_ = doc.add_paragraph()
+            run = np_.add_run(text)
+            run.font.size = Pt(10)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+#  DOCX SUMMARY (Analytics) — no Clause Conflicts
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def generate_docx_summary(
+    analysis_summary: list,
+    *,
+    conflicts: list = None,
+    jurisdiction_info: dict = None,
+    full_text: str = "",
+    agreement_meta: dict = None,
+) -> bytes:
+    """
+    Generate a DOCX analytics summary with score, critical issues,
+    risk breakdown, jurisdiction checklist, and timeline.
+    No Clause Conflicts section.
+    """
     jurisdiction_info = jurisdiction_info or {}
 
     doc = Document()
@@ -969,7 +1340,6 @@ def generate_docx_report(
     not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
     total           = len(analysis_summary)
     compliance_score = round((match_count / total) * 100) if total else 0
-    generated_at     = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
 
     if compliance_score >= 80:
         score_status = "Compliant"
@@ -981,7 +1351,6 @@ def generate_docx_report(
         score_status = "Critical"
         score_color  = COLOR_SCORE_LOW
 
-    # Category stats
     category_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "compliant": 0, "issues": 0})
     for entry in analysis_summary:
         cat, _ = _get_risk_info(entry.get("clause_title", ""))
@@ -990,18 +1359,6 @@ def generate_docx_report(
             category_stats[cat]["compliant"] += 1
         else:
             category_stats[cat]["issues"] += 1
-
-    # ── Title ────────────────────────────────────────────────────────────────
-    title = doc.add_heading("CLAUSE COMPLIANCE ANALYSIS REPORT", level=0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    meta = doc.add_paragraph()
-    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = meta.add_run(f"Generated on {generated_at}")
-    run.font.size = Pt(9)
-    run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
-
-    doc.add_paragraph("_" * 80)
 
     # ── Summary table ────────────────────────────────────────────────────────
     doc.add_heading("Summary", level=1)
@@ -1144,21 +1501,6 @@ def generate_docx_report(
         p = doc.add_paragraph()
         p.add_run("Jurisdiction information not available.").font.size = Pt(10)
 
-    # ── Clause Conflicts ──────────────────────────────────────────────────────
-    doc.add_heading("Clause Conflicts", level=1)
-
-    if not conflicts:
-        p = doc.add_paragraph()
-        run = p.add_run("No contradictions detected.")
-        run.font.color.rgb = _hex_to_rgb(COLOR_GREEN)
-        run.font.size = Pt(10)
-    else:
-        conf_rows = [
-            [c.get("clause_a", ""), c.get("clause_b", ""), c.get("conflict", "")]
-            for c in conflicts
-        ]
-        _docx_dark_header_table(doc, ["Clause A", "Clause B", "Conflict Description"], conf_rows)
-
     # ── Contract Timeline ─────────────────────────────────────────────────────
     doc.add_heading("Contract Timeline", level=1)
 
@@ -1174,150 +1516,6 @@ def generate_docx_report(
         tl_rows = [[ct, ti] for ct, ti in timeline_rows]
         _docx_dark_header_table(doc, ["Clause", "Timeline Item"], tl_rows)
 
-    # ── Clause Details ───────────────────────────────────────────────────────
-    doc.add_heading("Clause Details", level=1)
-
-    for idx, entry in enumerate(analysis_summary, start=1):
-        result         = entry.get("result", "NOT_FOUND")
-        clause_title   = entry.get("clause_title", "")
-        clause_id      = entry.get("clause_id", "")
-        clause_content = entry.get("clause_content", "")
-        ai_text        = entry.get("ai_added_text", "")
-        reason         = entry.get("reason", "")
-        relevant_text  = entry.get("relevant_text") or ""
-        parties        = entry.get("parties_obligated", [])
-        binding        = entry.get("binding_strength", "VAGUE")
-        missing        = entry.get("missing_values", [])
-
-        category, risk_level = _get_risk_info(clause_title)
-        risk_color = COLOR_RISK[risk_level]
-
-        if result == "VIOLATION":
-            status_color = COLOR_RED
-            status_label = "VIOLATION"
-            clause_bg    = BG_RED
-            ai_bg        = BG_GREEN
-            ai_label     = "Corrective Action"
-        elif result == "NOT_FOUND":
-            status_color = COLOR_ORANGE
-            status_label = "NOT FOUND"
-            clause_bg    = None
-            ai_bg        = BG_ORANGE
-            ai_label     = "Recommended Addition"
-        else:
-            status_color = COLOR_GREEN
-            status_label = "MATCH"
-            clause_bg    = None
-            ai_bg        = None
-            ai_label     = None
-
-        # Binding strength color
-        if binding == "MUST/SHALL":
-            binding_color = COLOR_GREEN
-        elif binding == "SHOULD":
-            binding_color = COLOR_ORANGE
-        else:
-            binding_color = COLOR_RED
-
-        # Clause heading with risk + status badges
-        heading_para = doc.add_paragraph()
-        run = heading_para.add_run(f"{idx}. {clause_title}  ")
-        run.bold = True
-        run.font.size = Pt(11)
-
-        run = heading_para.add_run(f"[{risk_level} RISK]  ")
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = _hex_to_rgb(risk_color)
-
-        run = heading_para.add_run(f"[{status_label}]")
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = _hex_to_rgb(status_color)
-
-        # ID + Category
-        id_para = doc.add_paragraph()
-        run = id_para.add_run(f"ID: {clause_id}    Category: {category}")
-        run.font.size = Pt(9)
-        run.font.color.rgb = _hex_to_rgb(COLOR_GREY)
-
-        # Obligations + Binding Strength
-        parties_str = " / ".join(parties) if parties else "—"
-        meta_para = doc.add_paragraph()
-        run = meta_para.add_run("Obligations: ")
-        run.bold = True
-        run.font.size = Pt(9)
-        run = meta_para.add_run(parties_str + "    ")
-        run.font.size = Pt(9)
-        run = meta_para.add_run("Binding: ")
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = _hex_to_rgb(binding_color)
-        run = meta_para.add_run(binding)
-        run.font.size = Pt(9)
-        run.bold = True
-        run.font.color.rgb = _hex_to_rgb(binding_color)
-
-        # Missing Values warning
-        if missing:
-            warn_para = doc.add_paragraph()
-            run = warn_para.add_run("\u26a0  Missing values: " + "; ".join(missing))
-            run.font.size = Pt(9)
-            run.italic = True
-            run.font.color.rgb = _hex_to_rgb(COLOR_ORANGE)
-            _set_paragraph_shading(warn_para, BG_ORANGE)
-
-        # Clause content — red background for VIOLATION
-        if clause_content:
-            cp = doc.add_paragraph()
-            run = cp.add_run("Clause: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run = cp.add_run(clause_content)
-            run.font.size = Pt(10)
-            if clause_bg:
-                _set_paragraph_shading(cp, clause_bg)
-
-        # REASON field — DOCX only, not shown in PDF
-        if reason:
-            rp = doc.add_paragraph()
-            run = rp.add_run("Reason: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run.font.color.rgb = _hex_to_rgb(COLOR_DARK)
-            run = rp.add_run(reason)
-            run.font.size = Pt(10)
-            run.italic = True
-
-        # Document Evidence — actual text extracted from the PDF
-        if relevant_text:
-            ep = doc.add_paragraph()
-            run = ep.add_run("Document Evidence: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run.font.color.rgb = _hex_to_rgb("#1a3a5c")
-            run = ep.add_run(relevant_text)
-            run.font.size = Pt(9)
-            run.italic = True
-            run.font.color.rgb = _hex_to_rgb("#1a3a5c")
-            _set_paragraph_shading(ep, BG_BLUE)
-
-        # AI recommendation — green background for VIOLATION, orange for NOT_FOUND
-        if ai_text and ai_label:
-            ap = doc.add_paragraph()
-            run = ap.add_run(f"{ai_label}: ")
-            run.bold = True
-            run.font.size = Pt(10)
-            run.font.color.rgb = _hex_to_rgb(status_color)
-            run = ap.add_run(ai_text)
-            run.font.size = Pt(10)
-            run.italic = True
-            if ai_bg:
-                _set_paragraph_shading(ap, ai_bg)
-
-        doc.add_paragraph("_" * 80)
-
-    # Save to bytes
     buffer = io.BytesIO()
     doc.save(buffer)
     return buffer.getvalue()
