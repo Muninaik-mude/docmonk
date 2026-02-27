@@ -80,7 +80,7 @@ def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
     Returns the extracted text, or empty string if nothing found / on error.
     """
     user_message = _EXTRACT_USER.format(title=title, doc_text=doc_text)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=30.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY,base_url= 'htpps://api.groq.com/openai/v1', max_retries=0, timeout=30.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
