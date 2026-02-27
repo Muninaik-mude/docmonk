@@ -2,7 +2,7 @@ import json
 import logging
 import time
 
-from groq import Groq, RateLimitError
+from openai import OpenAI, RateLimitError
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -186,7 +186,7 @@ def _parse_response(response_text: str) -> dict:
 
 def _call_groq(user_message: str) -> str:
     """Call Groq AI with rate-limit retry. Returns raw response text."""
-    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -195,7 +195,7 @@ def _call_groq(user_message: str) -> str:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
-                model=settings.GROQ_MODEL,
+                model=settings.OPENAI_MODEL,
                 temperature=0.1,
                 max_tokens=1500,
             )
@@ -294,7 +294,7 @@ def detect_jurisdiction(pdf_text: str) -> dict:
     """
     excerpt = pdf_text[:3000]
     user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
-    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -303,7 +303,7 @@ def detect_jurisdiction(pdf_text: str) -> dict:
                     {"role": "system", "content": _JURISDICTION_SYSTEM},
                     {"role": "user", "content": user_message},
                 ],
-                model=settings.GROQ_MODEL,
+                model=settings.OPENAI_MODEL,
                 temperature=0.1,
                 max_tokens=1000,
             )
@@ -376,7 +376,7 @@ def detect_conflicts(analysis_summary: list) -> list:
     clause_summary_text = "\n".join(lines)
 
     user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
-    client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -385,7 +385,7 @@ def detect_conflicts(analysis_summary: list) -> list:
                     {"role": "system", "content": _CONFLICT_SYSTEM},
                     {"role": "user", "content": user_message},
                 ],
-                model=settings.GROQ_MODEL,
+                model=settings.OPENAI_MODEL,
                 temperature=0.1,
                 max_tokens=800,
             )

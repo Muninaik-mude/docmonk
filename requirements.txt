@@ -2,7 +2,6 @@ django>=4.2
 djangorestframework
 boto3
 PyMuPDF
-groq
 openai
 python-dotenv
 requests

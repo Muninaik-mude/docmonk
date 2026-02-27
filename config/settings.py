@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -80,9 +80,9 @@ R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.getenv('R2_BUCKET_NAME')
 
-# Groq AI (primary)
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
+# OpenAI
+OPENAI_API_KEY = os.getenv('OPEN_AI_KEY')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = Path(os.getenv('ANNOTATED_PDF_DIR', str(BASE_DIR / 'annotated_pdfs')))

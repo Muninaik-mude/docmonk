@@ -39,29 +39,25 @@ def get_full_text(text_blocks: list[dict]) -> str:
 
 def detect_file_type(url: str, file_bytes: bytes) -> str:
     """
-    Detect the document type from the URL path or file magic bytes.
+    Detect the document type from file magic bytes first, then URL extension.
     Returns one of: 'pdf', 'docx', 'markdown', 'txt'.
     """
-    # Strip query params and get extension from URL path
-    path = urlparse(url).path.lower()
-    ext = os.path.splitext(path)[1]
-
-    if ext == ".pdf" or file_bytes[:5] == b"%PDF-":
-        return "pdf"
-    if ext == ".docx" or file_bytes[:4] == b"PK\x03\x04":
-        return "docx"
-    if ext in (".md", ".markdown"):
-        return "markdown"
-    if ext == ".txt":
-        return "txt"
-
-    # Fallback: try PDF magic bytes first, then assume text
+    # Magic bytes are authoritative — check these first
     if file_bytes[:5] == b"%PDF-":
         return "pdf"
     if file_bytes[:4] == b"PK\x03\x04":
         return "docx"
 
-    # Default to text/markdown
+    # Fall back to URL extension for text formats (no magic bytes)
+    path = urlparse(url).path.lower()
+    ext = os.path.splitext(path)[1]
+
+    if ext in (".md", ".markdown"):
+        return "markdown"
+    if ext == ".txt":
+        return "txt"
+
+    # Default to plain text
     return "txt"
 
 

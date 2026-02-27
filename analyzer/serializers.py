@@ -51,7 +51,7 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     document_presigned_url = serializers.URLField(required=False)
     pdf_presigned_url = serializers.URLField(required=False)  # backward compat
     document_base64 = serializers.CharField(required=False)
-    document_filename = serializers.CharField(required=False, default="document.pdf")
+    document_filename = serializers.CharField(required=False, default="document")
     agreement_type = serializers.CharField(required=False, default="")
     agreement_details = AgreementDetailsSerializer(required=False)
     parties = PartiesSerializer(required=False)
