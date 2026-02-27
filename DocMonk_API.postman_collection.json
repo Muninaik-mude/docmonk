@@ -1,0 +1,88 @@
+{
+	"info": {
+		"_postman_id": "docmonk-clause-analyzer-v1",
+		"name": "DocMonk - Clause Analyzer API",
+		"description": "# DocMonk Clause Analyzer API\n\nAnalyze PDF, DOCX, Markdown, or TXT documents against legal clauses using AI.\n\n## Input\nSend the document as a base64 string in the `document_base64` field.\n\n## Supported File Formats\n- PDF — auto-detected via magic bytes\n- DOCX — auto-detected via magic bytes\n- Markdown / TXT — auto-detected\n\n## AI Result Statuses\n- `MATCH` — Clause fully satisfied\n- `VIOLATION` — Clause contradicted (red strikethrough + green AI answer)\n- `PARTIALLY_SATISFIED` — Clause partially met (orange strikethrough + green AI answer)\n- `NOT_FOUND` — Clause absent from document (blue AI suggestion)\n\n## Base URL\n`{{base_url}}` defaults to `http://localhost:8000`",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Analyze Document",
+			"item": [
+				{
+					"name": "Analyze via Base64",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"document_base64\": \"<base64 encoded document content>\",\n  \"agreement_type\": \"Commercial Rental Agreement\",\n  \"agreement_details\": {\n    \"agreement_date\": \"2026-02-20\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\"\n  },\n  \"parties\": {\n    \"landlord\": {\n      \"name\": \"Mr. Rajesh Sharma\",\n      \"address\": \"12 MG Road, Bengaluru, Karnataka\",\n      \"contact\": \"\"\n    },\n    \"tenant\": {\n      \"name\": \"\",\n      \"company_name\": \"ABC Tech Solutions Pvt Ltd\",\n      \"authorized_signatory\": \"Ms. Priya Menon\",\n      \"address\": \"45 IT Park, Whitefield, Bengaluru, Karnataka\",\n      \"contact\": \"\"\n    }\n  },\n  \"property\": {\n    \"type\": \"Commercial Office Space\",\n    \"area_sqft\": 2500,\n    \"address\": \"3rd Floor, Commercial Complex, Indiranagar, Bengaluru\"\n  },\n  \"clauses\": [\n    {\n      \"id\": \"c1\",\n      \"title\": \"Rent Amount\",\n      \"content\": \"Monthly rent shall be Rs. 75,000 payable by the 5th of every month via bank transfer.\",\n      \"category\": \"financial\"\n    },\n    {\n      \"id\": \"c2\",\n      \"title\": \"Security Deposit\",\n      \"content\": \"Tenant shall deposit Rs. 10,00,000 as refundable security deposit before possession.\",\n      \"category\": \"financial\"\n    },\n    {\n      \"id\": \"c3\",\n      \"title\": \"Lock-in Period\",\n      \"content\": \"The agreement shall have a lock-in period of 12 months from the date of commencement.\",\n      \"category\": \"duration\"\n    },\n    {\n      \"id\": \"c4\",\n      \"title\": \"Maintenance & Repairs\",\n      \"content\": \"Tenant shall handle interior maintenance; structural repairs shall be the responsibility of the Landlord.\",\n      \"category\": \"maintenance\"\n    },\n    {\n      \"id\": \"c5\",\n      \"title\": \"Termination Clause\",\n      \"content\": \"Either party may terminate with 3 months written notice after the lock-in period.\",\n      \"category\": \"termination\"\n    }\n  ]\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/analyze",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "analyze"]
+						},
+						"description": "## Analyze Document via Base64\n\nSend a base64-encoded document (PDF, DOCX, MD, TXT) and clauses to analyze.\n\n### Request Fields\n\n| Field | Type | Required | Description |\n|---|---|---|---|\n| `document_base64` | string | **Yes** | Base64-encoded document content |\n| `agreement_type` | string | No | Type of agreement |\n| `agreement_details` | object | No | Date, city, state |\n| `parties` | object | No | Landlord and tenant details |\n| `property` | object | No | Property type, area, address |\n| `clauses` | array | **Yes** | 1-100 clauses to analyze |\n\n### Clause Object\n\n| Field | Type | Required | Description |\n|---|---|---|---|\n| `id` | string | Yes | Unique clause identifier |\n| `title` | string | Yes | Clause title/name |\n| `content` | string | No | Expected clause content |\n| `value` | string | No | Alternative to `content` |\n| `category` | string | No | Clause category |\n\n### File Type Detection\nThe API auto-detects the file format using magic bytes:\n- `%PDF-` for PDF\n- `PK\\x03\\x04` for DOCX\n- Otherwise treated as plain text\n\n### Base64 Input Notes\n- Supports optional data URI prefix: `data:application/pdf;base64,...`\n- The prefix is automatically stripped\n\n### Response\nReturns `analysis_summary` array with per-clause results, `report_md_base64` and `summary_md_base64` (always included), and `jurisdiction` info."
+					},
+					"response": [
+						{
+							"name": "200 - Success",
+							"status": "OK",
+							"code": 200,
+							"header": [
+								{
+									"key": "Content-Type",
+									"value": "application/json"
+								}
+							],
+							"body": "{\n  \"status\": \"success\",\n  \"analysis_summary\": [\n    {\n      \"clause_id\": \"c1\",\n      \"clause_title\": \"Rent Amount\",\n      \"clause_content\": \"Monthly rent shall be Rs. 75,000 payable by the 5th of every month via bank transfer.\",\n      \"result\": \"VIOLATION\",\n      \"reason\": \"Document states Rs. 50,000 monthly rent, which contradicts the required Rs. 75,000.\",\n      \"relevant_text\": \"Tenant shall pay Rs. 50,000 per month as rent.\",\n      \"color\": \"red\",\n      \"ai_added_text\": \"Monthly rent shall be Rs. 75,000 payable by the 5th of every month via bank transfer.\",\n      \"parties_obligated\": [\"Tenant\"],\n      \"missing_values\": [],\n      \"binding_strength\": \"STRONG\",\n      \"key_dates_durations\": [\"5th of every month\"]\n    },\n    {\n      \"clause_id\": \"c2\",\n      \"clause_title\": \"Security Deposit\",\n      \"clause_content\": \"Tenant shall deposit Rs. 10,00,000 as refundable security deposit before possession.\",\n      \"result\": \"MATCH\",\n      \"reason\": \"Security deposit amount and terms match exactly.\",\n      \"relevant_text\": \"Tenant shall deposit Rs. 10,00,000 as refundable security deposit.\",\n      \"color\": null,\n      \"ai_added_text\": null,\n      \"parties_obligated\": [\"Tenant\"],\n      \"missing_values\": [],\n      \"binding_strength\": \"STRONG\",\n      \"key_dates_durations\": []\n    },\n    {\n      \"clause_id\": \"c3\",\n      \"clause_title\": \"Lock-in Period\",\n      \"clause_content\": \"The agreement shall have a lock-in period of 12 months from the date of commencement.\",\n      \"result\": \"PARTIALLY_SATISFIED\",\n      \"reason\": \"Lock-in period exists but is only 6 months instead of required 12 months.\",\n      \"relevant_text\": \"Lock-in period of 6 months applies.\",\n      \"color\": \"orange\",\n      \"ai_added_text\": \"The agreement shall have a lock-in period of 12 months from the date of commencement.\",\n      \"parties_obligated\": [\"Landlord\", \"Tenant\"],\n      \"missing_values\": [],\n      \"binding_strength\": \"MODERATE\",\n      \"key_dates_durations\": [\"6 months\"]\n    },\n    {\n      \"clause_id\": \"c5\",\n      \"clause_title\": \"Termination Clause\",\n      \"clause_content\": \"Either party may terminate with 3 months written notice after the lock-in period.\",\n      \"result\": \"NOT_FOUND\",\n      \"reason\": \"No termination clause found in the document.\",\n      \"relevant_text\": null,\n      \"color\": \"blue\",\n      \"ai_added_text\": \"Either party may terminate this agreement by providing 3 months written notice after the lock-in period expires.\",\n      \"parties_obligated\": [],\n      \"missing_values\": [\"notice_period\", \"termination_conditions\"],\n      \"binding_strength\": \"VAGUE\",\n      \"key_dates_durations\": []\n    }\n  ],\n  \"conflicts\": [],\n  \"jurisdiction\": {\n    \"jurisdiction\": \"Karnataka, India\",\n    \"applicable_laws\": [\"Indian Contract Act, 1872\", \"Transfer of Property Act, 1882\", \"Karnataka Rent Act\"]\n  },\n  \"report_md_base64\": \"PHA+...(base64 encoded markdown report)...</p>\",\n  \"summary_md_base64\": \"PHA+...(base64 encoded markdown summary)...</p>\"\n}"
+						},
+						{
+							"name": "400 - Validation Error",
+							"status": "Bad Request",
+							"code": 400,
+							"header": [
+								{
+									"key": "Content-Type",
+									"value": "application/json"
+								}
+							],
+							"body": "{\n  \"status\": \"error\",\n  \"errors\": {\n    \"non_field_errors\": [\n      \"Either 'document_presigned_url', 'pdf_presigned_url', or 'document_base64' is required.\"\n    ]\n  }\n}"
+						},
+						{
+							"name": "413 - File Too Large",
+							"status": "Request Entity Too Large",
+							"code": 413,
+							"header": [
+								{
+									"key": "Content-Type",
+									"value": "application/json"
+								}
+							],
+							"body": "{\n  \"status\": \"error\",\n  \"message\": \"File size 120.50 MB exceeds the maximum allowed size of 100 MB.\"\n}"
+						}
+					]
+				}
+			],
+			"description": "## POST /v1/analyze\n\nSend a base64-encoded document with clauses to analyze against it."
+		}
+	]
+}
