@@ -247,21 +247,29 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     not_found_list = []   # (ai_text, reason) for NOT_FOUND
 
     for entry in analysis_summary:
-        result  = entry.get("result", "")
-        rt      = (entry.get("relevant_text") or "").strip()
-        cc      = (entry.get("clause_content", "")).strip()
-        ai_text = entry.get("ai_added_text", "") or ""
-        reason  = entry.get("reason", "") or ""
+        result       = entry.get("result", "")
+        rt           = (entry.get("relevant_text") or "").strip()
+        cc           = (entry.get("clause_content", "")).strip()
+        clause_title = (entry.get("clause_title", "") or "").strip()
+        ai_text      = entry.get("ai_added_text", "") or ""
+        reason       = entry.get("reason", "") or ""
 
         if result == "VIOLATION":
-            key = rt or cc
+            # Primary key: relevant_text (verbatim doc text).  Fallback: clause_title.
+            key = rt or clause_title
             if key:
                 violation_map[key] = (ai_text, reason)
+            # Always also index by title so the clause heading line is guaranteed to match
+            # even when rt is long multi-sentence text that doesn't fit a single line.
+            if clause_title and clause_title not in violation_map:
+                violation_map[clause_title] = (ai_text, reason)
 
         elif result == "PARTIALLY_SATISFIED":
-            key = rt or cc
+            key = rt or clause_title
             if key:
                 partial_map[key] = (ai_text, reason)
+            if clause_title and clause_title not in partial_map:
+                partial_map[clause_title] = (ai_text, reason)
 
         elif result == "NOT_FOUND":
             if ai_text:
@@ -276,20 +284,40 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     # bullet characters (•·◦◉), whitespace — e.g. "1.", "•", "...", "___"
     _junk = re.compile(r'^[\d\.\-_\s\u2022\u00b7\u25cf\u25cb\u25cc\u25e6\*]+$')
 
-    # Strips leading "16. " or "16. Registration: " style prefixes so that
-    # a line like "16. Registration: This Agreement..." still matches a key
-    # that starts with "This Agreement..."
-    _num_prefix = re.compile(r'^\d+[\.\)]\s*(?:[A-Z][A-Za-z ,]+:\s*)?')
+    # Strips leading "16. " / "*   16. " / "16. Registration: " style prefixes so that
+    # a line like "*   1\. Lease Term: This Agreement..." still matches a key like
+    # "Lease Term" or "This Agreement..."
+    _num_prefix = re.compile(r'^[\*\s]*\d+[\.\\)]\s*(?:[A-Z][A-Za-z ,&]+:\s*)?')
+
+    # Cleans markdown bullet artifacts from display text:
+    #   "*   1\. Lease Term: ..."  →  "1. Lease Term: ..."
+    _md_bullet   = re.compile(r'^\*\s+')
+    _md_heading  = re.compile(r'^#+\s*')
+
+    def _clean_display(s: str) -> str:
+        """Strip markdown artifacts and format for clean display."""
+        s = _md_bullet.sub('', s).replace('\\.', '.')
+        # Convert markdown headings → bold: "# TITLE" → "<b>TITLE</b>"
+        if s.startswith('#'):
+            s = '<b>' + _md_heading.sub('', s) + '</b>'
+        return s
 
     def _line_matches(s: str, key: str) -> bool:
-        """Return True if document line s matches violation/partial key."""
+        """Return True if document line s matches violation/partial/match key."""
         if not key or not s:
             return False
+        # Case-sensitive substring check
         if key in s or s in key:
             return True
-        # Try again after stripping leading section-number prefix
+        # Case-insensitive substring check
+        s_lower, key_lower = s.lower(), key.lower()
+        if key_lower in s_lower or s_lower in key_lower:
+            return True
+        # Try again after stripping leading bullet/section-number prefix
         clean = _num_prefix.sub('', s).strip()
         if clean and len(clean) > 6 and (clean in key or key in clean):
+            return True
+        if clean and len(clean) > 6 and (clean.lower() in key_lower or key_lower in clean.lower()):
             return True
         return False
 
@@ -313,7 +341,8 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_violation():
         nonlocal pending_v_key, pending_v_lines, pending_v_ai, pending_v_reason
         if pending_v_lines:
-            segments.append({"type": "violation", "text": " ".join(pending_v_lines), "reason": pending_v_reason})
+            display = " ".join(_clean_display(l) for l in pending_v_lines)
+            segments.append({"type": "violation", "text": display, "reason": pending_v_reason})
             if pending_v_ai:
                 segments.append({"type": "ai", "text": pending_v_ai})
         pending_v_key    = None
@@ -324,7 +353,8 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_partial():
         nonlocal pending_p_key, pending_p_lines, pending_p_ai, pending_p_reason
         if pending_p_lines:
-            segments.append({"type": "partial", "text": " ".join(pending_p_lines), "reason": pending_p_reason})
+            display = " ".join(_clean_display(l) for l in pending_p_lines)
+            segments.append({"type": "partial", "text": display, "reason": pending_p_reason})
             if pending_p_ai:
                 segments.append({"type": "ai", "text": pending_p_ai})
         pending_p_key    = None
@@ -335,7 +365,8 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_match():
         nonlocal pending_m_key, pending_m_lines
         if pending_m_lines:
-            segments.append({"type": "match", "text": " ".join(pending_m_lines)})
+            display = " ".join(_clean_display(l) for l in pending_m_lines)
+            segments.append({"type": "match", "text": display})
         pending_m_key   = None
         pending_m_lines = []
 
@@ -415,7 +446,7 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
         _flush_match()
 
         # ── 4. Normal ──────────────────────────────────────────────────────
-        segments.append({"type": "normal", "text": stripped})
+        segments.append({"type": "normal", "text": _clean_display(stripped)})
 
     _flush_violation()
     _flush_partial()
@@ -1024,7 +1055,7 @@ def generate_markdown_report(
             lines.append(icon) if icon else None
             lines.append('  <div class="diff-line deleted">')
             lines.append('    <div class="gutter">&minus;</div>')
-            lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
+            lines.append(f'    <div class="line-content"><span class="old-text" style="text-decoration:line-through">{text}</span></div>')
             lines.append("  </div>")
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1
@@ -1042,7 +1073,7 @@ def generate_markdown_report(
             lines.append(icon) if icon else None
             lines.append('  <div class="diff-line deleted">')
             lines.append('    <div class="gutter">&minus;</div>')
-            lines.append(f'    <div class="line-content"><span class="old-text">{text}</span></div>')
+            lines.append(f'    <div class="line-content"><span class="old-text" style="text-decoration:line-through">{text}</span></div>')
             lines.append("  </div>")
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1

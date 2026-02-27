@@ -60,38 +60,115 @@ def _get_relevant_excerpt(full_text: str, clause_title: str, clause_content: str
     return excerpt
 
 
+# ── AI-based relevant text extraction ───────────────────────────────────────────
+
+_EXTRACT_SYSTEM = """You are a document search assistant. Given a clause topic and a legal document, return ONLY the exact verbatim sentence(s) or paragraph(s) from the document that are directly relevant to that clause. Do not paraphrase, summarize, or add any explanation. Return the copied text only."""
+
+_EXTRACT_USER = """CLAUSE TOPIC: {title}
+
+DOCUMENT TEXT:
+{doc_text}
+
+Copy verbatim only the sentence(s) from DOCUMENT TEXT that directly mention or relate to "{title}". Return only the copied text with no extra words. If nothing relevant exists, return an empty string."""
+
+
+def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
+    """
+    Use a fast AI call to extract the exact verbatim sentences from the document
+    that are relevant to the given clause title.
+
+    Returns the extracted text, or empty string if nothing found / on error.
+    """
+    user_message = _EXTRACT_USER.format(title=title, doc_text=doc_text)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=30.0)
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": _EXTRACT_SYSTEM},
+                    {"role": "user", "content": user_message},
+                ],
+                model=settings.OPENAI_MODEL,
+                temperature=0.0,
+                max_tokens=500,
+            )
+            result = chat_completion.choices[0].message.content.strip()
+            return result if result else ""
+        except RateLimitError:
+            if attempt < _MAX_RETRIES:
+                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+                logger.warning("Rate limited on excerpt extraction for '%s', retrying in %.1fs", title, wait)
+                time.sleep(wait)
+            else:
+                return ""
+        except Exception as e:
+            logger.warning("Excerpt extraction failed for '%s': %s", title, e)
+            return ""
+
+    return ""
+
+
 # ── Per-clause analysis ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a legal contract compliance analyzer. Analyze whether a given clause is present, compliant, violated, or missing in the provided document text.
+SYSTEM_PROMPT = """You are a strict legal contract compliance auditor. Your job is to compare a REQUIRED CLAUSE (the standard/library clause) against the ACTUAL DOCUMENT TEXT and determine whether the document satisfies, violates, or is missing that clause.
+
+You are not checking if a topic merely exists. You are verifying whether the document's specific terms — amounts, dates, jurisdictions, named acts, restrictions, percentages, locations — exactly match or conflict with the required clause.
 
 You must respond ONLY with valid JSON, no extra text or markdown formatting."""
 
-USER_PROMPT_TEMPLATE = """CLAUSE TITLE: {title}
-CLAUSE CONTENT: {content}
+USER_PROMPT_TEMPLATE = """REQUIRED CLAUSE (this is what the contract SHOULD contain):
+TITLE: {title}
+CONTENT: {content}
 
-DOCUMENT TEXT:
+ACTUAL DOCUMENT TEXT (this is what the contract ACTUALLY says):
 {pdf_text}
 
-Analyze the clause against the document and respond in this EXACT JSON format:
+Your task: Compare the REQUIRED CLAUSE against the ACTUAL DOCUMENT TEXT with the following strict methodology:
+
+STEP 1 — Does the document contain this clause topic at all?
+  - If NO → result is NOT_FOUND
+
+STEP 2 — If YES, compare every specific value in the required clause against the document:
+  - Monetary amounts (e.g. Rs.2,25,000 required vs Rs.1,50,000 in document → VIOLATION)
+  - Named laws/acts (e.g. "Telangana Stamp Act" required vs "Indian Stamp Act" in document → VIOLATION)
+  - Locations/jurisdictions (e.g. "Hyderabad" required vs "Bengaluru" in document → VIOLATION)
+  - Dates and durations (e.g. "7-day grace period" required vs no grace period in document → VIOLATION)
+  - Scope restrictions (e.g. "IT and Software Development only" required vs "commercial/business" in document — narrowing scope is a VIOLATION)
+  - If ANY specific value conflicts → result is VIOLATION
+
+STEP 3 — If no conflicts, check completeness:
+  - If the document clause is vague where the required clause is specific (e.g. "appropriate insurance" vs "fire and liability insurance worth Rs.50,00,000") → PARTIALLY_SATISFIED
+  - If the document clause is missing required sub-conditions (e.g. required clause adds grace period, commencement date, specific party obligations not in document) → PARTIALLY_SATISFIED
+
+STEP 4 — If all values match and clause is complete → MATCH
+
+Respond in this EXACT JSON format:
 {{
     "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
-    "reason": "brief explanation",
-    "relevant_text": "the part of document that relates to this clause, or null",
-    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION: write a corrective clause. If PARTIALLY_SATISFIED: write the improved/completed clause. If MATCH: null",
+    "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
+    "relevant_text": "the exact sentence(s) from the document that relate to this clause, or null",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION: write a corrective clause resolving the conflict. If PARTIALLY_SATISFIED: write the improved/completed clause. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
-    "missing_values": ["commencement date not specified", "deposit amount blank"] or [],
+    "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000", "no commencement date specified"] or [],
     "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",
     "key_dates_durations": ["30 days notice required", "lease ends March 2029"] or []
 }}
 
-Rules:
-- MATCH: clause content is present and fully compliant in the document
-- PARTIALLY_SATISFIED: clause topic exists but is incomplete, vague, or only partly meets the requirement
-- NOT_FOUND: clause topic is completely absent from the document
-- VIOLATION: clause topic exists but contradicts or violates the clause requirement
-- parties_obligated: list which party carries obligations under this clause (["Tenant"], ["Landlord"], ["Both"], or [] if not applicable)
-- missing_values: list critical referenced values that are undefined or blank in the clause or document (e.g. amounts, dates, percentages left as blanks)
-- binding_strength: classify the language strength — "MUST/SHALL" for mandatory/imperative, "SHOULD" for advisory, "MAY/CAN" for permissive/optional, "VAGUE" for non-binding phrases like "agrees to try" or "will endeavour"
+Classification rules (apply strictly):
+- MATCH: ALL specific values in the required clause are present and consistent in the document — no deviations whatsoever
+- VIOLATION: The topic exists in the document BUT at least one specific value (amount, act name, location, duration, scope) differs from the required clause — even a single Rs.1 difference or a different city name is a VIOLATION
+- PARTIALLY_SATISFIED: The topic exists and no direct value conflict, but the document version is vaguer, less specific, or missing sub-conditions compared to the required clause
+- NOT_FOUND: The clause topic is entirely absent from the document
+
+Additional field rules:
+- reason: Write a precise, professional legal finding (one sentence, no filler). Use these formats:
+    VIOLATION → "The agreement specifies '[exact doc text]' whereas the prescribed standard requires '[exact required text]'."
+    NOT_FOUND → "The executed agreement contains no provision for [clause title], a mandatory compliance requirement."
+    PARTIALLY_SATISFIED → "The agreement addresses [topic] as '[doc text]' but lacks the required specificity: '[required text]'."
+    MATCH → "The agreement satisfies this requirement — [brief confirmation of matching values]."
+- missing_values: List every specific value that differs or is absent (amounts, dates, act names, locations, percentages)
+- binding_strength: classify the language strength — "MUST/SHALL" for mandatory/imperative, "SHOULD" for advisory, "MAY/CAN" for permissive/optional, "VAGUE" for non-binding phrases like "agrees to try" or "appropriate" without specifics
 - key_dates_durations: list all dates and durations found in this clause (e.g. "30 days", "March 2029", "within 60 days of execution", "5th of each month")
 """
 
@@ -211,14 +288,25 @@ def _call_groq(user_message: str) -> str:
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     """
-    Analyze clause compliance using Groq AI.
+    Analyze clause compliance using a two-step AI pipeline:
+      Step 1 — AI extracts the verbatim relevant text for this clause from the document.
+      Step 2 — AI analyzes that extracted text against the clause requirement.
+
     Returns dict with: result, reason, relevant_text, ai_recommendation,
                        parties_obligated, missing_values, binding_strength, key_dates_durations
     """
     title = clause["title"]
     content = clause.get("content") or clause.get("value", "")
 
-    excerpt = _get_relevant_excerpt(pdf_text, title, content)
+    # Step 1: AI extracts the verbatim relevant text directly from the full document
+    ai_excerpt = _extract_relevant_text_via_ai(title, pdf_text)
+
+    # Step 2: Analyze — use AI-extracted passage if non-empty, else fall back to full text
+    excerpt = ai_excerpt if ai_excerpt else pdf_text
+    logger.debug(
+        "Clause '%s': ai_excerpt=%d chars, analyzing=%d chars",
+        title, len(ai_excerpt), len(excerpt),
+    )
 
     user_message = USER_PROMPT_TEMPLATE.format(
         title=title,

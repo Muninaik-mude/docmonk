@@ -14,8 +14,9 @@ from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLO
 
 logger = logging.getLogger(__name__)
 
-# Max parallel Groq calls — keeps us under rate limits while still fast
-_MAX_PARALLEL_CLAUSES = 3
+# Max parallel Groq calls — each clause now makes 2 sequential AI calls (extract + analyze),
+# so workers × 2 = peak concurrent calls. Set high enough to minimize wall-clock latency.
+_MAX_PARALLEL_CLAUSES = 8
 
 
 def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type: str) -> dict:
@@ -73,7 +74,7 @@ class ClauseAnalyzerView(APIView):
         doc_b64 = serializer.validated_data.get("document_base64")
         doc_filename = serializer.validated_data.get("document_filename", "document.pdf")
         clauses = serializer.validated_data["clauses"]
-        report_format = serializer.validated_data.get("report_format", "pdf")
+        report_format = serializer.validated_data.get("report_format", "markdown")
 
         # Agreement metadata (all optional)
         agreement_meta = {
@@ -248,9 +249,8 @@ class ClauseAnalyzerView(APIView):
 
             analysis_summary.append(summary_entry)
 
-        # Step 5: Detect cross-clause conflicts (one AI call)
-        conflicts = groq_service.detect_conflicts(analysis_summary)
-        logger.info("Detected %d clause conflict(s)", len(conflicts))
+        # Step 5: Conflict detection skipped — not currently used in reports
+        conflicts = []
 
         # Step 6: Generate report(s) + summary from analysis_summary
         run_id = uuid.uuid4()
@@ -269,6 +269,12 @@ class ClauseAnalyzerView(APIView):
         )
 
         try:
+            # Always generate markdown report + summary and return as base64 in payload
+            _md_report = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
+            _md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
+            response_data["report_md_base64"] = base64.b64encode(_md_report.encode("utf-8")).decode("utf-8")
+            response_data["summary_md_base64"] = base64.b64encode(_md_summary.encode("utf-8")).decode("utf-8")
+
             if report_format in ("pdf", "both"):
                 # Redline report
                 pdf_report_bytes = report_service.generate_pdf_report(

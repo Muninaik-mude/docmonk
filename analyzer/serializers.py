@@ -59,7 +59,7 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     clauses = ClauseSerializer(many=True)
     report_format = serializers.ChoiceField(
         choices=["pdf", "markdown", "docx", "both"],
-        default="pdf",
+        default="markdown",
         required=False,
     )
 
