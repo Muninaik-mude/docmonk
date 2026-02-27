@@ -50,6 +50,8 @@ SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".md", ".txt")
 class ClauseAnalyzerSerializer(serializers.Serializer):
     document_presigned_url = serializers.URLField(required=False)
     pdf_presigned_url = serializers.URLField(required=False)  # backward compat
+    document_base64 = serializers.CharField(required=False)
+    document_filename = serializers.CharField(required=False, default="document.pdf")
     agreement_type = serializers.CharField(required=False, default="")
     agreement_details = AgreementDetailsSerializer(required=False)
     parties = PartiesSerializer(required=False)
@@ -63,11 +65,13 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         doc_url = attrs.get("document_presigned_url") or attrs.get("pdf_presigned_url")
-        if not doc_url:
+        doc_b64 = attrs.get("document_base64")
+        if not doc_url and not doc_b64:
             raise serializers.ValidationError(
-                "Either 'document_presigned_url' or 'pdf_presigned_url' is required."
+                "Either 'document_presigned_url', 'pdf_presigned_url', or 'document_base64' is required."
             )
-        attrs["document_presigned_url"] = doc_url
+        if doc_url:
+            attrs["document_presigned_url"] = doc_url
         return attrs
 
     def validate_clauses(self, value):

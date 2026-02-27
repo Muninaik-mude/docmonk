@@ -1,10 +1,16 @@
 import json
 import logging
+import time
 
-from groq import Groq
+from groq import Groq, RateLimitError
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+# Rate limit: short sleep between calls to avoid 429 bursts
+_RATE_LIMIT_DELAY = 1.0
+_RATE_LIMIT_RETRY_WAIT = 5.0
+_MAX_RETRIES = 2
 
 # Max chars sent to AI per clause — keeps every call within any model's context window
 # ~5,000 chars ≈ 1,250 tokens (vs 3,000,000 chars for a 1000-page PDF)
@@ -179,18 +185,28 @@ def _parse_response(response_text: str) -> dict:
 
 
 def _call_groq(user_message: str) -> str:
-    """Call Groq AI and return the raw response text."""
+    """Call Groq AI with rate-limit retry. Returns raw response text."""
     client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-        max_tokens=1500,
-    )
-    return chat_completion.choices[0].message.content.strip()
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                model=settings.GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=1500,
+            )
+            return chat_completion.choices[0].message.content.strip()
+        except RateLimitError:
+            if attempt < _MAX_RETRIES:
+                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+                logger.warning("Groq rate limited, retrying in %.1fs (attempt %d/%d)", wait, attempt + 1, _MAX_RETRIES)
+                time.sleep(wait)
+            else:
+                raise
 
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
@@ -279,31 +295,46 @@ def detect_jurisdiction(pdf_text: str) -> dict:
     excerpt = pdf_text[:3000]
     user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
     client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": _JURISDICTION_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            model=settings.GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=1000,
-        )
-        response_text = chat_completion.choices[0].message.content.strip()
-        result = _safe_json_parse(response_text)
-        if not isinstance(result.get("checklist"), list):
-            result["checklist"] = []
-        if not isinstance(result.get("applicable_laws"), list):
-            result["applicable_laws"] = []
-        return result
-    except Exception as e:
-        logger.error("detect_jurisdiction failed: %s", e)
-        return {
-            "jurisdiction": "Unknown",
-            "agreement_type": "Unknown",
-            "applicable_laws": [],
-            "checklist": [],
-        }
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": _JURISDICTION_SYSTEM},
+                    {"role": "user", "content": user_message},
+                ],
+                model=settings.GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=1000,
+            )
+            response_text = chat_completion.choices[0].message.content.strip()
+            result = _safe_json_parse(response_text)
+            if not isinstance(result.get("checklist"), list):
+                result["checklist"] = []
+            if not isinstance(result.get("applicable_laws"), list):
+                result["applicable_laws"] = []
+            return result
+        except RateLimitError:
+            if attempt < _MAX_RETRIES:
+                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+                logger.warning("detect_jurisdiction rate limited, retrying in %.1fs", wait)
+                time.sleep(wait)
+                continue
+            logger.error("detect_jurisdiction rate limited after all retries")
+            return {
+                "jurisdiction": "Unknown",
+                "agreement_type": "Unknown",
+                "applicable_laws": [],
+                "checklist": [],
+            }
+        except Exception as e:
+            logger.error("detect_jurisdiction failed: %s", e)
+            return {
+                "jurisdiction": "Unknown",
+                "agreement_type": "Unknown",
+                "applicable_laws": [],
+                "checklist": [],
+            }
 
 
 _CONFLICT_SYSTEM = """You are a legal contract conflict analyst. Identify contradictions or conflicts between clauses in a contract analysis. Respond ONLY with valid JSON, no extra text or markdown."""
@@ -346,23 +377,33 @@ def detect_conflicts(analysis_summary: list) -> list:
 
     user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
     client = Groq(api_key=settings.GROQ_API_KEY, max_retries=0, timeout=60.0)
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": _CONFLICT_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            model=settings.GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=800,
-        )
-        response_text = chat_completion.choices[0].message.content.strip()
-        result = _safe_json_parse(response_text)
-        conflicts = result.get("conflicts", [])
-        return conflicts if isinstance(conflicts, list) else []
-    except Exception as e:
-        logger.error("detect_conflicts failed: %s", e)
-        return []
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": _CONFLICT_SYSTEM},
+                    {"role": "user", "content": user_message},
+                ],
+                model=settings.GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=800,
+            )
+            response_text = chat_completion.choices[0].message.content.strip()
+            result = _safe_json_parse(response_text)
+            conflicts = result.get("conflicts", [])
+            return conflicts if isinstance(conflicts, list) else []
+        except RateLimitError:
+            if attempt < _MAX_RETRIES:
+                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+                logger.warning("detect_conflicts rate limited, retrying in %.1fs", wait)
+                time.sleep(wait)
+                continue
+            logger.error("detect_conflicts rate limited after all retries")
+            return []
+        except Exception as e:
+            logger.error("detect_conflicts failed: %s", e)
+            return []
 
 
 # ── PDF text location helper ──────────────────────────────────────────────────────

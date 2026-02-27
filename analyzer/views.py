@@ -1,6 +1,8 @@
+import base64
+import binascii
 import logging
-import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rest_framework import status
 from rest_framework.response import Response
@@ -11,6 +13,9 @@ from .services import r2_service, pdf_service, groq_service, report_service
 from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLOR
 
 logger = logging.getLogger(__name__)
+
+# Max parallel Groq calls — keeps us under rate limits while still fast
+_MAX_PARALLEL_CLAUSES = 3
 
 
 def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type: str) -> dict:
@@ -24,16 +29,32 @@ def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type:
         return {"url": f"/annotated_pdfs/{filename}", "expires_in": "local file (no expiry)"}
 
 
+def _decode_base64_document(base64_string: str) -> bytes:
+    """Decode a base64-encoded document string to raw bytes."""
+    # Strip optional data URI prefix: "data:application/pdf;base64,..."
+    if "," in base64_string and base64_string.index(",") < 200:
+        base64_string = base64_string.split(",", 1)[1]
+    # Strip whitespace/newlines
+    base64_string = base64_string.strip()
+    return base64.b64decode(base64_string)
+
+
+def _analyze_single_clause(clause: dict, full_text: str) -> dict:
+    """Analyze one clause — called by ThreadPoolExecutor."""
+    ai_result = groq_service.analyze_clause_against_pdf(clause, full_text)
+    return {"clause": clause, "ai_result": ai_result}
+
+
 class ClauseAnalyzerView(APIView):
     """
     POST /api/analyze/
 
     Orchestrates the full clause compliance analysis pipeline:
     1. Validate request
-    2. Download PDF from presigned URL
-    3. Extract text from PDF
+    2. Get document bytes (from presigned URL or base64)
+    3. Extract text from PDF/DOCX/MD/TXT
     4. Detect jurisdiction (one AI call)
-    5. Analyze each clause via Groq AI + annotate original PDF
+    5. Analyze clauses in parallel via Groq AI + annotate original PDF
     6. Detect cross-clause conflicts (one AI call)
     7. Generate report (redline) + summary (analytics)
     8. Upload report(s) to S3/R2 or save locally
@@ -48,7 +69,9 @@ class ClauseAnalyzerView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        doc_url = serializer.validated_data["document_presigned_url"]
+        doc_url = serializer.validated_data.get("document_presigned_url")
+        doc_b64 = serializer.validated_data.get("document_base64")
+        doc_filename = serializer.validated_data.get("document_filename", "document.pdf")
         clauses = serializer.validated_data["clauses"]
         report_format = serializer.validated_data.get("report_format", "pdf")
 
@@ -60,16 +83,27 @@ class ClauseAnalyzerView(APIView):
             "property":          serializer.validated_data.get("property") or {},
         }
 
-        # Step 1: Download document (PDF, DOCX, Markdown, TXT)
-        try:
-            doc_bytes = r2_service.download_document_from_presigned_url(doc_url)
-            logger.info("Document downloaded successfully (%d bytes)", len(doc_bytes))
-        except Exception as e:
-            logger.error("Document download failed: %s", e)
-            return Response(
-                {"status": "error", "message": f"Failed to download document: {str(e)}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Step 1: Get document bytes — from URL or base64
+        if doc_b64:
+            try:
+                doc_bytes = _decode_base64_document(doc_b64)
+                logger.info("Document decoded from base64 (%d bytes)", len(doc_bytes))
+            except (binascii.Error, ValueError) as e:
+                logger.error("Base64 decode failed: %s", e)
+                return Response(
+                    {"status": "error", "message": f"Invalid base64 document: {str(e)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            try:
+                doc_bytes = r2_service.download_document_from_presigned_url(doc_url)
+                logger.info("Document downloaded successfully (%d bytes)", len(doc_bytes))
+            except Exception as e:
+                logger.error("Document download failed: %s", e)
+                return Response(
+                    {"status": "error", "message": f"Failed to download document: {str(e)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Validate file size (max 100 MB)
         file_size_mb = len(doc_bytes) / (1024 * 1024)
@@ -86,14 +120,16 @@ class ClauseAnalyzerView(APIView):
             )
 
         # Step 2: Detect file type and extract text
-        file_type = pdf_service.detect_file_type(doc_url, doc_bytes)
-        text_blocks = pdf_service.extract_text_blocks(doc_url, doc_bytes)
+        # For base64 input use filename for type detection; for URL use the URL
+        type_hint = doc_url or doc_filename
+        file_type = pdf_service.detect_file_type(type_hint, doc_bytes)
+        text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
         full_text = pdf_service.get_full_text(text_blocks)
         logger.info("Extracted %d text blocks from %s", len(text_blocks), file_type)
 
         if not full_text.strip():
             return Response(
-                {"status": "error", "message": "PDF contains no extractable text"},
+                {"status": "error", "message": "Document contains no extractable text"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -101,20 +137,42 @@ class ClauseAnalyzerView(APIView):
         jurisdiction_info = groq_service.detect_jurisdiction(full_text)
         logger.info("Jurisdiction detected: %s", jurisdiction_info.get("jurisdiction"))
 
-        # Step 4: Analyze each clause via Groq + build annotation list
+        # Step 4: Analyze clauses in PARALLEL via Groq
+        clause_results = [None] * len(clauses)
+
+        with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CLAUSES) as executor:
+            future_to_idx = {
+                executor.submit(_analyze_single_clause, clause, full_text): idx
+                for idx, clause in enumerate(clauses)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    clause_results[idx] = future.result()
+                except Exception as e:
+                    logger.error("Clause analysis thread failed for index %d: %s", idx, e)
+                    clause_results[idx] = {
+                        "clause": clauses[idx],
+                        "ai_result": {
+                            "result": "NOT_FOUND",
+                            "reason": f"Analysis failed: {type(e).__name__}",
+                            "relevant_text": None,
+                            "ai_recommendation": f"Clause '{clauses[idx]['title']}' could not be analyzed. Manual review recommended.",
+                            "parties_obligated": [],
+                            "missing_values": [],
+                            "binding_strength": "VAGUE",
+                            "key_dates_durations": [],
+                            "_provider": "groq",
+                        },
+                    }
+
+        # Build analysis_summary + annotations from parallel results
         analysis_summary = []
         annotations = []
 
-        for clause in clauses:
-            try:
-                ai_result = groq_service.analyze_clause_against_pdf(clause, full_text)
-            except Exception as e:
-                logger.error("Groq API failed for clause %s: %s", clause["id"], e)
-                return Response(
-                    {"status": "error", "message": f"AI analysis failed: {str(e)}"},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-
+        for item in clause_results:
+            clause = item["clause"]
+            ai_result = item["ai_result"]
             ai_result.pop("_provider", None)
 
             result_status = ai_result["result"]
@@ -189,7 +247,6 @@ class ClauseAnalyzerView(APIView):
                     })
 
             analysis_summary.append(summary_entry)
-            time.sleep(0.5)
 
         # Step 5: Detect cross-clause conflicts (one AI call)
         conflicts = groq_service.detect_conflicts(analysis_summary)
