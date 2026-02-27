@@ -289,14 +289,14 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     # "Lease Term" or "This Agreement..."
     _num_prefix = re.compile(r'^[\*\s]*\d+[\.\\)]\s*(?:[A-Z][A-Za-z ,&]+:\s*)?')
 
-    # Cleans markdown bullet artifacts from display text:
-    #   "*   1\. Lease Term: ..."  →  "1. Lease Term: ..."
+    # Converts markdown bullet markers to bullet character:
+    #   "* some item"  →  "• some item"
     _md_bullet   = re.compile(r'^\*\s+')
     _md_heading  = re.compile(r'^#+\s*')
 
     def _clean_display(s: str) -> str:
-        """Strip markdown artifacts and format for clean display."""
-        s = _md_bullet.sub('', s).replace('\\.', '.')
+        """Convert markdown artifacts to display-friendly format."""
+        s = _md_bullet.sub('\u2022 ', s).replace('\\.', '.')
         # Convert markdown headings → bold: "# TITLE" → "<b>TITLE</b>"
         if s.startswith('#'):
             s = '<b>' + _md_heading.sub('', s) + '</b>'
