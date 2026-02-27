@@ -445,8 +445,13 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
 
         _flush_match()
 
-        # ── 4. Normal ──────────────────────────────────────────────────────
-        segments.append({"type": "normal", "text": _clean_display(stripped)})
+        # ── 4. Heading / Normal ────────────────────────────────────────────
+        if stripped.startswith('#'):
+            # Markdown heading → H1 bold segment (strip # chars, keep plain text)
+            heading_text = _md_heading.sub('', stripped).strip()
+            segments.append({"type": "heading", "text": heading_text})
+        else:
+            segments.append({"type": "normal", "text": _clean_display(stripped)})
 
     _flush_violation()
     _flush_partial()
@@ -512,6 +517,12 @@ def generate_pdf_report(
         fontSize=9, leading=14,
         textColor=colors.HexColor("#0a3577"),
     )
+    heading_style = ParagraphStyle(
+        "RHeading", parent=S["Normal"],
+        fontSize=14, fontName="Helvetica-Bold",
+        textColor=colors.HexColor(COLOR_DARK),
+        spaceBefore=10, spaceAfter=4,
+    )
 
     story = []
 
@@ -558,6 +569,11 @@ def generate_pdf_report(
             # No color — satisfied/match clause (plain text)
             story.append(Paragraph(text, inner_style))
             story.append(Spacer(1, 1))
+
+        elif stype == "heading":
+            # H1 bold heading — large dark title
+            story.append(Paragraph(text, heading_style))
+            story.append(Spacer(1, 2))
 
         else:  # normal
             story.append(Paragraph(text, inner_style))
@@ -1112,6 +1128,14 @@ def generate_markdown_report(
             lines.append("  </div>")
             lines.append("</div>")
 
+        elif stype == "heading":
+            # H1 bold heading
+            lines.append('<div class="diff-group" data-type="unchanged">')
+            lines.append('  <div class="diff-line normal">')
+            lines.append(f'    <div class="line-content" style="font-size:18px;font-weight:bold;color:#1a1a2e;margin-top:12px;">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
+
         elif stype == "ai":
             # Orphan AI
             lines.append('<div class="diff-group" data-type="modified">')
@@ -1472,6 +1496,14 @@ def generate_docx_report(
             mp = doc.add_paragraph()
             run = mp.add_run(text)
             run.font.size = Pt(10)
+
+        elif stype == "heading":
+            # H1 bold heading
+            hp = doc.add_paragraph()
+            run = hp.add_run(text)
+            run.bold = True
+            run.font.size = Pt(16)
+            run.font.color.rgb = _hex_to_rgb(COLOR_DARK)
 
         else:  # normal
             np_ = doc.add_paragraph()
