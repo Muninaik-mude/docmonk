@@ -122,6 +122,20 @@ def extract_text_blocks(url: str, file_bytes: bytes) -> list[dict]:
         return extract_text_from_markdown(file_bytes)
 
 
+def extract_text_blocks_by_type(file_type: str, file_bytes: bytes) -> list[dict]:
+    """
+    Extract text blocks given an explicit file type string.
+    file_type must be one of: 'pdf', 'docx', 'md', 'txt'.
+    Use this when the type is already known (e.g. from payload) to avoid URL-based detection.
+    """
+    if file_type == "pdf":
+        return extract_text_with_positions(file_bytes)
+    elif file_type == "docx":
+        return extract_text_from_docx(file_bytes)
+    else:  # "md" or "txt"
+        return extract_text_from_markdown(file_bytes)
+
+
 def annotate_pdf(pdf_bytes: bytes, annotations: list[dict]) -> bytes:
     """
     Apply color annotations to PDF using PyMuPDF.

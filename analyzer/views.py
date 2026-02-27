@@ -1,43 +1,59 @@
+import base64
 import logging
-import time
-import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .serializers import ClauseAnalyzerSerializer, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
-from .services import r2_service, pdf_service, groq_service, report_service
+from .serializers import ClauseAnalyzerSerializer
+from .services import pdf_service, groq_service, report_service
 from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLOR
 
 logger = logging.getLogger(__name__)
 
+# 3 concurrent clause workers — safe for Groq's 8 000 TPM free-tier limit.
+# Each clause call uses ~1 250 input tokens; 3 × 1 250 = 3 750 tokens/burst,
+# well below the limit even after the upfront context call (~1 200 tokens).
+_CLAUSE_WORKERS = 3
 
-def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type: str) -> dict:
-    """Upload file to R2 or save locally. Returns {url, expires_in}."""
-    if r2_service.is_r2_configured():
-        object_key = r2_service.upload_file_to_r2(file_bytes, filename, prefix, content_type)
-        url = r2_service.generate_presigned_download_url(object_key)
-        return {"url": url, "expires_in": "24 hour"}
-    else:
-        r2_service.save_file_locally(file_bytes, filename)
-        return {"url": f"/annotated_pdfs/{filename}", "expires_in": "local file (no expiry)"}
+
+def _fallback_clause_result(clause: dict, error: Exception) -> dict:
+    """Safe default returned when a clause analysis thread raises an exception."""
+    return {
+        "result":            "NOT_FOUND",
+        "reason":            f"Analysis failed: {error}",
+        "relevant_text":     None,
+        "ai_recommendation": (
+            f"Clause '{clause['title']}' could not be analyzed. "
+            "Manual review recommended."
+        ),
+        "parties_obligated":   [],
+        "missing_values":      [],
+        "binding_strength":    "VAGUE",
+        "key_dates_durations": [],
+    }
 
 
 class ClauseAnalyzerView(APIView):
     """
     POST /api/analyze/
 
-    Orchestrates the full clause compliance analysis pipeline:
-    1. Validate request
-    2. Download PDF from presigned URL
-    3. Extract text from PDF
-    4. Detect jurisdiction (one AI call)
-    5. Analyze each clause via Groq AI + annotate original PDF
-    6. Detect cross-clause conflicts (one AI call)
-    7. Generate report (redline) + summary (analytics)
-    8. Upload report(s) to S3/R2 or save locally
-    9. Return analysis_summary + report/summary download URL(s) + conflicts + jurisdiction
+    Payload:
+        document_base64  – base64-encoded document (md / pdf / docx / txt)
+        document_type    – "md" | "pdf" | "docx" | "txt"  (default "md")
+        clauses          – list of clause objects  (required, max 100)
+        report_format    – "markdown" | "pdf" | "docx" | "both"  (default "markdown")
+
+    Pipeline:
+        1. Decode base64 → raw bytes
+        2. Extract text blocks (routed by document_type)
+        3. ONE Groq call — extract metadata + jurisdiction together
+        4. [PARALLEL, 3 workers] Per-clause analysis
+              → smart retry: waits exactly as long as Groq's rate-limit header says
+              → per-clause failures get a safe fallback, never abort the request
+        5. Generate report(s) + summary
+        6. Return base64-encoded outputs in response JSON
     """
 
     def post(self, request):
@@ -48,257 +64,197 @@ class ClauseAnalyzerView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        doc_url = serializer.validated_data["document_presigned_url"]
-        clauses = serializer.validated_data["clauses"]
-        report_format = serializer.validated_data.get("report_format", "pdf")
+        doc_b64       = serializer.validated_data["document_base64"]
+        document_type = serializer.validated_data.get("document_type", "md")
+        clauses       = serializer.validated_data["clauses"]
+        report_format = serializer.validated_data.get("report_format", "markdown")
 
-        # Agreement metadata (all optional)
-        agreement_meta = {
-            "agreement_type":    serializer.validated_data.get("agreement_type", ""),
-            "agreement_details": serializer.validated_data.get("agreement_details") or {},
-            "parties":           serializer.validated_data.get("parties") or {},
-            "property":          serializer.validated_data.get("property") or {},
-        }
-
-        # Step 1: Download document (PDF, DOCX, Markdown, TXT)
+        # ── Step 1: Decode base64 → bytes ────────────────────────────────────────
         try:
-            doc_bytes = r2_service.download_document_from_presigned_url(doc_url)
-            logger.info("Document downloaded successfully (%d bytes)", len(doc_bytes))
+            doc_bytes = base64.b64decode(doc_b64)
+            logger.info("Document decoded: %d bytes, type=%s", len(doc_bytes), document_type)
         except Exception as e:
-            logger.error("Document download failed: %s", e)
             return Response(
-                {"status": "error", "message": f"Failed to download document: {str(e)}"},
+                {"status": "error", "message": f"Failed to decode document_base64: {e}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Validate file size (max 100 MB)
-        file_size_mb = len(doc_bytes) / (1024 * 1024)
-        if len(doc_bytes) > MAX_FILE_SIZE_BYTES:
-            return Response(
-                {
-                    "status": "error",
-                    "message": (
-                        f"File size {file_size_mb:.2f} MB exceeds "
-                        f"the maximum allowed size of {MAX_FILE_SIZE_MB} MB."
-                    ),
-                },
-                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            )
-
-        # Step 2: Detect file type and extract text
-        file_type = pdf_service.detect_file_type(doc_url, doc_bytes)
-        text_blocks = pdf_service.extract_text_blocks(doc_url, doc_bytes)
-        full_text = pdf_service.get_full_text(text_blocks)
-        logger.info("Extracted %d text blocks from %s", len(text_blocks), file_type)
+        # ── Step 2: Extract text ──────────────────────────────────────────────────
+        text_blocks = pdf_service.extract_text_blocks_by_type(document_type, doc_bytes)
+        full_text   = pdf_service.get_full_text(text_blocks)
+        logger.info("Extracted %d text blocks", len(text_blocks))
 
         if not full_text.strip():
             return Response(
-                {"status": "error", "message": "PDF contains no extractable text"},
+                {"status": "error", "message": "Document contains no extractable text."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Step 3: Detect jurisdiction (one AI call using first 3000 chars)
-        jurisdiction_info = groq_service.detect_jurisdiction(full_text)
-        logger.info("Jurisdiction detected: %s", jurisdiction_info.get("jurisdiction"))
+        # ── Step 3: ONE call — metadata + jurisdiction combined ───────────────────
+        # Previously 2 parallel calls (~2 000 tokens burst).
+        # Now 1 call (~1 200 tokens) before clause analysis starts.
+        doc_context = groq_service.extract_document_context(full_text)
 
-        # Step 4: Analyze each clause via Groq + build annotation list
-        analysis_summary = []
-        annotations = []
+        agreement_meta = {
+            "agreement_type":    doc_context.get("agreement_type", ""),
+            "agreement_details": doc_context.get("agreement_details") or {},
+            "parties":           doc_context.get("parties") or {},
+            "property":          doc_context.get("property") or {},
+        }
+        jurisdiction_info = {
+            "jurisdiction":    doc_context.get("jurisdiction", "Unknown"),
+            "applicable_laws": doc_context.get("applicable_laws", []),
+            "checklist":       doc_context.get("checklist", []),
+        }
+        logger.info(
+            "Context extracted — agreement_type=%s  jurisdiction=%s",
+            agreement_meta["agreement_type"],
+            jurisdiction_info["jurisdiction"],
+        )
+
+        # ── Step 4: Per-clause analysis — PARALLEL (3 workers) ───────────────────
+        workers = min(len(clauses), _CLAUSE_WORKERS)
+        results_by_id: dict[str, dict] = {}
+
+        with ThreadPoolExecutor(max_workers=workers) as clause_pool:
+            future_to_clause = {
+                clause_pool.submit(
+                    groq_service.analyze_clause_against_pdf, clause, full_text
+                ): clause
+                for clause in clauses
+            }
+
+            for future in as_completed(future_to_clause):
+                clause = future_to_clause[future]
+                try:
+                    results_by_id[clause["id"]] = future.result()
+                except Exception as e:
+                    logger.error(
+                        "Clause '%s' (%s) failed after retries: %s",
+                        clause["id"], clause["title"], e,
+                    )
+                    results_by_id[clause["id"]] = _fallback_clause_result(clause, e)
+
+        logger.info("Clause analysis done (%d clauses, %d workers)", len(clauses), workers)
+
+        # ── Build analysis_summary + annotations in original clause order ─────────
+        analysis_summary: list[dict] = []
+        annotations:      list[dict] = []
 
         for clause in clauses:
-            try:
-                ai_result = groq_service.analyze_clause_against_pdf(clause, full_text)
-            except Exception as e:
-                logger.error("Groq API failed for clause %s: %s", clause["id"], e)
-                return Response(
-                    {"status": "error", "message": f"AI analysis failed: {str(e)}"},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-
+            ai_result = results_by_id[clause["id"]]
             ai_result.pop("_provider", None)
 
-            result_status = ai_result["result"]
+            result_status   = ai_result["result"]
             highlight_color = STATUS_HIGHLIGHT_COLOR.get(result_status)
             insertion_color = STATUS_INSERTION_COLOR.get(result_status)
-            ai_text = ai_result.get("ai_recommendation")
+            ai_text         = ai_result.get("ai_recommendation")
 
             summary_entry = {
-                "clause_id": clause["id"],
-                "clause_title": clause["title"],
-                "clause_content": clause.get("content") or clause.get("value", ""),
-                "result": result_status,
-                "reason": ai_result.get("reason"),
-                "relevant_text": ai_result.get("relevant_text"),
-                "color": None,
-                "ai_added_text": None,
-                "parties_obligated": ai_result.get("parties_obligated", []),
-                "missing_values": ai_result.get("missing_values", []),
-                "binding_strength": ai_result.get("binding_strength", "VAGUE"),
+                "clause_id":           clause["id"],
+                "clause_title":        clause["title"],
+                "clause_content":      clause.get("content") or clause.get("value", ""),
+                "result":              result_status,
+                "reason":              ai_result.get("reason"),
+                "relevant_text":       ai_result.get("relevant_text"),
+                "color":               None,
+                "ai_added_text":       None,
+                "parties_obligated":   ai_result.get("parties_obligated", []),
+                "missing_values":      ai_result.get("missing_values", []),
+                "binding_strength":    ai_result.get("binding_strength", "VAGUE"),
                 "key_dates_durations": ai_result.get("key_dates_durations", []),
             }
 
             if result_status == "NOT_FOUND":
-                summary_entry["color"] = "blue"
+                summary_entry["color"]         = "blue"
                 summary_entry["ai_added_text"] = ai_text
                 if text_blocks:
-                    last_block = text_blocks[-1]
+                    last = text_blocks[-1]
                     annotations.append({
-                        "page_num": last_block["page_num"],
-                        "bbox": last_block["bbox"],
-                        "highlight_color": highlight_color,
-                        "inserted_text": f"[MISSING - {clause['title']}]: {ai_text}" if ai_text else None,
+                        "page_num":            last["page_num"],
+                        "bbox":                last["bbox"],
+                        "highlight_color":     highlight_color,
+                        "inserted_text":       f"[MISSING - {clause['title']}]: {ai_text}" if ai_text else None,
                         "inserted_text_color": insertion_color,
                     })
 
             elif result_status == "PARTIALLY_SATISFIED":
-                summary_entry["color"] = "orange"
+                summary_entry["color"]         = "orange"
                 summary_entry["ai_added_text"] = ai_text
                 relevant_text = ai_result.get("relevant_text")
                 location = groq_service.find_text_location_in_pdf(text_blocks, relevant_text)
                 if not location:
                     location = groq_service.find_text_location_in_pdf(text_blocks, clause["title"])
                 if not location and text_blocks:
-                    last_block = text_blocks[-1]
-                    location = {"page_num": last_block["page_num"], "bbox": last_block["bbox"]}
+                    location = {"page_num": text_blocks[-1]["page_num"], "bbox": text_blocks[-1]["bbox"]}
                 if location:
                     annotations.append({
-                        "page_num": location["page_num"],
-                        "bbox": location["bbox"],
-                        "highlight_color": highlight_color,
-                        "inserted_text": f"[PARTIAL - {clause['title']}]: {ai_text}" if ai_text else None,
+                        "page_num":            location["page_num"],
+                        "bbox":                location["bbox"],
+                        "highlight_color":     highlight_color,
+                        "inserted_text":       f"[PARTIAL - {clause['title']}]: {ai_text}" if ai_text else None,
                         "inserted_text_color": insertion_color,
                     })
 
             elif result_status == "VIOLATION":
-                summary_entry["color"] = "red"
+                summary_entry["color"]         = "red"
                 summary_entry["ai_added_text"] = ai_text
                 relevant_text = ai_result.get("relevant_text")
                 location = groq_service.find_text_location_in_pdf(text_blocks, relevant_text)
                 if not location:
                     location = groq_service.find_text_location_in_pdf(text_blocks, clause["title"])
                 if not location and text_blocks:
-                    last_block = text_blocks[-1]
-                    location = {"page_num": last_block["page_num"], "bbox": last_block["bbox"]}
+                    location = {"page_num": text_blocks[-1]["page_num"], "bbox": text_blocks[-1]["bbox"]}
                 if location:
                     annotations.append({
-                        "page_num": location["page_num"],
-                        "bbox": location["bbox"],
-                        "highlight_color": highlight_color,
-                        "inserted_text": f"[CORRECTION - {clause['title']}]: {ai_text}" if ai_text else None,
+                        "page_num":            location["page_num"],
+                        "bbox":                location["bbox"],
+                        "highlight_color":     highlight_color,
+                        "inserted_text":       f"[CORRECTION - {clause['title']}]: {ai_text}" if ai_text else None,
                         "inserted_text_color": insertion_color,
                     })
 
             analysis_summary.append(summary_entry)
-            time.sleep(0.5)
 
-        # Step 5: Detect cross-clause conflicts (one AI call)
-        conflicts = groq_service.detect_conflicts(analysis_summary)
-        logger.info("Detected %d clause conflict(s)", len(conflicts))
-
-        # Step 6: Generate report(s) + summary from analysis_summary
-        run_id = uuid.uuid4()
-        response_data = {
-            "status": "success",
-            "analysis_summary": analysis_summary,
-            "conflicts": conflicts,
-            "jurisdiction": jurisdiction_info,
-        }
-
+        # ── Step 5 & 6: Generate reports, encode as base64 ───────────────────────
         report_kwargs = dict(
-            conflicts=conflicts,
+            conflicts=[],           # conflict detection removed
             jurisdiction_info=jurisdiction_info,
             full_text=full_text,
             agreement_meta=agreement_meta,
         )
 
+        response_data = {
+            "status":            "success",
+            "document_metadata": doc_context,
+            "analysis_summary":  analysis_summary,
+            "jurisdiction":      jurisdiction_info,
+        }
+
         try:
-            if report_format in ("pdf", "both"):
-                # Redline report
-                pdf_report_bytes = report_service.generate_pdf_report(
-                    analysis_summary, **report_kwargs,
-                )
-                pdf_report_filename = f"report_{run_id}.pdf"
-                result = _upload_or_save(
-                    pdf_report_bytes, pdf_report_filename,
-                    prefix="reports", content_type="application/pdf",
-                )
-                response_data["report_pdf_url"] = result["url"]
-                response_data["report_pdf_expires_in"] = result["expires_in"]
-                logger.info("PDF report generated: %s", pdf_report_filename)
-
-                # Analytics summary
-                pdf_summary_bytes = report_service.generate_pdf_summary(
-                    analysis_summary, **report_kwargs,
-                )
-                pdf_summary_filename = f"summary_{run_id}.pdf"
-                result = _upload_or_save(
-                    pdf_summary_bytes, pdf_summary_filename,
-                    prefix="reports", content_type="application/pdf",
-                )
-                response_data["summary_pdf_url"] = result["url"]
-                response_data["summary_pdf_expires_in"] = result["expires_in"]
-                logger.info("PDF summary generated: %s", pdf_summary_filename)
-
             if report_format in ("markdown", "both"):
-                # Redline report
-                md_content = report_service.generate_markdown_report(
-                    analysis_summary, **report_kwargs,
-                )
-                md_bytes = md_content.encode("utf-8")
-                md_filename = f"report_{run_id}.md"
-                result = _upload_or_save(
-                    md_bytes, md_filename,
-                    prefix="reports", content_type="text/markdown",
-                )
-                response_data["report_markdown_url"] = result["url"]
-                response_data["report_markdown_expires_in"] = result["expires_in"]
-                logger.info("Markdown report generated: %s", md_filename)
+                md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
+                md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
+                response_data["report_markdown_base64"]  = base64.b64encode(md_report.encode("utf-8")).decode("ascii")
+                response_data["summary_markdown_base64"] = base64.b64encode(md_summary.encode("utf-8")).decode("ascii")
+                logger.info("Markdown report generated and base64-encoded")
 
-                # Analytics summary
-                md_summary = report_service.generate_markdown_summary(
-                    analysis_summary, **report_kwargs,
-                )
-                md_summary_bytes = md_summary.encode("utf-8")
-                md_summary_filename = f"summary_{run_id}.md"
-                result = _upload_or_save(
-                    md_summary_bytes, md_summary_filename,
-                    prefix="reports", content_type="text/markdown",
-                )
-                response_data["summary_markdown_url"] = result["url"]
-                response_data["summary_markdown_expires_in"] = result["expires_in"]
-                logger.info("Markdown summary generated: %s", md_summary_filename)
+            if report_format in ("pdf", "both"):
+                pdf_report  = report_service.generate_pdf_report(analysis_summary, **report_kwargs)
+                pdf_summary = report_service.generate_pdf_summary(analysis_summary, **report_kwargs)
+                response_data["report_pdf_base64"]  = base64.b64encode(pdf_report).decode("ascii")
+                response_data["summary_pdf_base64"] = base64.b64encode(pdf_summary).decode("ascii")
+                logger.info("PDF report generated and base64-encoded")
 
             if report_format == "docx":
-                # Redline report
-                docx_bytes = report_service.generate_docx_report(
-                    analysis_summary, **report_kwargs,
-                )
-                docx_filename = f"report_{run_id}.docx"
-                result = _upload_or_save(
-                    docx_bytes, docx_filename,
-                    prefix="reports",
-                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-                response_data["report_docx_url"] = result["url"]
-                response_data["report_docx_expires_in"] = result["expires_in"]
-                logger.info("DOCX report generated: %s", docx_filename)
-
-                # Analytics summary
-                docx_summary_bytes = report_service.generate_docx_summary(
-                    analysis_summary, **report_kwargs,
-                )
-                docx_summary_filename = f"summary_{run_id}.docx"
-                result = _upload_or_save(
-                    docx_summary_bytes, docx_summary_filename,
-                    prefix="reports",
-                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-                response_data["summary_docx_url"] = result["url"]
-                response_data["summary_docx_expires_in"] = result["expires_in"]
-                logger.info("DOCX summary generated: %s", docx_summary_filename)
+                docx_report  = report_service.generate_docx_report(analysis_summary, **report_kwargs)
+                docx_summary = report_service.generate_docx_summary(analysis_summary, **report_kwargs)
+                response_data["report_docx_base64"]  = base64.b64encode(docx_report).decode("ascii")
+                response_data["summary_docx_base64"] = base64.b64encode(docx_summary).decode("ascii")
+                logger.info("DOCX report generated and base64-encoded")
 
         except Exception as e:
-            logger.error("Report generation/upload failed: %s", e)
-            response_data["report_error"] = f"Report could not be generated/uploaded: {str(e)}"
+            logger.error("Report generation failed: %s", e)
+            response_data["report_error"] = f"Report could not be generated: {e}"
 
         return Response(response_data, status=status.HTTP_200_OK)

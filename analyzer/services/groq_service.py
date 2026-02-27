@@ -1,28 +1,22 @@
 import json
 import logging
+import random
+import time
 
-from groq import Groq
+from groq import Groq, RateLimitError as GroqRateLimitError
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 # Max chars sent to AI per clause — keeps every call within any model's context window
-# ~5,000 chars ≈ 1,250 tokens (vs 3,000,000 chars for a 1000-page PDF)
 _EXCERPT_CHARS = 5_000
+
+# Retry config
+_MAX_RETRIES = 5
+_BASE_DELAY  = 1.0  # fallback if server doesn't provide retry-after
 
 
 def _get_relevant_excerpt(full_text: str, clause_title: str, clause_content: str) -> str:
-    """
-    Extract the most relevant portion of the document for the given clause.
-
-    For small documents (<= 5,000 chars) returns the full text.
-    For large documents slides a 5,000-char window across the text in steps of 2,500 chars,
-    scores each window by keyword overlap with the clause title + content,
-    and returns the highest-scoring window.
-
-    This ensures every Groq call stays well within the model's context window
-    regardless of the PDF size (even 1000-page / 78 MB documents).
-    """
     if len(full_text) <= _EXCERPT_CHARS:
         return full_text
 
@@ -47,11 +41,82 @@ def _get_relevant_excerpt(full_text: str, clause_title: str, clause_content: str
         pos += step
 
     excerpt = full_text[best_pos: best_pos + _EXCERPT_CHARS]
-    logger.debug(
-        "Excerpt for clause '%s': pos=%d, score=%d, len=%d",
-        clause_title, best_pos, best_score, len(excerpt),
-    )
+    logger.debug("Excerpt for '%s': pos=%d score=%d len=%d", clause_title, best_pos, best_score, len(excerpt))
     return excerpt
+
+
+# ── Smart retry helper ────────────────────────────────────────────────────────────
+
+def _parse_retry_wait(e: GroqRateLimitError) -> float | None:
+    """
+    Extract the server-suggested wait time from Groq's rate-limit response headers.
+
+    Groq sends one of:
+      retry-after                  → seconds (float)
+      x-ratelimit-reset-tokens     → e.g. "0.952s" or "952ms"
+      x-ratelimit-reset-requests   → same format
+
+    Returns seconds to wait, or None if headers are unavailable.
+    """
+    try:
+        headers = e.response.headers
+
+        ra = headers.get("retry-after")
+        if ra:
+            return float(ra) + 0.05
+
+        for key in ("x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+            val = headers.get(key, "")
+            if val.endswith("ms"):
+                return float(val[:-2]) / 1000 + 0.05
+            if val.endswith("s"):
+                return float(val[:-1]) + 0.05
+    except Exception:
+        pass
+    return None
+
+
+# ── Shared Groq caller with smart retry ──────────────────────────────────────────
+
+def _call_groq(user_message: str, system_prompt: str, max_tokens: int = 1500) -> str:
+    """
+    Call Groq AI with smart rate-limit retry.
+
+    On 429 RateLimitError:
+      1. Reads the server's 'retry-after' / 'x-ratelimit-reset-tokens' header
+         and waits exactly that long (+ 50 ms jitter) — no wasted time.
+      2. Falls back to exponential backoff only when headers are unavailable.
+
+    All other exceptions propagate immediately.
+    Thread-safe — each call creates its own Groq client.
+    """
+    client = Groq(api_key=settings.GROQ_API_KEY)
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+                model=settings.GROQ_MODEL,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content.strip()
+
+        except GroqRateLimitError as e:
+            if attempt == _MAX_RETRIES:
+                logger.error("Groq rate limit — exhausted %d retries", _MAX_RETRIES)
+                raise
+
+            # Use server-suggested wait time; fall back to exponential backoff
+            wait = _parse_retry_wait(e)
+            if wait is None:
+                wait = _BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+
+            logger.warning("Groq rate limit — retry %d/%d in %.2f s", attempt + 1, _MAX_RETRIES, wait)
+            time.sleep(wait)
 
 
 # ── Per-clause analysis ──────────────────────────────────────────────────────────
@@ -83,40 +148,26 @@ Rules:
 - PARTIALLY_SATISFIED: clause topic exists but is incomplete, vague, or only partly meets the requirement
 - NOT_FOUND: clause topic is completely absent from the document
 - VIOLATION: clause topic exists but contradicts or violates the clause requirement
-- parties_obligated: list which party carries obligations under this clause (["Tenant"], ["Landlord"], ["Both"], or [] if not applicable)
-- missing_values: list critical referenced values that are undefined or blank in the clause or document (e.g. amounts, dates, percentages left as blanks)
-- binding_strength: classify the language strength — "MUST/SHALL" for mandatory/imperative, "SHOULD" for advisory, "MAY/CAN" for permissive/optional, "VAGUE" for non-binding phrases like "agrees to try" or "will endeavour"
-- key_dates_durations: list all dates and durations found in this clause (e.g. "30 days", "March 2029", "within 60 days of execution", "5th of each month")
+- parties_obligated: list which party carries obligations under this clause
+- missing_values: list critical referenced values that are undefined or blank
+- binding_strength: "MUST/SHALL" mandatory, "SHOULD" advisory, "MAY/CAN" permissive, "VAGUE" non-binding
+- key_dates_durations: list all dates and durations found in this clause
 """
 
 _VALID_BINDING = ("MUST/SHALL", "SHOULD", "MAY/CAN", "VAGUE")
 
 
 def _safe_json_parse(text: str) -> dict:
-    """
-    Parse JSON with automatic repair for truncated responses.
-
-    Groq can hit max_tokens mid-response, leaving an unterminated string or
-    unclosed object/array. This function:
-      1. Strips code fences (``` ... ```)
-      2. Tries a direct json.loads
-      3. Tries to find the deepest valid close-brace and truncate there
-      4. Strips trailing commas and force-closes the outermost object
-    Raises json.JSONDecodeError only if all three strategies fail.
-    """
-    # Strip code fences
     if text.startswith("```"):
         lines = [ln for ln in text.split("\n") if not ln.strip().startswith("```")]
         text = "\n".join(lines)
     text = text.strip()
 
-    # Strategy 1: direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: find the last position where the root object/array is closed
     depth = 0
     in_string = False
     escape_next = False
@@ -145,7 +196,6 @@ def _safe_json_parse(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Strategy 3: strip trailing partial field + dangling comma, then force-close
     stripped = text.rstrip().rstrip(",")
     if not stripped.endswith("}"):
         stripped += "}"
@@ -158,14 +208,12 @@ def _safe_json_parse(text: str) -> dict:
 
 
 def _parse_response(response_text: str) -> dict:
-    """Parse and validate the AI JSON response."""
     result = _safe_json_parse(response_text)
 
     if result.get("result") not in ("MATCH", "NOT_FOUND", "VIOLATION", "PARTIALLY_SATISFIED"):
-        logger.warning("Invalid result value: %s, defaulting to NOT_FOUND", result.get("result"))
+        logger.warning("Invalid result value '%s', defaulting to NOT_FOUND", result.get("result"))
         result["result"] = "NOT_FOUND"
 
-    # Validate / default the 4 new fields
     if not isinstance(result.get("parties_obligated"), list):
         result["parties_obligated"] = []
     if not isinstance(result.get("missing_values"), list):
@@ -178,45 +226,24 @@ def _parse_response(response_text: str) -> dict:
     return result
 
 
-def _call_groq(user_message: str) -> str:
-    """Call Groq AI and return the raw response text."""
-    client = Groq(api_key=settings.GROQ_API_KEY)
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-        max_tokens=1500,
-    )
-    return chat_completion.choices[0].message.content.strip()
-
-
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     """
     Analyze clause compliance using Groq AI.
-    Returns dict with: result, reason, relevant_text, ai_recommendation,
-                       parties_obligated, missing_values, binding_strength, key_dates_durations
+    Thread-safe — called concurrently from ThreadPoolExecutor.
     """
-    title = clause["title"]
+    title   = clause["title"]
     content = clause.get("content") or clause.get("value", "")
-
     excerpt = _get_relevant_excerpt(pdf_text, title, content)
 
-    user_message = USER_PROMPT_TEMPLATE.format(
-        title=title,
-        content=content,
-        pdf_text=excerpt,
-    )
+    user_message = USER_PROMPT_TEMPLATE.format(title=title, content=content, pdf_text=excerpt)
 
     try:
-        response_text = _call_groq(user_message)
+        response_text = _call_groq(user_message, SYSTEM_PROMPT, max_tokens=1500)
         result = _parse_response(response_text)
         result["_provider"] = "groq"
         return result
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse Groq JSON response for clause '%s': %s", title, e)
+        logger.error("Failed to parse Groq JSON for clause '%s': %s", title, e)
         return {
             "result": "NOT_FOUND",
             "reason": "AI response could not be parsed",
@@ -233,18 +260,42 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
         raise
 
 
-# ── Document-level analysis ──────────────────────────────────────────────────────
+# ── Combined document context (metadata + jurisdiction in ONE call) ───────────────
 
-_JURISDICTION_SYSTEM = """You are a legal jurisdiction analyst. Analyze the provided contract text and identify the governing jurisdiction, agreement type, and applicable laws. Respond ONLY with valid JSON, no extra text or markdown."""
+_CONTEXT_SYSTEM = """You are a legal document analyst. Extract structured metadata and jurisdiction info from the contract text. Respond ONLY with valid JSON, no extra text or markdown."""
 
-_JURISDICTION_USER = """DOCUMENT EXCERPT (first 3000 characters):
-{pdf_excerpt}
+_CONTEXT_USER = """DOCUMENT TEXT (first 4000 characters):
+{excerpt}
 
-Identify the jurisdiction and compliance requirements. Respond in this EXACT JSON format:
+Extract all document context and respond in this EXACT JSON format:
 {{
-    "jurisdiction": "State/Country name or 'Unknown'",
     "agreement_type": "e.g. Commercial Rental Agreement",
-    "applicable_laws": ["Indian Contract Act 1872", "Telangana Stamp Act"],
+    "agreement_details": {{
+        "agreement_date": "YYYY-MM-DD or empty string",
+        "city": "city name or empty string",
+        "state": "state/province or empty string"
+    }},
+    "parties": {{
+        "landlord": {{
+            "name": "full name or empty string",
+            "address": "address or empty string",
+            "contact": "email/phone or empty string"
+        }},
+        "tenant": {{
+            "name": "full name or empty string",
+            "company_name": "company name or empty string",
+            "authorized_signatory": "signatory name or empty string",
+            "address": "address or empty string",
+            "contact": "email/phone or empty string"
+        }}
+    }},
+    "property": {{
+        "type": "e.g. Commercial Office Space or empty string",
+        "area_sqft": null,
+        "address": "property address or empty string"
+    }},
+    "jurisdiction": "State/Country name or Unknown",
+    "applicable_laws": ["Indian Contract Act 1872", "Karnataka Rent Control Act"],
     "checklist": [
         {{"item": "Registration required under Registration Act", "required": true}},
         {{"item": "Stamp duty payment required", "required": true}},
@@ -253,120 +304,61 @@ Identify the jurisdiction and compliance requirements. Respond in this EXACT JSO
 }}
 
 Rules:
-- If jurisdiction is unclear set "jurisdiction" to "Unknown"
-- checklist should contain 3-6 key compliance requirements for this jurisdiction and agreement type
-- required: true means mandatory, false means optional/recommended
+- Use empty string for missing text fields, null for missing numeric fields
+- jurisdiction: detect from governing law clauses, party addresses, or property location
+- checklist: 3-6 key compliance requirements for this jurisdiction and agreement type
+- required: true = mandatory, false = optional/recommended
 """
 
 
-def detect_jurisdiction(pdf_text: str) -> dict:
+def extract_document_context(full_text: str) -> dict:
     """
-    Analyze the first 3000 chars of the document to detect jurisdiction and build a
-    compliance checklist. Called ONCE before the per-clause loop.
+    Single Groq call that extracts BOTH document metadata AND jurisdiction info.
+    Replaces the two separate parallel calls (extract_document_metadata + detect_jurisdiction).
 
-    Returns: {jurisdiction, agreement_type, applicable_laws, checklist}
+    Returns combined dict with keys:
+        agreement_type, agreement_details, parties, property,
+        jurisdiction, applicable_laws, checklist
     """
-    excerpt = pdf_text[:3000]
-    user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    excerpt = full_text[:4000]
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": _JURISDICTION_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            model=settings.GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=1000,
-        )
-        response_text = chat_completion.choices[0].message.content.strip()
+        response_text = _call_groq(_CONTEXT_USER.format(excerpt=excerpt), _CONTEXT_SYSTEM, max_tokens=1200)
         result = _safe_json_parse(response_text)
-        if not isinstance(result.get("checklist"), list):
-            result["checklist"] = []
+
+        # Structural defaults
+        if not isinstance(result.get("agreement_details"), dict):
+            result["agreement_details"] = {"agreement_date": "", "city": "", "state": ""}
+        if not isinstance(result.get("parties"), dict):
+            result["parties"] = {"landlord": {}, "tenant": {}}
+        if not isinstance(result.get("property"), dict):
+            result["property"] = {"type": "", "area_sqft": None, "address": ""}
         if not isinstance(result.get("applicable_laws"), list):
             result["applicable_laws"] = []
+        if not isinstance(result.get("checklist"), list):
+            result["checklist"] = []
+
         return result
     except Exception as e:
-        logger.error("detect_jurisdiction failed: %s", e)
+        logger.error("extract_document_context failed: %s", e)
         return {
+            "agreement_type": "",
+            "agreement_details": {"agreement_date": "", "city": "", "state": ""},
+            "parties": {"landlord": {}, "tenant": {}},
+            "property": {"type": "", "area_sqft": None, "address": ""},
             "jurisdiction": "Unknown",
-            "agreement_type": "Unknown",
             "applicable_laws": [],
             "checklist": [],
         }
 
 
-_CONFLICT_SYSTEM = """You are a legal contract conflict analyst. Identify contradictions or conflicts between clauses in a contract analysis. Respond ONLY with valid JSON, no extra text or markdown."""
-
-_CONFLICT_USER = """CLAUSE ANALYSIS RESULTS:
-{clause_summary_text}
-
-Identify any direct contradictions, conflicts, or inconsistencies between these clauses.
-Respond in this EXACT JSON format:
-{{
-    "conflicts": [
-        {{
-            "clause_a": "Clause title A",
-            "clause_b": "Clause title B",
-            "conflict": "Brief description of the contradiction"
-        }}
-    ]
-}}
-
-Rules:
-- Return an empty list for "conflicts" if no genuine contradictions exist
-- Only report direct logical contradictions (e.g. one clause says 30 days notice, another says 60 days)
-- Maximum 5 conflicts
-"""
-
-
-def detect_conflicts(analysis_summary: list) -> list:
-    """
-    Compare all clause analysis results for contradictions/conflicts.
-    Called ONCE after all per-clause analyses are complete.
-
-    Returns: [{clause_a, clause_b, conflict}, ...] or []
-    """
-    lines = []
-    for entry in analysis_summary:
-        lines.append(
-            f"- {entry['clause_title']} [{entry['result']}]: {entry.get('reason', '')}"
-        )
-    clause_summary_text = "\n".join(lines)
-
-    user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
-    client = Groq(api_key=settings.GROQ_API_KEY)
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": _CONFLICT_SYSTEM},
-                {"role": "user", "content": user_message},
-            ],
-            model=settings.GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=800,
-        )
-        response_text = chat_completion.choices[0].message.content.strip()
-        result = _safe_json_parse(response_text)
-        conflicts = result.get("conflicts", [])
-        return conflicts if isinstance(conflicts, list) else []
-    except Exception as e:
-        logger.error("detect_conflicts failed: %s", e)
-        return []
-
-
 # ── PDF text location helper ──────────────────────────────────────────────────────
 
 def find_text_location_in_pdf(text_blocks: list, search_text: str) -> dict | None:
-    """
-    Find which page and bbox contains text most similar to search_text.
-    Uses substring matching with case-insensitive comparison.
-    """
     if not search_text:
         return None
 
     search_lower = search_text.lower()
-    best_match = None
+    best_match   = None
     best_overlap = 0
 
     for block in text_blocks:
@@ -376,11 +368,11 @@ def find_text_location_in_pdf(text_blocks: list, search_text: str) -> dict | Non
             return {"page_num": block["page_num"], "bbox": block["bbox"]}
 
         search_words = set(search_lower.split())
-        block_words = set(block_text_lower.split())
-        overlap = len(search_words & block_words)
+        block_words  = set(block_text_lower.split())
+        overlap      = len(search_words & block_words)
 
         if overlap > best_overlap and overlap >= len(search_words) * 0.3:
             best_overlap = overlap
-            best_match = {"page_num": block["page_num"], "bbox": block["bbox"]}
+            best_match   = {"page_num": block["page_num"], "bbox": block["bbox"]}
 
     return best_match
