@@ -293,6 +293,8 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     #   "* some item"  →  "• some item"
     _md_bullet   = re.compile(r'^\*\s+')
     _md_heading  = re.compile(r'^#+\s*')
+    _table_line  = re.compile(r'^\|.+\|$')
+    _table_sep   = re.compile(r'^\|[\s\-:|\+]+\|$')
 
     def _clean_display(s: str) -> str:
         """Convert markdown artifacts to display-friendly format."""
@@ -341,7 +343,7 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_violation():
         nonlocal pending_v_key, pending_v_lines, pending_v_ai, pending_v_reason
         if pending_v_lines:
-            display = " ".join(_clean_display(l) for l in pending_v_lines)
+            display = "<br>".join(_clean_display(l) for l in pending_v_lines)
             segments.append({"type": "violation", "text": display, "reason": pending_v_reason})
             if pending_v_ai:
                 segments.append({"type": "ai", "text": pending_v_ai})
@@ -353,7 +355,7 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_partial():
         nonlocal pending_p_key, pending_p_lines, pending_p_ai, pending_p_reason
         if pending_p_lines:
-            display = " ".join(_clean_display(l) for l in pending_p_lines)
+            display = "<br>".join(_clean_display(l) for l in pending_p_lines)
             segments.append({"type": "partial", "text": display, "reason": pending_p_reason})
             if pending_p_ai:
                 segments.append({"type": "ai", "text": pending_p_ai})
@@ -365,14 +367,46 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     def _flush_match():
         nonlocal pending_m_key, pending_m_lines
         if pending_m_lines:
-            display = " ".join(_clean_display(l) for l in pending_m_lines)
+            display = "<br>".join(_clean_display(l) for l in pending_m_lines)
             segments.append({"type": "match", "text": display})
         pending_m_key   = None
         pending_m_lines = []
 
+    pending_table_lines = []
+
+    def _flush_table():
+        nonlocal pending_table_lines
+        if not pending_table_lines:
+            return
+        html_rows = []
+        is_first_data = True
+        for tl in pending_table_lines:
+            if _table_sep.match(tl):
+                continue
+            cells = [c.strip() for c in tl.strip('|').split('|')]
+            if is_first_data:
+                html_cells = "".join(f"<th>{c}</th>" for c in cells)
+                html_rows.append(f"<tr>{html_cells}</tr>")
+                is_first_data = False
+            else:
+                html_cells = "".join(f"<td>{c}</td>" for c in cells)
+                html_rows.append(f"<tr>{html_cells}</tr>")
+        if html_rows:
+            table_html = '<table class="doc-table">' + "".join(html_rows) + "</table>"
+            segments.append({"type": "table", "text": table_html})
+        pending_table_lines = []
+
     for line in (full_text or "").split("\n"):
         stripped = line.strip()
-        if not stripped or _junk.match(stripped):
+        if not stripped:
+            _flush_violation()
+            _flush_partial()
+            _flush_match()
+            _flush_table()
+            if segments and segments[-1]["type"] != "blank":
+                segments.append({"type": "blank", "text": ""})
+            continue
+        if _junk.match(stripped):
             continue
 
         # ── 1. Violation check ─────────────────────────────────────────────
@@ -445,7 +479,13 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
 
         _flush_match()
 
-        # ── 4. Heading / Normal ────────────────────────────────────────────
+        # ── 4. Table check ────────────────────────────────────────────────
+        if _table_line.match(stripped):
+            pending_table_lines.append(stripped)
+            continue
+        _flush_table()
+
+        # ── 5. Heading / Normal ────────────────────────────────────────────
         if stripped.startswith('#'):
             # Markdown heading → H1 bold segment (strip # chars, keep plain text)
             heading_text = _md_heading.sub('', stripped).strip()
@@ -456,6 +496,7 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     _flush_violation()
     _flush_partial()
     _flush_match()
+    _flush_table()
 
     for ai_text, reason in not_found_list:
         segments.append({"type": "not_found_ai", "text": ai_text, "reason": reason})
@@ -1023,6 +1064,11 @@ _MD_DIFF_CSS = """\
 
 /* Unchanged — match and normal: no bg, pure black text */
 .diff-group[data-type="unchanged"] .diff-line .line-content { color: #000000 !important; }
+
+/* Tables */
+.doc-table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+.doc-table th, .doc-table td { border: 1px solid #dee2e6; padding: 8px 12px; text-align: left; }
+.doc-table th { font-weight: 700; }
 </style>
 """
 
@@ -1145,6 +1191,13 @@ def generate_markdown_report(
             lines.append("  </div>")
             lines.append("</div>")
             lines.append("")
+
+        elif stype == "table":
+            lines.append(text)
+            lines.append("")
+
+        elif stype == "blank":
+            lines.append('<div style="height: 8px;"></div>')
 
         i += 1
 

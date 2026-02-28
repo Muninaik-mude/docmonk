@@ -80,7 +80,7 @@ def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
     Returns the extracted text, or empty string if nothing found / on error.
     """
     user_message = _EXTRACT_USER.format(title=title, doc_text=doc_text)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY,base_url= 'htpps://api.groq.com/openai/v1', max_retries=0, timeout=30.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=30.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -263,7 +263,7 @@ def _parse_response(response_text: str) -> dict:
 
 def _call_groq(user_message: str) -> str:
     """Call Groq AI with rate-limit retry. Returns raw response text."""
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -382,7 +382,7 @@ def detect_jurisdiction(pdf_text: str) -> dict:
     """
     excerpt = pdf_text[:3000]
     user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -464,7 +464,7 @@ def detect_conflicts(analysis_summary: list) -> list:
     clause_summary_text = "\n".join(lines)
 
     user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=0, timeout=60.0)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
