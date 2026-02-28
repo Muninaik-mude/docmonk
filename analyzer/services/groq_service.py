@@ -296,7 +296,7 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
                        parties_obligated, missing_values, binding_strength, key_dates_durations
     """
     title = clause["title"]
-    content = clause.get("content") or clause.get("value", "")
+    content = clause["value"]
 
     # Step 1: AI extracts the verbatim relevant text directly from the full document
     ai_excerpt = _extract_relevant_text_via_ai(title, pdf_text)

@@ -4,8 +4,7 @@ from rest_framework import serializers
 class ClauseSerializer(serializers.Serializer):
     id = serializers.CharField()
     title = serializers.CharField()
-    content = serializers.CharField(required=False, default="")
-    value = serializers.CharField(required=False, default="")
+    value = serializers.CharField()
     category = serializers.CharField(required=False, default="")
 
 

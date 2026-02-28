@@ -184,7 +184,7 @@ class ClauseAnalyzerView(APIView):
             summary_entry = {
                 "clause_id": clause["id"],
                 "clause_title": clause["title"],
-                "clause_content": clause.get("content") or clause.get("value", ""),
+                "clause_value": clause["value"],
                 "result": result_status,
                 "reason": ai_result.get("reason"),
                 "relevant_text": ai_result.get("relevant_text"),

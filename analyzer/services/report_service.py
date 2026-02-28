@@ -249,7 +249,7 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
     for entry in analysis_summary:
         result       = entry.get("result", "")
         rt           = (entry.get("relevant_text") or "").strip()
-        cc           = (entry.get("clause_content", "")).strip()
+        cc           = (entry.get("clause_value", "")).strip()
         clause_title = (entry.get("clause_title", "") or "").strip()
         ai_text      = entry.get("ai_added_text", "") or ""
         reason       = entry.get("reason", "") or ""
