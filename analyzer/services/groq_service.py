@@ -165,42 +165,12 @@ def _call_ai(
     )
 
 
-# ── AI-based relevant text extraction ───────────────────────────────────────────
-
-_EXTRACT_SYSTEM = """You are a document search assistant. Given a clause topic and a legal document, return ONLY the exact verbatim sentence(s) or paragraph(s) from the document that are directly relevant to that clause. Do not paraphrase, summarize, or add any explanation. Return the copied text only."""
-
-_EXTRACT_USER = """CLAUSE TOPIC: {title}
-
-DOCUMENT TEXT:
-{doc_text}
-
-Copy verbatim only the sentence(s) from DOCUMENT TEXT that directly mention or relate to "{title}".
-IMPORTANT: If the relevant sentence(s) are part of a numbered section or sub-clause (e.g. "3.1 Fees:", "7.10 Assignment:", "2.3.1 Obligations:"), include that full line from the start — do not strip the numbering prefix. Return only the copied text with no extra words. If nothing relevant exists, return an empty string."""
-
-
-def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
-    """
-    Use a fast AI call to extract the exact verbatim sentences from the document
-    that are relevant to the given clause title.
-
-    Returns the extracted text, or empty string if nothing found / on error.
-    """
-    user_message = _EXTRACT_USER.format(title=title, doc_text=doc_text)
-    try:
-        return _call_ai(
-            user_message,
-            _EXTRACT_SYSTEM,
-            max_tokens=500,
-            temperature=0.0,
-        )
-    except Exception as e:
-        logger.warning("Excerpt extraction failed for '%s': %s", title, e)
-        return ""
-
-
 # ── Per-clause analysis ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a strict legal contract compliance auditor. Your job is to compare a REQUIRED CLAUSE (the standard/library clause) against the ACTUAL DOCUMENT TEXT and determine whether the document satisfies, violates, or is missing that clause.
+SYSTEM_PROMPT = """You are a strict legal contract compliance auditor. You receive a REQUIRED CLAUSE and a FULL CONTRACT DOCUMENT. Your job is to:
+1. Scan the full document and locate the section(s) relevant to the clause topic.
+2. Compare the required clause against what the document actually says in that section.
+3. Determine whether the document satisfies, violates, or is missing that clause.
 
 You are not checking if a topic merely exists. You are verifying whether the document's specific terms — amounts, dates, jurisdictions, named acts, restrictions, percentages, locations — exactly match or conflict with the required clause.
 
@@ -210,15 +180,16 @@ USER_PROMPT_TEMPLATE = """REQUIRED CLAUSE (this is what the contract SHOULD cont
 TITLE: {title}
 CONTENT: {content}
 
-ACTUAL DOCUMENT TEXT (this is what the contract ACTUALLY says):
+FULL CONTRACT DOCUMENT:
 {pdf_text}
 
-Your task: Compare the REQUIRED CLAUSE against the ACTUAL DOCUMENT TEXT with the following strict methodology:
+Your task: Analyze the FULL CONTRACT DOCUMENT against the REQUIRED CLAUSE using the following strict methodology:
 
-STEP 1 — Does the document contain this clause topic at all?
-  - If NO → result is NOT_FOUND
+STEP 1 — Scan the full document and locate the section(s) relevant to "{title}".
+  - Copy the verbatim sentence(s) or paragraph(s) you find into the "relevant_text" field.
+  - If nothing relevant exists anywhere in the document → result is NOT_FOUND, relevant_text is null.
 
-STEP 2 — If YES, compare every specific value in the required clause against the document:
+STEP 2 — If relevant text is found, compare every specific value in the required clause against it:
   - Monetary amounts (e.g. Rs.2,25,000 required vs Rs.1,50,000 in document → VIOLATION)
   - Named laws/acts (e.g. "Telangana Stamp Act" required vs "Indian Stamp Act" in document → VIOLATION)
   - Locations/jurisdictions (e.g. "Hyderabad" required vs "Bengaluru" in document → VIOLATION)
@@ -236,7 +207,7 @@ Respond in this EXACT JSON format:
 {{
     "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
     "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
-    "relevant_text": "the exact sentence(s) from the document that relate to this clause, or null",
+    "relevant_text": "the verbatim sentence(s) or paragraph(s) you located in the document for this clause topic — copied exactly as they appear including any numbering prefix (e.g. '3.1 Fees:') — or null if not found",
     "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — if relevant_text literally starts with a numbering prefix such as '3.1', '7.10', '2.3', '1)', then begin ai_recommendation with that exact same prefix; if relevant_text starts with a bullet (•, *, -) or any non-digit character, do NOT add any number prefix. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
     "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000", "no commencement date specified"] or [],
@@ -382,11 +353,13 @@ def _parse_response(response_text: str) -> dict:
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     """
-    Analyze clause compliance using a two-step AI pipeline:
-      Step 1 — AI extracts the verbatim relevant text for this clause from the document.
-      Step 2 — AI analyzes that extracted text against the clause requirement.
+    Analyze clause compliance in a single AI call.
 
-    Both steps use the shared multi-provider pool (round-robin, rate-limit aware).
+    The full document text is passed directly — the AI extracts the relevant
+    text and performs compliance analysis in one shot, returning both
+    relevant_text and the compliance verdict in a single JSON response.
+
+    Uses the shared multi-provider pool (round-robin, rate-limit aware).
 
     Returns dict with: result, reason, relevant_text, ai_recommendation,
                        parties_obligated, missing_values, binding_strength, key_dates_durations
@@ -394,14 +367,10 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     title   = clause["title"]
     content = clause["value"]
 
-    # Step 1: AI extracts the verbatim relevant text directly from the full document
-    excerpt = _extract_relevant_text_via_ai(title, pdf_text)
-    logger.debug("Clause '%s': ai_excerpt=%d chars", title, len(excerpt))
-
     user_message = USER_PROMPT_TEMPLATE.format(
         title=title,
         content=content,
-        pdf_text=excerpt,
+        pdf_text=pdf_text,
     )
 
     try:

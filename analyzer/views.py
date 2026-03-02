@@ -14,8 +14,8 @@ from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLO
 
 logger = logging.getLogger(__name__)
 
-# Max parallel clause analyses — each clause makes 2 sequential AI calls (extract + analyze).
-# With 4 pooled providers, 3 workers = up to 6 concurrent calls spread evenly across keys.
+# Max parallel clause analyses — each clause makes 1 AI call (extract + analyze combined).
+# With 4 pooled providers, 3 workers = up to 3 concurrent calls spread evenly across keys.
 _MAX_PARALLEL_CLAUSES = 3
 
 
