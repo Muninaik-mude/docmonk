@@ -1,63 +1,168 @@
 import json
 import logging
+import re
+import threading
 import time
 
 from openai import OpenAI, RateLimitError
 from django.conf import settings
 
+# Matches a leading numbering prefix like "3.1 ", "7.10 ", "2.3.1 ", "6. ", "1) "
+_NUM_PREFIX_RE = re.compile(r'^(\d+(?:\.\d+)*[\s.):]+)')
+
 logger = logging.getLogger(__name__)
 
-# Rate limit: short sleep between calls to avoid 429 bursts
-_RATE_LIMIT_DELAY = 1.0
-_RATE_LIMIT_RETRY_WAIT = 5.0
-_MAX_RETRIES = 2
-
-# Max chars sent to AI per clause — keeps every call within any model's context window
-# ~5,000 chars ≈ 1,250 tokens (vs 3,000,000 chars for a 1000-page PDF)
-_EXCERPT_CHARS = 5_000
+# Seconds to wait when ALL providers are simultaneously rate-limited
+_RATE_LIMIT_RETRY_WAIT = 8.0
+# Max full-pool sweeps before giving up (on a single _call_ai invocation)
+_MAX_RETRIES = 3
 
 
-def _get_relevant_excerpt(full_text: str, clause_title: str, clause_content: str) -> str:
+# ── Multi-provider client pool ────────────────────────────────────────────────────
+
+_pool_lock:   threading.Lock = threading.Lock()
+_pool:        list           = []
+_pool_built:  bool           = False
+_idx_lock:    threading.Lock = threading.Lock()
+_idx:         int            = 0
+
+
+def _build_provider_pool() -> list:
     """
-    Extract the most relevant portion of the document for the given clause.
+    Build the ordered list of AI provider clients from Django settings.
 
-    For small documents (<= 5,000 chars) returns the full text.
-    For large documents slides a 5,000-char window across the text in steps of 2,500 chars,
-    scores each window by keyword overlap with the clause title + content,
-    and returns the highest-scoring window.
-
-    This ensures every Groq call stays well within the model's context window
-    regardless of the PDF size (even 1000-page / 78 MB documents).
+    Provider order: groq_1, groq_2, cerebras_1, cerebras_2
+    Any provider whose API key is not set is silently skipped.
     """
-    if len(full_text) <= _EXCERPT_CHARS:
-        return full_text
+    pool = []
+    groq_model     = getattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
+    cerebras_model = "gpt-oss-120b"
 
-    query = (clause_title + " " + clause_content).lower()
-    query_words = {w for w in query.split() if len(w) > 3}
+    for slot, attr in enumerate(["GROQ_API_KEY_1", "GROQ_API_KEY_2"], start=1):
+        key = getattr(settings, attr, None)
+        if key:
+            pool.append({
+                "name":   f"groq_{slot}",
+                "client": OpenAI(
+                    api_key=key,
+                    base_url="https://api.groq.com/openai/v1",
+                    max_retries=0,
+                    timeout=60.0,
+                ),
+                "model": groq_model,
+            })
 
-    if not query_words:
-        return full_text[:_EXCERPT_CHARS]
+    for slot, attr in enumerate(["CEREBRAS_KEY_1", "CEREBRAS_KEY_2"], start=1):
+        key = getattr(settings, attr, None)
+        if key:
+            pool.append({
+                "name":   f"cerebras_{slot}",
+                "client": OpenAI(
+                    api_key=key,
+                    base_url="https://api.cerebras.ai/v1",
+                    max_retries=0,
+                    timeout=60.0,
+                ),
+                "model": cerebras_model,
+            })
 
-    step = _EXCERPT_CHARS // 2
-    best_score = -1
-    best_pos = 0
-    pos = 0
-
-    while pos < len(full_text):
-        end = min(pos + _EXCERPT_CHARS, len(full_text))
-        chunk_words = set(full_text[pos:end].lower().split())
-        score = len(query_words & chunk_words)
-        if score > best_score:
-            best_score = score
-            best_pos = pos
-        pos += step
-
-    excerpt = full_text[best_pos: best_pos + _EXCERPT_CHARS]
-    logger.debug(
-        "Excerpt for clause '%s': pos=%d, score=%d, len=%d",
-        clause_title, best_pos, best_score, len(excerpt),
+    logger.info(
+        "AI provider pool built: %s",
+        [p["name"] for p in pool] or ["<none — check env vars>"],
     )
-    return excerpt
+    return pool
+
+
+def _get_pool() -> list:
+    """Return the shared provider pool, building it once on first call."""
+    global _pool, _pool_built
+    if not _pool_built:
+        with _pool_lock:
+            if not _pool_built:
+                _pool = _build_provider_pool()
+                _pool_built = True
+    return _pool
+
+
+def _next_start_idx() -> int:
+    """Thread-safe increment; returns the index this call should start from."""
+    global _idx
+    with _idx_lock:
+        i = _idx
+        _idx += 1
+    return i
+
+
+def _call_ai(
+    user_message: str,
+    system_prompt: str,
+    *,
+    max_tokens: int = 1500,
+    temperature: float = 0.1,
+) -> str:
+    """
+    Call an AI provider from the pool using round-robin selection.
+
+    Strategy:
+      • Pick a start offset via global round-robin counter so parallel calls
+        spread evenly across providers.
+      • On RateLimitError from one provider, immediately rotate to the next.
+      • If every provider in the pool is rate-limited during one sweep,
+        wait _RATE_LIMIT_RETRY_WAIT seconds then sweep again.
+      • Raises RuntimeError after _MAX_RETRIES full sweeps all hit rate limits.
+    """
+    pool = _get_pool()
+    if not pool:
+        raise RuntimeError(
+            "No AI providers configured. "
+            "Set at least one of: GROQ_API_KEY_1, GROQ_API_KEY_2, "
+            "CEREBRAS_KEY_1, CEREBRAS_KEY_2."
+        )
+
+    n     = len(pool)
+    start = _next_start_idx()
+
+    for attempt in range(_MAX_RETRIES + 1):
+        rate_limited = 0
+
+        for offset in range(n):
+            provider = pool[(start + offset) % n]
+            try:
+                resp = provider["client"].chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_message},
+                    ],
+                    model=provider["model"],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = resp.choices[0].message.content
+                return content.strip() if content is not None else ""
+
+            except RateLimitError:
+                logger.warning(
+                    "Rate limited on %s (sweep %d/%d), rotating to next provider",
+                    provider["name"], attempt + 1, _MAX_RETRIES + 1,
+                )
+                rate_limited += 1
+                continue
+
+            except Exception:
+                raise   # Non-rate-limit errors propagate immediately
+
+        # All providers were rate-limited in this sweep
+        if attempt < _MAX_RETRIES:
+            wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+            logger.warning(
+                "All %d providers rate-limited — waiting %.1fs before retry %d/%d",
+                n, wait, attempt + 1, _MAX_RETRIES,
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"All {n} AI providers exhausted after {_MAX_RETRIES + 1} full sweeps."
+    )
 
 
 # ── AI-based relevant text extraction ───────────────────────────────────────────
@@ -69,7 +174,8 @@ _EXTRACT_USER = """CLAUSE TOPIC: {title}
 DOCUMENT TEXT:
 {doc_text}
 
-Copy verbatim only the sentence(s) from DOCUMENT TEXT that directly mention or relate to "{title}". Return only the copied text with no extra words. If nothing relevant exists, return an empty string."""
+Copy verbatim only the sentence(s) from DOCUMENT TEXT that directly mention or relate to "{title}".
+IMPORTANT: If the relevant sentence(s) are part of a numbered section or sub-clause (e.g. "3.1 Fees:", "7.10 Assignment:", "2.3.1 Obligations:"), include that full line from the start — do not strip the numbering prefix. Return only the copied text with no extra words. If nothing relevant exists, return an empty string."""
 
 
 def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
@@ -80,33 +186,16 @@ def _extract_relevant_text_via_ai(title: str, doc_text: str) -> str:
     Returns the extracted text, or empty string if nothing found / on error.
     """
     user_message = _EXTRACT_USER.format(title=title, doc_text=doc_text)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=30.0)
-
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": _EXTRACT_SYSTEM},
-                    {"role": "user", "content": user_message},
-                ],
-                model=settings.OPENAI_MODEL,
-                temperature=0.0,
-                max_tokens=500,
-            )
-            result = chat_completion.choices[0].message.content.strip()
-            return result if result else ""
-        except RateLimitError:
-            if attempt < _MAX_RETRIES:
-                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
-                logger.warning("Rate limited on excerpt extraction for '%s', retrying in %.1fs", title, wait)
-                time.sleep(wait)
-            else:
-                return ""
-        except Exception as e:
-            logger.warning("Excerpt extraction failed for '%s': %s", title, e)
-            return ""
-
-    return ""
+    try:
+        return _call_ai(
+            user_message,
+            _EXTRACT_SYSTEM,
+            max_tokens=500,
+            temperature=0.0,
+        )
+    except Exception as e:
+        logger.warning("Excerpt extraction failed for '%s': %s", title, e)
+        return ""
 
 
 # ── Per-clause analysis ──────────────────────────────────────────────────────────
@@ -148,7 +237,7 @@ Respond in this EXACT JSON format:
     "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
     "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
     "relevant_text": "the exact sentence(s) from the document that relate to this clause, or null",
-    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION: write a corrective clause resolving the conflict. If PARTIALLY_SATISFIED: write the improved/completed clause. If MATCH: null",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — if relevant_text literally starts with a numbering prefix such as '3.1', '7.10', '2.3', '1)', then begin ai_recommendation with that exact same prefix; if relevant_text starts with a bullet (•, *, -) or any non-digit character, do NOT add any number prefix. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
     "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000", "no commencement date specified"] or [],
     "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",
@@ -240,6 +329,31 @@ def _safe_json_parse(text: str) -> dict:
     raise json.JSONDecodeError("Cannot repair truncated JSON", text, len(text))
 
 
+def _fix_recommendation_prefix(relevant_text: str | None, recommendation: str | None) -> str | None:
+    """
+    Align the leading prefix of ai_recommendation with that of relevant_text.
+
+    - If relevant_text starts with a numbering prefix (e.g. '3.1 ', '7.10 ')
+      and recommendation does NOT already start with that prefix → prepend it.
+    - If relevant_text does NOT start with a numbering prefix (starts with a bullet,
+      letter, etc.) but recommendation has a spurious one → strip it.
+    """
+    if not recommendation or not relevant_text:
+        return recommendation
+
+    rel = relevant_text.lstrip()
+    rec = recommendation.lstrip()
+
+    m_rel = _NUM_PREFIX_RE.match(rel)
+    if m_rel:
+        # relevant_text has a numbering prefix — ensure recommendation starts with it
+        prefix = m_rel.group(1)
+        if not rec.startswith(prefix.rstrip()):
+            return prefix + rec
+
+    return recommendation
+
+
 def _parse_response(response_text: str) -> dict:
     """Parse and validate the AI JSON response."""
     result = _safe_json_parse(response_text)
@@ -248,7 +362,6 @@ def _parse_response(response_text: str) -> dict:
         logger.warning("Invalid result value: %s, defaulting to NOT_FOUND", result.get("result"))
         result["result"] = "NOT_FOUND"
 
-    # Validate / default the 4 new fields
     if not isinstance(result.get("parties_obligated"), list):
         result["parties_obligated"] = []
     if not isinstance(result.get("missing_values"), list):
@@ -258,32 +371,13 @@ def _parse_response(response_text: str) -> dict:
     if not isinstance(result.get("key_dates_durations"), list):
         result["key_dates_durations"] = []
 
+    # Fix prefix alignment: ensure ai_recommendation prefix matches relevant_text
+    result["ai_recommendation"] = _fix_recommendation_prefix(
+        result.get("relevant_text"),
+        result.get("ai_recommendation"),
+    )
+
     return result
-
-
-def _call_groq(user_message: str) -> str:
-    """Call Groq AI with rate-limit retry. Returns raw response text."""
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
-
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-                model=settings.OPENAI_MODEL,
-                temperature=0.1,
-                max_tokens=1500,
-            )
-            return chat_completion.choices[0].message.content.strip()
-        except RateLimitError:
-            if attempt < _MAX_RETRIES:
-                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
-                logger.warning("Groq rate limited, retrying in %.1fs (attempt %d/%d)", wait, attempt + 1, _MAX_RETRIES)
-                time.sleep(wait)
-            else:
-                raise
 
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
@@ -292,21 +386,17 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
       Step 1 — AI extracts the verbatim relevant text for this clause from the document.
       Step 2 — AI analyzes that extracted text against the clause requirement.
 
+    Both steps use the shared multi-provider pool (round-robin, rate-limit aware).
+
     Returns dict with: result, reason, relevant_text, ai_recommendation,
                        parties_obligated, missing_values, binding_strength, key_dates_durations
     """
-    title = clause["title"]
+    title   = clause["title"]
     content = clause["value"]
 
     # Step 1: AI extracts the verbatim relevant text directly from the full document
-    ai_excerpt = _extract_relevant_text_via_ai(title, pdf_text)
-
-    # Step 2: Analyze — use AI-extracted passage if non-empty, else fall back to full text
-    excerpt = ai_excerpt if ai_excerpt else pdf_text
-    logger.debug(
-        "Clause '%s': ai_excerpt=%d chars, analyzing=%d chars",
-        title, len(ai_excerpt), len(excerpt),
-    )
+    excerpt = _extract_relevant_text_via_ai(title, pdf_text)
+    logger.debug("Clause '%s': ai_excerpt=%d chars", title, len(excerpt))
 
     user_message = USER_PROMPT_TEMPLATE.format(
         title=title,
@@ -315,12 +405,12 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     )
 
     try:
-        response_text = _call_groq(user_message)
+        response_text = _call_ai(user_message, SYSTEM_PROMPT, max_tokens=1500, temperature=0.1)
         result = _parse_response(response_text)
-        result["_provider"] = "groq"
+        result["_provider"] = "pool"
         return result
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse Groq JSON response for clause '%s': %s", title, e)
+        logger.error("Failed to parse AI JSON response for clause '%s': %s", title, e)
         return {
             "result": "NOT_FOUND",
             "reason": "AI response could not be parsed",
@@ -330,10 +420,10 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
             "missing_values": [],
             "binding_strength": "VAGUE",
             "key_dates_durations": [],
-            "_provider": "groq",
+            "_provider": "pool",
         }
     except Exception as e:
-        logger.error("Groq failed for clause '%s': %s", title, e)
+        logger.error("AI call failed for clause '%s': %s", title, e)
         return {
             "result": "NOT_FOUND",
             "reason": f"AI analysis failed: {type(e).__name__}",
@@ -343,7 +433,7 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
             "missing_values": [],
             "binding_strength": "VAGUE",
             "key_dates_durations": [],
-            "_provider": "groq",
+            "_provider": "pool",
         }
 
 
@@ -382,47 +472,25 @@ def detect_jurisdiction(pdf_text: str) -> dict:
     """
     excerpt = pdf_text[:3000]
     user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
 
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": _JURISDICTION_SYSTEM},
-                    {"role": "user", "content": user_message},
-                ],
-                model=settings.OPENAI_MODEL,
-                temperature=0.1,
-                max_tokens=1000,
-            )
-            response_text = chat_completion.choices[0].message.content.strip()
-            result = _safe_json_parse(response_text)
-            if not isinstance(result.get("checklist"), list):
-                result["checklist"] = []
-            if not isinstance(result.get("applicable_laws"), list):
-                result["applicable_laws"] = []
-            return result
-        except RateLimitError:
-            if attempt < _MAX_RETRIES:
-                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
-                logger.warning("detect_jurisdiction rate limited, retrying in %.1fs", wait)
-                time.sleep(wait)
-                continue
-            logger.error("detect_jurisdiction rate limited after all retries")
-            return {
-                "jurisdiction": "Unknown",
-                "agreement_type": "Unknown",
-                "applicable_laws": [],
-                "checklist": [],
-            }
-        except Exception as e:
-            logger.error("detect_jurisdiction failed: %s", e)
-            return {
-                "jurisdiction": "Unknown",
-                "agreement_type": "Unknown",
-                "applicable_laws": [],
-                "checklist": [],
-            }
+    try:
+        response_text = _call_ai(
+            user_message, _JURISDICTION_SYSTEM, max_tokens=1000, temperature=0.1,
+        )
+        result = _safe_json_parse(response_text)
+        if not isinstance(result.get("checklist"), list):
+            result["checklist"] = []
+        if not isinstance(result.get("applicable_laws"), list):
+            result["applicable_laws"] = []
+        return result
+    except Exception as e:
+        logger.error("detect_jurisdiction failed: %s", e)
+        return {
+            "jurisdiction": "Unknown",
+            "agreement_type": "Unknown",
+            "applicable_laws": [],
+            "checklist": [],
+        }
 
 
 _CONFLICT_SYSTEM = """You are a legal contract conflict analyst. Identify contradictions or conflicts between clauses in a contract analysis. Respond ONLY with valid JSON, no extra text or markdown."""
@@ -462,36 +530,18 @@ def detect_conflicts(analysis_summary: list) -> list:
             f"- {entry['clause_title']} [{entry['result']}]: {entry.get('reason', '')}"
         )
     clause_summary_text = "\n".join(lines)
-
     user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
-    client = OpenAI(api_key=settings.OPENAI_API_KEY, base_url='https://api.groq.com/openai/v1', max_retries=0, timeout=60.0)
 
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": _CONFLICT_SYSTEM},
-                    {"role": "user", "content": user_message},
-                ],
-                model=settings.OPENAI_MODEL,
-                temperature=0.1,
-                max_tokens=800,
-            )
-            response_text = chat_completion.choices[0].message.content.strip()
-            result = _safe_json_parse(response_text)
-            conflicts = result.get("conflicts", [])
-            return conflicts if isinstance(conflicts, list) else []
-        except RateLimitError:
-            if attempt < _MAX_RETRIES:
-                wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
-                logger.warning("detect_conflicts rate limited, retrying in %.1fs", wait)
-                time.sleep(wait)
-                continue
-            logger.error("detect_conflicts rate limited after all retries")
-            return []
-        except Exception as e:
-            logger.error("detect_conflicts failed: %s", e)
-            return []
+    try:
+        response_text = _call_ai(
+            user_message, _CONFLICT_SYSTEM, max_tokens=800, temperature=0.1,
+        )
+        result = _safe_json_parse(response_text)
+        conflicts = result.get("conflicts", [])
+        return conflicts if isinstance(conflicts, list) else []
+    except Exception as e:
+        logger.error("detect_conflicts failed: %s", e)
+        return []
 
 
 # ── PDF text location helper ──────────────────────────────────────────────────────

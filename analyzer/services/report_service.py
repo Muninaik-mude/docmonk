@@ -298,7 +298,8 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
 
     def _clean_display(s: str) -> str:
         """Convert markdown artifacts to display-friendly format."""
-        s = _md_bullet.sub('\u2022 ', s).replace('\\.', '.')
+        # Bullet lines get indentation via non-breaking spaces for PDF paragraphs
+        s = _md_bullet.sub('&nbsp;&nbsp;&nbsp;&nbsp;\u2022 ', s).replace('\\.', '.')
         # Convert markdown headings → bold: "# TITLE" → "<b>TITLE</b>"
         if s.startswith('#'):
             s = '<b>' + _md_heading.sub('', s) + '</b>'
@@ -490,6 +491,10 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
             # Markdown heading → H1 bold segment (strip # chars, keep plain text)
             heading_text = _md_heading.sub('', stripped).strip()
             segments.append({"type": "heading", "text": heading_text})
+        elif _md_bullet.match(stripped):
+            # Markdown bullet → dedicated indented bullet segment
+            bullet_text = _md_bullet.sub('\u2022 ', stripped).replace('\\.', '.')
+            segments.append({"type": "bullet", "text": bullet_text})
         else:
             segments.append({"type": "normal", "text": _clean_display(stripped)})
 
@@ -564,6 +569,13 @@ def generate_pdf_report(
         textColor=colors.HexColor(COLOR_DARK),
         spaceBefore=10, spaceAfter=4,
     )
+    bullet_style = ParagraphStyle(
+        "RBullet", parent=S["Normal"],
+        fontSize=9, leading=14,
+        textColor=colors.HexColor(COLOR_BLACK),
+        leftIndent=16,
+        firstLineIndent=0,
+    )
 
     story = []
 
@@ -615,6 +627,11 @@ def generate_pdf_report(
             # H1 bold heading — large dark title
             story.append(Paragraph(text, heading_style))
             story.append(Spacer(1, 2))
+
+        elif stype == "bullet":
+            # Indented bullet point
+            story.append(Paragraph(text, bullet_style))
+            story.append(Spacer(1, 1))
 
         else:  # normal
             story.append(Paragraph(text, inner_style))
@@ -1182,6 +1199,14 @@ def generate_markdown_report(
             lines.append("  </div>")
             lines.append("</div>")
 
+        elif stype == "bullet":
+            # Indented bullet point — unchanged original content
+            lines.append('<div class="diff-group" data-type="unchanged">')
+            lines.append('  <div class="diff-line normal">')
+            lines.append(f'    <div class="line-content" style="padding-left:20px;">{text}</div>')
+            lines.append("  </div>")
+            lines.append("</div>")
+
         elif stype == "ai":
             # Orphan AI
             lines.append('<div class="diff-group" data-type="modified">')
@@ -1557,6 +1582,13 @@ def generate_docx_report(
             run.bold = True
             run.font.size = Pt(16)
             run.font.color.rgb = _hex_to_rgb(COLOR_DARK)
+
+        elif stype == "bullet":
+            # Indented bullet point
+            bp = doc.add_paragraph()
+            run = bp.add_run(text)
+            run.font.size = Pt(10)
+            bp.paragraph_format.left_indent = Pt(16)
 
         else:  # normal
             np_ = doc.add_paragraph()

@@ -80,9 +80,13 @@ R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.getenv('R2_BUCKET_NAME')
 
-# OpenAI
-OPENAI_API_KEY = os.getenv('OPEN_AI_KEY')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+# AI Provider Pool — Groq (keys 1 & 2) + Cerebras (keys 1 & 2)
+# GROQ_API_KEY_1 falls back to the legacy GROQ_API_KEY env var
+GROQ_API_KEY_1 = os.getenv('GROQ_API_KEY_1') or os.getenv('GROQ_API_KEY')
+GROQ_API_KEY_2 = os.getenv('GROQ_API_KEY_2')
+CEREBRAS_KEY_1 = os.getenv('CEREBRAS_KEY_1')
+CEREBRAS_KEY_2 = os.getenv('CEREBRAS_KEY_2')
+GROQ_MODEL     = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = Path(os.getenv('ANNOTATED_PDF_DIR', str(BASE_DIR / 'annotated_pdfs')))

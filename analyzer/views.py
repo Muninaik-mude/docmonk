@@ -14,9 +14,9 @@ from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLO
 
 logger = logging.getLogger(__name__)
 
-# Max parallel Groq calls — each clause now makes 2 sequential AI calls (extract + analyze),
-# so workers × 2 = peak concurrent calls. Set high enough to minimize wall-clock latency.
-_MAX_PARALLEL_CLAUSES = 8
+# Max parallel clause analyses — each clause makes 2 sequential AI calls (extract + analyze).
+# With 4 pooled providers, 3 workers = up to 6 concurrent calls spread evenly across keys.
+_MAX_PARALLEL_CLAUSES = 3
 
 
 def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type: str) -> dict:
