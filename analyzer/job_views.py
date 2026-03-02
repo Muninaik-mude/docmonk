@@ -6,7 +6,6 @@ POST /api/v1/jobs/{job_id}/resume — Re-run only FAILED/PENDING clauses (no re-
 """
 import base64
 import logging
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -20,10 +19,10 @@ from rest_framework.views import APIView
 from .services import groq_service, report_service
 from .models import (
     AnalysisJob, JobClause, ClauseResult, JobJurisdiction,
-    JobStatus, ClauseStatus, ReportType,
+    JobStatus, ClauseStatus,
 )
 from .views import (
-    _upload_or_save, _save_report, _fallback_ai_result,
+    _fallback_ai_result,
     _STATUS_COLOR, _MAX_PARALLEL_CLAUSES,
 )
 
@@ -43,6 +42,7 @@ def _reconstruct_analysis_summary(job: AnalysisJob) -> list:
             "clause_id":           jc.clause_ref_id,
             "clause_title":        jc.title,
             "clause_value":        jc.value,
+            "clause_category":     jc.category,
             "analysis_status":     jc.status,
             "retry_count":         jc.retry_count,
             # Defaults for failed/pending clauses (overwritten below if result exists)
@@ -100,32 +100,6 @@ def _reconstruct_conflicts(job: AnalysisJob) -> list:
         }
         for c in job.conflict_records.all()
     ]
-
-
-def _reconstruct_report_urls(job: AnalysisJob) -> dict:
-    """Build report URL fields from stored JobReport records."""
-    urls = {}
-    for report in job.reports.all():
-        rt = report.report_type
-        if rt == ReportType.PDF_REPORT:
-            urls["report_pdf_url"]        = report.presigned_url
-            urls["report_pdf_expires_in"] = "24 hour"
-        elif rt == ReportType.PDF_SUMMARY:
-            urls["summary_pdf_url"]        = report.presigned_url
-            urls["summary_pdf_expires_in"] = "24 hour"
-        elif rt == ReportType.MARKDOWN_REPORT:
-            urls["report_markdown_url"]        = report.presigned_url
-            urls["report_markdown_expires_in"] = "24 hour"
-        elif rt == ReportType.MARKDOWN_SUMMARY:
-            urls["summary_markdown_url"]        = report.presigned_url
-            urls["summary_markdown_expires_in"] = "24 hour"
-        elif rt == ReportType.DOCX_REPORT:
-            urls["report_docx_url"]        = report.presigned_url
-            urls["report_docx_expires_in"] = "24 hour"
-        elif rt == ReportType.DOCX_SUMMARY:
-            urls["summary_docx_url"]        = report.presigned_url
-            urls["summary_docx_expires_in"] = "24 hour"
-    return urls
 
 
 def _analyze_clause_for_resume(clause_db_id: str, clause_dict: dict, full_text: str) -> dict:
@@ -204,24 +178,49 @@ class JobStatusView(APIView):
         analysis_summary = _reconstruct_analysis_summary(job)
         jurisdiction     = _reconstruct_jurisdiction(job)
         conflicts        = _reconstruct_conflicts(job)
-        report_urls      = _reconstruct_report_urls(job)
 
-        response_data = {
-            "job_id":           str(job.id),
-            "status":           job.status.lower(),
-            "can_resume":       job.status == JobStatus.PARTIAL_FAILURE,
+        agreement_meta = {
+            "agreement_type":    job.agreement_type,
+            "agreement_details": job.agreement_details,
+            "parties":           job.parties,
+            "property":          job.property_details,
+        }
+        report_kwargs: dict[str, Any] = dict(
+            conflicts=conflicts,
+            jurisdiction_info=jurisdiction,
+            full_text=job.full_text,
+            agreement_meta=agreement_meta,
+        )
+
+        clauses_analysis = {entry["clause_id"]: {k: v for k, v in entry.items() if k != "clause_id"}
+                            for entry in analysis_summary}
+
+        response_data: dict[str, Any] = {
+            "job_id":     str(job.id),
+            "status":     job.status.lower(),
+            "can_resume": job.status == JobStatus.PARTIAL_FAILURE,
             "progress": {
                 "total":     job.total_clauses,
                 "completed": job.completed_clauses,
                 "failed":    job.failed_clauses,
             },
-            "analysis_summary": analysis_summary,
-            "conflicts":        conflicts,
-            "jurisdiction":     jurisdiction,
-            "created_at":       job.created_at.isoformat(),
-            "completed_at":     job.completed_at.isoformat() if job.completed_at else None,
-            **report_urls,
+            "analysis_summary": {
+                "jurisdiction":    jurisdiction,
+                "clauses_analysis": clauses_analysis,
+            },
+            "created_at":   job.created_at.isoformat(),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         }
+
+        if job.status == JobStatus.COMPLETED:
+            try:
+                md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
+                md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
+                response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
+                response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
+            except Exception as e:
+                logger.error("GET report generation failed for job %s: %s", job.id, e)
+                response_data["report_error"] = f"Report could not be generated: {e}"
 
         if job.error_message:
             response_data["error_message"] = job.error_message
@@ -344,63 +343,12 @@ class JobResumeView(APIView):
             job.status = JobStatus.GENERATING_REPORTS
             job.save(update_fields=["status", "updated_at"])
 
-            run_id = uuid.uuid4()
-            report_format = job.report_format
-
             try:
-                _md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-                _md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
-                response_data["report_md_base64"]  = base64.b64encode(_md_report.encode()).decode()
-                response_data["summary_md_base64"] = base64.b64encode(_md_summary.encode()).decode()
-
-                if report_format in ("pdf", "both"):
-                    pdf_bytes    = report_service.generate_pdf_report(analysis_summary, **report_kwargs)
-                    pdf_filename = f"report_{run_id}.pdf"
-                    result = _upload_or_save(pdf_bytes, pdf_filename, "reports", "application/pdf")
-                    response_data["report_pdf_url"]        = result["url"]
-                    response_data["report_pdf_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.PDF_REPORT, result, len(pdf_bytes))
-
-                    pdf_sum_bytes    = report_service.generate_pdf_summary(analysis_summary, **report_kwargs)
-                    pdf_sum_filename = f"summary_{run_id}.pdf"
-                    result = _upload_or_save(pdf_sum_bytes, pdf_sum_filename, "reports", "application/pdf")
-                    response_data["summary_pdf_url"]        = result["url"]
-                    response_data["summary_pdf_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.PDF_SUMMARY, result, len(pdf_sum_bytes))
-
-                if report_format in ("markdown", "both"):
-                    md_content  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-                    md_bytes    = md_content.encode("utf-8")
-                    md_filename = f"report_{run_id}.md"
-                    result = _upload_or_save(md_bytes, md_filename, "reports", "text/markdown")
-                    response_data["report_markdown_url"]        = result["url"]
-                    response_data["report_markdown_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.MARKDOWN_REPORT, result, len(md_bytes))
-
-                    md_sum       = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
-                    md_sum_bytes = md_sum.encode("utf-8")
-                    md_sum_file  = f"summary_{run_id}.md"
-                    result = _upload_or_save(md_sum_bytes, md_sum_file, "reports", "text/markdown")
-                    response_data["summary_markdown_url"]        = result["url"]
-                    response_data["summary_markdown_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.MARKDOWN_SUMMARY, result, len(md_sum_bytes))
-
-                if report_format == "docx":
-                    _docx_ct      = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    docx_bytes    = report_service.generate_docx_report(analysis_summary, **report_kwargs)
-                    docx_filename = f"report_{run_id}.docx"
-                    result = _upload_or_save(docx_bytes, docx_filename, "reports", _docx_ct)
-                    response_data["report_docx_url"]        = result["url"]
-                    response_data["report_docx_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.DOCX_REPORT, result, len(docx_bytes))
-
-                    docx_sum_bytes = report_service.generate_docx_summary(analysis_summary, **report_kwargs)
-                    docx_sum_file  = f"summary_{run_id}.docx"
-                    result = _upload_or_save(docx_sum_bytes, docx_sum_file, "reports", _docx_ct)
-                    response_data["summary_docx_url"]        = result["url"]
-                    response_data["summary_docx_expires_in"] = result["expires_in"]
-                    _save_report(job, ReportType.DOCX_SUMMARY, result, len(docx_sum_bytes))
-
+                md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
+                md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
+                response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
+                response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
+                logger.info("Resume markdown report + summary generated for job %s", job.id)
             except Exception as e:
                 logger.error("Resume report generation failed: %s", e)
                 response_data["report_error"] = f"Report could not be generated: {e}"
@@ -409,9 +357,7 @@ class JobResumeView(APIView):
             job.completed_at = timezone.now()
 
         else:
-            # Still have failures — stay resumable, include existing report URLs
             job.status = JobStatus.PARTIAL_FAILURE
-            response_data.update(_reconstruct_report_urls(job))
 
         job.save(update_fields=["status", "completed_clauses", "failed_clauses", "completed_at", "updated_at"])
 

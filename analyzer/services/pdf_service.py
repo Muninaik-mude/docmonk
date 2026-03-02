@@ -202,3 +202,32 @@ def annotate_pdf(pdf_bytes: bytes, annotations: list[dict]) -> bytes:
     result_bytes = doc.tobytes()
     doc.close()
     return result_bytes
+
+
+def find_text_location_in_pdf(text_blocks: list, search_text: str) -> dict | None:
+    """
+    Find which page and bbox contains text most similar to search_text.
+    Uses substring matching with case-insensitive comparison.
+    """
+    if not search_text:
+        return None
+
+    search_lower = search_text.lower()
+    best_match = None
+    best_overlap = 0
+
+    for block in text_blocks:
+        block_text_lower = block["text"].lower()
+
+        if search_lower in block_text_lower:
+            return {"page_num": block["page_num"], "bbox": block["bbox"]}
+
+        search_words = set(search_lower.split())
+        block_words = set(block_text_lower.split())
+        overlap = len(search_words & block_words)
+
+        if overlap > best_overlap and overlap >= len(search_words) * 0.3:
+            best_overlap = overlap
+            best_match = {"page_num": block["page_num"], "bbox": block["bbox"]}
+
+    return best_match

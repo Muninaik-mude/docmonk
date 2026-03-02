@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DocMonk is a Django REST API that performs AI-powered legal document analysis. It extracts text from uploaded documents, uses the Groq API to check clauses for compliance, detects conflicts, and generates annotated reports in PDF, DOCX, or Markdown formats.
+DocMonk is a Django REST API that performs AI-powered legal document services:
+- **Clause Analysis** — check uploaded document clauses for compliance, generate color-coded reports
+- **Document Q&A** *(planned)* — ask freeform questions on an uploaded document
+- **Contract Generation** *(planned)* — generate a contract document from structured party/property details
 
 ## Common Commands
 
@@ -30,68 +33,152 @@ No test suite is configured. There are no test files in this repository.
 ## Environment Variables
 
 Copy `.env.example` to `.env`. Key variables:
-- `GROQ_API_KEY` / `GROQ_MODEL` — Groq AI for legal clause analysis
-- `STORAGE_BACKEND` — `"r2"` (Cloudflare) or `"local"` (falls back to `annotated_pdfs/`)
-- `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME` — R2 credentials when using cloud storage
+
+| Variable | Purpose |
+|---|---|
+| `SECRET_KEY` | Django secret key |
+| `DEBUG` | `True` / `False` |
+| `ALLOWED_HOSTS` | Comma-separated host list |
+| `DATABASE_URL` | PostgreSQL connection string (`postgres://...`). Falls back to SQLite if unset. |
+| `STORAGE_BACKEND` | `"r2"` (Cloudflare R2) or `"local"` (writes to `annotated_pdfs/`) |
+| `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME` | R2 credentials |
+| `GROQ_API_KEY_1`, `GROQ_API_KEY_2` | Groq API keys (pool of 2) |
+| `CEREBRAS_KEY_1`, `CEREBRAS_KEY_2` | Cerebras API keys (pool of 2) |
+| `GROQ_MODEL` | Model ID (default: `llama-3.3-70b-versatile`) |
 
 ## Architecture
 
-The entire API is a single endpoint: **POST `/api/analyze/`** (see `analyzer/urls.py` and `analyzer/views.py`).
+### App Structure
 
-The view (`ClauseAnalyzerView`) orchestrates a pipeline across four services:
+```
+analyzer/
+├── models.py          — DB models (AnalysisJob, JobClause, ClauseResult, ...)
+├── serializers.py     — DRF serializers for request validation
+├── views.py           — ClauseAnalyzerView (POST /v1/analyze)
+├── job_views.py       — JobStatusView (GET), JobResumeView (POST resume)
+├── urls.py            — URL routing
+├── services/
+│   ├── groq_service.py    — AI calls: jurisdiction detection, clause analysis, conflict detection
+│   ├── pdf_service.py     — Text extraction (PDF/DOCX/MD/TXT), PDF annotation
+│   ├── r2_service.py      — Cloudflare R2 / local file storage
+│   └── report_service.py  — PDF/DOCX/Markdown report + summary generation
+└── utils/
+    └── color_constants.py — Compliance status → highlight/insertion color maps
+```
+
+### Services
 
 | Service | File | Responsibility |
 |---|---|---|
 | `pdf_service` | `analyzer/services/pdf_service.py` | Extract text from PDF, DOCX, Markdown, TXT; annotate PDFs with highlights |
-| `groq_service` | `analyzer/services/groq_service.py` | AI analysis via Groq API — clause compliance, jurisdiction detection, conflict detection |
+| `groq_service` | `analyzer/services/groq_service.py` | AI analysis — clause compliance, jurisdiction detection, conflict detection (dormant) |
 | `r2_service` | `analyzer/services/r2_service.py` | Upload/download files from Cloudflare R2 or local filesystem |
-| `report_service` | `analyzer/services/report_service.py` | Generate PDF/DOCX/Markdown reports with color-coded compliance results |
+| `report_service` | `analyzer/services/report_service.py` | Generate PDF/DOCX/Markdown report + summary with color-coded results |
 
-### Analysis Pipeline
+### AI Provider Pool
 
-1. Download document from presigned URL (`r2_service`)
-2. Extract full text (`pdf_service`)
-3. Detect jurisdiction and applicable compliance requirements (`groq_service.detect_jurisdiction`)
-4. For each clause: analyze compliance against document text (`groq_service.analyze_clause_against_pdf`)
-5. Detect cross-clause conflicts (`groq_service.detect_conflicts`)
-6. Annotate original PDF with color-coded highlights (`pdf_service`)
-7. Generate report(s) in requested format(s) (`report_service`)
-8. Upload results and return presigned download URLs (`r2_service`)
+`groq_service.py` maintains a pool of 4 clients (Groq key 1, Groq key 2, Cerebras key 1, Cerebras key 2). Calls round-robin across available clients. Includes JSON repair logic for truncated responses and intelligent 5,000-char context window excerpt selection.
 
-### Compliance Status Values
+**Conflict detection** (`groq_service.detect_conflicts`) is implemented but intentionally NOT called — too expensive per request. Will be wired in on demand.
 
-Defined in `analyzer/utils/color_constants.py`:
-- `MATCH` — Fully satisfied (green)
-- `NOT_FOUND` — Absent from document (blue)
-- `PARTIALLY_SATISFIED` — Vague or incomplete (orange)
-- `VIOLATION` — Contradicts requirement (red)
+## Database Models
 
-### AI Response Handling
+| Model | Table | Purpose |
+|---|---|---|
+| `AnalysisJob` | `analysis_jobs` | Top-level job: status machine, counters, stored full text |
+| `JobClause` | `job_clauses` | One row per clause; state machine (PENDING → IN_PROGRESS → COMPLETED/FAILED) |
+| `ClauseResult` | `clause_results` | AI output for a completed clause |
+| `JobJurisdiction` | `job_jurisdiction` | Jurisdiction + applicable laws + checklist |
+| `ClauseConflict` | `clause_conflicts` | Conflict pairs (populated only if conflict detection is enabled) |
+| `JobReport` | `job_reports` | Stored report file keys + presigned URLs |
 
-`groq_service.py` includes JSON repair logic for truncated Groq API responses. It uses intelligent excerpt selection (5,000-char window centered on relevant keywords) to stay within token limits for large documents. All Groq responses are validated and defaulted for missing fields before use.
+## API Endpoints
 
-### Storage Abstraction
+### POST `/v1/analyze`
 
-`r2_service.py` provides a dual-backend storage layer. Setting `STORAGE_BACKEND=local` stores files in `annotated_pdfs/` instead of R2, which is useful for development without cloud credentials.
+Full analysis pipeline. Returns only lightweight response — no analysis_summary, no report URLs.
 
-## Request Format
-
+**Request** (JSON):
 ```json
 {
-  "document_presigned_url": "https://...",
+  "document_base64": "<base64-encoded document>",
+  "document_filename": "contract.pdf",
   "agreement_type": "Commercial Rental Agreement",
   "agreement_details": { "agreement_date": "...", "city": "...", "state": "..." },
   "parties": { "landlord": {...}, "tenant": {...} },
   "property": { "type": "...", "area_sqft": 5000, "address": "..." },
   "clauses": [
-    { "id": "clause_1", "title": "Rent Payment", "content": "..." }
+    {
+      "id": "confidentiality_survival_clause",
+      "category": "confidentiality",
+      "title": "Post-Termination Confidentiality",
+      "value": "Confidentiality obligations shall survive termination..."
+    }
   ],
-  "report_format": "pdf"
+  "report_format": "markdown"
 }
 ```
 
-`report_format` accepts `"pdf"`, `"docx"`, `"markdown"`, or `"both"`. The field `pdf_presigned_url` is also accepted as a legacy alias for `document_presigned_url`.
+`document_presigned_url` / `pdf_presigned_url` are also accepted (legacy aliases). `report_format` accepts `"pdf"`, `"docx"`, `"markdown"`, or `"both"`.
+
+**Response** (slim — for speed):
+```json
+{
+  "job_id": "uuid",
+  "status": "completed",
+  "can_resume": false,
+  "progress": { "total": 5, "completed": 5, "failed": 0 },
+  "report_md_base64": "<base64>",
+  "summary_md_base64": "<base64>"
+}
+```
+
+### GET `/v1/jobs/{job_id}`
+
+Poll job state + retrieve full results including analysis_summary (with jurisdiction embedded per entry) and report URLs.
+
+### POST `/v1/jobs/{job_id}/resume`
+
+Re-run only FAILED/PENDING clauses. Uses `full_text` stored in DB — no re-download. Only works when job is in `PARTIAL_FAILURE` state.
+
+## Analysis Pipeline
+
+1. Decode base64 / download document from presigned URL
+2. Extract full text (`pdf_service`)
+3. Detect jurisdiction + applicable laws (`groq_service.detect_jurisdiction`)
+4. Analyze each clause in parallel — 3 workers (`groq_service.analyze_clause_against_pdf`)
+5. ~~Detect cross-clause conflicts~~ — dormant, not called
+6. Annotate original PDF with color-coded highlights (`pdf_service`)
+7. Generate reports in requested format(s) (`report_service`)
+8. Store reports, return slim response
+
+## Compliance Status Values
+
+Defined in `analyzer/utils/color_constants.py`:
+
+| Status | Color | Meaning |
+|---|---|---|
+| `MATCH` | green | Fully satisfied |
+| `NOT_FOUND` | blue | Absent from document |
+| `PARTIALLY_SATISFIED` | orange | Vague or incomplete |
+| `VIOLATION` | red | Contradicts requirement |
+
+## Storage Abstraction
+
+`r2_service.py` provides a dual-backend layer. Set `STORAGE_BACKEND=local` for dev (stores in `annotated_pdfs/`). Set `STORAGE_BACKEND=r2` for production (Cloudflare R2 with 24-hour presigned download URLs).
 
 ## Deployment
 
-Deployed on Leapcell. The `Procfile` defines the web process. Static files are served via WhiteNoise. No database migrations beyond the default Django tables are required.
+Deployed on **Railway**. The `Procfile` defines the web process. Static files served via WhiteNoise. PostgreSQL provided via `DATABASE_URL` environment variable using `dj-database-url`.
+
+## Agents & Skills Available
+
+Agents in `.claude/agents/`:
+- `explorer` — scan codebase before any feature work (use proactively)
+- `django-reviewer` — review all changed files after implementation (use proactively)
+- `migration-auditor` — audit new migrations before applying (use proactively)
+- `test-runner` — write and run tests (no test suite exists yet)
+
+Skills in `.claude/skills/`: `django-architecture`, `django-models`, `django-performance`, `django-security`, `django-testing`, `drf-api-design`
+
+Commands in `.claude/commands/`: `/feature`, `/debug`, `/migrate`, `/review`, `/pr`, `/scaffold`, `/test`

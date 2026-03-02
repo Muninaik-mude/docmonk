@@ -1,9 +1,7 @@
 import base64
 import binascii
 import logging
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
 from typing import Any, cast
 
 from django.db import close_old_connections, transaction
@@ -15,10 +13,9 @@ from rest_framework.views import APIView
 
 from .serializers import ClauseAnalyzerSerializer, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
 from .services import r2_service, pdf_service, groq_service, report_service
-from .utils.color_constants import STATUS_HIGHLIGHT_COLOR, STATUS_INSERTION_COLOR
 from .models import (
-    AnalysisJob, JobClause, ClauseResult, JobJurisdiction, JobReport,
-    JobStatus, ClauseStatus, ReportType,
+    AnalysisJob, JobClause, ClauseResult, JobJurisdiction,
+    JobStatus, ClauseStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,22 +29,6 @@ _STATUS_COLOR = {
     "PARTIALLY_SATISFIED": "orange",
     "VIOLATION": "red",
 }
-
-
-def _upload_or_save(file_bytes: bytes, filename: str, prefix: str, content_type: str) -> dict:
-    """Upload file to R2 or save locally. Returns {url, expires_in}."""
-    if r2_service.is_r2_configured():
-        object_key = r2_service.upload_file_to_r2(file_bytes, filename, prefix, content_type)
-        url = r2_service.generate_presigned_download_url(object_key)
-        return {"url": url, "expires_in": "24 hour", "file_key": object_key, "backend": "r2"}
-    else:
-        r2_service.save_file_locally(file_bytes, filename)
-        return {
-            "url": f"/annotated_pdfs/{filename}",
-            "expires_in": "local file (no expiry)",
-            "file_key": filename,
-            "backend": "local",
-        }
 
 
 def _decode_base64_document(base64_string: str) -> bytes:
@@ -133,25 +114,6 @@ def _analyze_single_clause_with_db(clause_db_id: str, clause: dict, full_text: s
         return {"clause": clause, "ai_result": _fallback_ai_result(clause, e), "success": False}
 
 
-def _save_report(job: AnalysisJob, report_type: str, upload_result: dict, file_size: int) -> None:
-    """Create or update a JobReport record after a successful upload/save."""
-    expires_at = None
-    if upload_result["backend"] == "r2":
-        expires_at = timezone.now() + timedelta(hours=24)
-
-    JobReport.objects.update_or_create(
-        job=job,
-        report_type=report_type,
-        defaults={
-            "storage_backend": upload_result["backend"],
-            "file_key": upload_result["file_key"],
-            "presigned_url": upload_result["url"],
-            "expires_at": expires_at,
-            "file_size_bytes": file_size,
-        },
-    )
-
-
 class ClauseAnalyzerView(APIView):
     """
     POST /api/v1/analyze
@@ -183,7 +145,6 @@ class ClauseAnalyzerView(APIView):
         doc_b64: str | None = validated_data.get("document_base64")
         doc_filename = validated_data.get("document_filename", "document.pdf")
         clauses      = validated_data["clauses"]
-        report_format = validated_data.get("report_format", "markdown")
 
         agreement_meta = {
             "agreement_type":    validated_data.get("agreement_type", ""),
@@ -205,7 +166,6 @@ class ClauseAnalyzerView(APIView):
                 agreement_details=agreement_meta["agreement_details"],
                 parties=agreement_meta["parties"],
                 property_details=agreement_meta["property"],
-                report_format=report_format,
                 total_clauses=len(clauses),
             )
             for i, clause in enumerate(clauses):
@@ -344,102 +304,46 @@ class ClauseAnalyzerView(APIView):
         job.failed_clauses    = failed_count
         job.save(update_fields=["completed_clauses", "failed_clauses", "updated_at"])
 
-        # ── Build analysis_summary + PDF annotations ───────────────────────────
+        # ── Build analysis_summary ─────────────────────────────────────────────
         analysis_summary = []
-        annotations      = []
 
         for item in clause_results:
             clause    = item["clause"]
             ai_result = item["ai_result"]
             ai_result.pop("_provider", None)
 
-            result_status   = ai_result["result"]
-            highlight_color = STATUS_HIGHLIGHT_COLOR.get(result_status)
-            insertion_color = STATUS_INSERTION_COLOR.get(result_status)
-            ai_text         = ai_result.get("ai_recommendation")
-            jc              = clause_db_map[clause["id"]]
+            result_status = ai_result["result"]
+            ai_text       = ai_result.get("ai_recommendation")
+            jc            = clause_db_map[clause["id"]]
 
             summary_entry = {
-                "clause_id":          clause["id"],
-                "clause_title":       clause["title"],
-                "clause_value":       clause["value"],
-                "result":             result_status,
-                "reason":             ai_result.get("reason"),
-                "relevant_text":      ai_result.get("relevant_text"),
-                "color":              _STATUS_COLOR.get(result_status) or None,
-                "ai_added_text":      None,
-                "parties_obligated":  ai_result.get("parties_obligated", []),
-                "missing_values":     ai_result.get("missing_values", []),
-                "binding_strength":   ai_result.get("binding_strength", "VAGUE"),
+                "clause_id":           clause["id"],
+                "clause_title":        clause["title"],
+                "clause_value":        clause["value"],
+                "clause_category":     clause.get("category", ""),
+                "result":              result_status,
+                "reason":              ai_result.get("reason"),
+                "relevant_text":       ai_result.get("relevant_text"),
+                "color":               _STATUS_COLOR.get(result_status) or None,
+                "ai_added_text":       ai_text if result_status != "MATCH" else None,
+                "parties_obligated":   ai_result.get("parties_obligated", []),
+                "missing_values":      ai_result.get("missing_values", []),
+                "binding_strength":    ai_result.get("binding_strength", "VAGUE"),
                 "key_dates_durations": ai_result.get("key_dates_durations", []),
-                # New state fields
-                "analysis_status": jc.status,
-                "retry_count":     jc.retry_count,
+                "analysis_status":     jc.status,
+                "retry_count":         jc.retry_count,
             }
-
-            if result_status == "NOT_FOUND":
-                summary_entry["ai_added_text"] = ai_text
-                if text_blocks:
-                    last_block = text_blocks[-1]
-                    annotations.append({
-                        "page_num":            last_block["page_num"],
-                        "bbox":                last_block["bbox"],
-                        "highlight_color":     highlight_color,
-                        "inserted_text":       f"[MISSING - {clause['title']}]: {ai_text}" if ai_text else None,
-                        "inserted_text_color": insertion_color,
-                    })
-
-            elif result_status == "PARTIALLY_SATISFIED":
-                summary_entry["ai_added_text"] = ai_text
-                relevant_text = ai_result.get("relevant_text")
-                location = groq_service.find_text_location_in_pdf(text_blocks, relevant_text)
-                if not location:
-                    location = groq_service.find_text_location_in_pdf(text_blocks, clause["title"])
-                if not location and text_blocks:
-                    last_block = text_blocks[-1]
-                    location = {"page_num": last_block["page_num"], "bbox": last_block["bbox"]}
-                if location:
-                    annotations.append({
-                        "page_num":            location["page_num"],
-                        "bbox":                location["bbox"],
-                        "highlight_color":     highlight_color,
-                        "inserted_text":       f"[PARTIAL - {clause['title']}]: {ai_text}" if ai_text else None,
-                        "inserted_text_color": insertion_color,
-                    })
-
-            elif result_status == "VIOLATION":
-                summary_entry["ai_added_text"] = ai_text
-                relevant_text = ai_result.get("relevant_text")
-                location = groq_service.find_text_location_in_pdf(text_blocks, relevant_text)
-                if not location:
-                    location = groq_service.find_text_location_in_pdf(text_blocks, clause["title"])
-                if not location and text_blocks:
-                    last_block = text_blocks[-1]
-                    location = {"page_num": last_block["page_num"], "bbox": last_block["bbox"]}
-                if location:
-                    annotations.append({
-                        "page_num":            location["page_num"],
-                        "bbox":                location["bbox"],
-                        "highlight_color":     highlight_color,
-                        "inserted_text":       f"[CORRECTION - {clause['title']}]: {ai_text}" if ai_text else None,
-                        "inserted_text_color": insertion_color,
-                    })
-
             analysis_summary.append(summary_entry)
 
         conflicts = []
 
-        # ── Step 5: Generate reports ───────────────────────────────────────────
+        # ── Step 5: Generate markdown reports ─────────────────────────────────
         job.status = JobStatus.GENERATING_REPORTS
         job.save(update_fields=["status", "updated_at"])
 
-        run_id = uuid.uuid4()
-        response_data = {
-            "status":      "success",   # overwritten below after job finalization
-            "job_id":      str(job.id),
-            "analysis_summary": analysis_summary,
-            "conflicts":   conflicts,
-            "jurisdiction": jurisdiction_info,
+        response_data: dict[str, Any] = {
+            "status": "success",
+            "job_id": str(job.id),
         }
 
         report_kwargs: dict[str, Any] = dict(
@@ -450,69 +354,14 @@ class ClauseAnalyzerView(APIView):
         )
 
         try:
-            # Markdown is always generated and returned inline as base64
-            _md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-            _md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
-            response_data["report_md_base64"]  = base64.b64encode(_md_report.encode()).decode()
-            response_data["summary_md_base64"] = base64.b64encode(_md_summary.encode()).decode()
-
-            if report_format in ("pdf", "both"):
-                pdf_report_bytes    = report_service.generate_pdf_report(analysis_summary, **report_kwargs)
-                pdf_report_filename = f"report_{run_id}.pdf"
-                result = _upload_or_save(pdf_report_bytes, pdf_report_filename, "reports", "application/pdf")
-                response_data["report_pdf_url"]        = result["url"]
-                response_data["report_pdf_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.PDF_REPORT, result, len(pdf_report_bytes))
-                logger.info("PDF report generated: %s", pdf_report_filename)
-
-                pdf_summary_bytes    = report_service.generate_pdf_summary(analysis_summary, **report_kwargs)
-                pdf_summary_filename = f"summary_{run_id}.pdf"
-                result = _upload_or_save(pdf_summary_bytes, pdf_summary_filename, "reports", "application/pdf")
-                response_data["summary_pdf_url"]        = result["url"]
-                response_data["summary_pdf_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.PDF_SUMMARY, result, len(pdf_summary_bytes))
-                logger.info("PDF summary generated: %s", pdf_summary_filename)
-
-            if report_format in ("markdown", "both"):
-                md_content  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-                md_bytes    = md_content.encode("utf-8")
-                md_filename = f"report_{run_id}.md"
-                result = _upload_or_save(md_bytes, md_filename, "reports", "text/markdown")
-                response_data["report_markdown_url"]        = result["url"]
-                response_data["report_markdown_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.MARKDOWN_REPORT, result, len(md_bytes))
-                logger.info("Markdown report generated: %s", md_filename)
-
-                md_summary       = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
-                md_summary_bytes = md_summary.encode("utf-8")
-                md_summary_filename = f"summary_{run_id}.md"
-                result = _upload_or_save(md_summary_bytes, md_summary_filename, "reports", "text/markdown")
-                response_data["summary_markdown_url"]        = result["url"]
-                response_data["summary_markdown_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.MARKDOWN_SUMMARY, result, len(md_summary_bytes))
-                logger.info("Markdown summary generated: %s", md_summary_filename)
-
-            if report_format == "docx":
-                docx_bytes    = report_service.generate_docx_report(analysis_summary, **report_kwargs)
-                docx_filename = f"report_{run_id}.docx"
-                _docx_ct      = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                result = _upload_or_save(docx_bytes, docx_filename, "reports", _docx_ct)
-                response_data["report_docx_url"]        = result["url"]
-                response_data["report_docx_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.DOCX_REPORT, result, len(docx_bytes))
-                logger.info("DOCX report generated: %s", docx_filename)
-
-                docx_summary_bytes    = report_service.generate_docx_summary(analysis_summary, **report_kwargs)
-                docx_summary_filename = f"summary_{run_id}.docx"
-                result = _upload_or_save(docx_summary_bytes, docx_summary_filename, "reports", _docx_ct)
-                response_data["summary_docx_url"]        = result["url"]
-                response_data["summary_docx_expires_in"] = result["expires_in"]
-                _save_report(job, ReportType.DOCX_SUMMARY, result, len(docx_summary_bytes))
-                logger.info("DOCX summary generated: %s", docx_summary_filename)
-
+            md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
+            md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
+            response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
+            response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
+            logger.info("Markdown report + summary generated for job %s", job.id)
         except Exception as e:
-            logger.error("Report generation/upload failed: %s", e)
-            response_data["report_error"] = f"Report could not be generated/uploaded: {e}"
+            logger.error("Markdown report generation failed: %s", e)
+            response_data["report_error"] = f"Report could not be generated: {e}"
 
         # ── Finalize job ───────────────────────────────────────────────────────
         if failed_count > 0:

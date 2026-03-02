@@ -56,11 +56,6 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     parties = PartiesSerializer(required=False)
     property = PropertySerializer(required=False)
     clauses = ClauseSerializer(many=True)
-    report_format = serializers.ChoiceField(
-        choices=["pdf", "markdown", "docx", "both"],
-        default="markdown",
-        required=False,
-    )
 
     def validate(self, attrs):
         doc_url = attrs.get("document_presigned_url") or attrs.get("pdf_presigned_url")
