@@ -512,3 +512,34 @@ def detect_conflicts(analysis_summary: list) -> list:
         logger.error("detect_conflicts failed: %s", e)
         return []
 
+
+# ── Q&A ──────────────────────────────────────────────────────────────────────
+
+_QA_SYSTEM = (
+    "You are a legal document expert. Answer the user's question based strictly on the provided "
+    "document excerpt. If the answer is not in the excerpt, say so clearly. "
+    'Return JSON only: {"answer": "...", "relevant_excerpt": "exact quote from document or empty string"}'
+)
+
+
+def answer_question_in_document(question: str, context: str) -> dict:
+    """
+    Answer a single question from a document context window.
+
+    Returns: {"answer": str, "relevant_excerpt": str}
+    Used by qa_service.answer_for_document() — called inside ThreadPoolExecutor.
+    """
+    user = f"Document excerpt:\n{context}\n\nQuestion: {question}"
+    try:
+        raw    = _call_ai(user, _QA_SYSTEM, max_tokens=800, temperature=0.1)
+        parsed = _safe_json_parse(raw)
+        return {
+            "answer":           parsed.get("answer", "Could not determine from document."),
+            "relevant_excerpt": parsed.get("relevant_excerpt", "") or "",
+        }
+    except Exception as e:
+        logger.error("answer_question_in_document failed: %s", e)
+        return {
+            "answer":           f"Analysis failed: {type(e).__name__}. Manual review recommended.",
+            "relevant_excerpt": "",
+        }

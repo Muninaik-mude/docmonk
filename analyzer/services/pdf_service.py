@@ -46,12 +46,20 @@ def detect_file_type(url: str, file_bytes: bytes) -> str:
     if file_bytes[:5] == b"%PDF-":
         return "pdf"
     if file_bytes[:4] == b"PK\x03\x04":
+        # Both DOCX and PPTX start with the ZIP magic bytes PK\x03\x04.
+        # Distinguish by checking the URL extension.
+        path_lower = urlparse(url).path.lower()
+        ext = os.path.splitext(path_lower)[1]
+        if ext in (".ppt", ".pptx"):
+            return "pptx"
         return "docx"
 
     # Fall back to URL extension for text formats (no magic bytes)
     path = urlparse(url).path.lower()
     ext = os.path.splitext(path)[1]
 
+    if ext in (".ppt", ".pptx"):
+        return "pptx"
     if ext in (".md", ".markdown"):
         return "markdown"
     if ext == ".txt":
@@ -102,10 +110,38 @@ def extract_text_from_markdown(file_bytes: bytes) -> list[dict]:
     return text_blocks
 
 
+def extract_text_from_pptx(file_bytes: bytes) -> list[dict]:
+    """
+    Extract text blocks from a PPTX file (one block per slide).
+    Returns same format as extract_text_with_positions: [{page_num, text, bbox}]
+    page_num = 1-based slide number.
+    """
+    try:
+        from pptx import Presentation  # python-pptx
+    except ImportError:
+        logger.warning("python-pptx not installed — falling back to empty text for PPTX")
+        return []
+
+    prs    = Presentation(io.BytesIO(file_bytes))
+    blocks = []
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        texts = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                texts.append(shape.text.strip())
+        if texts:
+            blocks.append({
+                "page_num": slide_num,
+                "text":     "\n".join(texts),
+                "bbox":     (0, 0, 0, 0),
+            })
+    return blocks
+
+
 def extract_text_blocks(url: str, file_bytes: bytes) -> list[dict]:
     """
     Auto-detect file type and extract text blocks.
-    Unified entry point for PDF, DOCX, Markdown, and TXT files.
+    Unified entry point for PDF, DOCX, PPTX, Markdown, and TXT files.
     """
     file_type = detect_file_type(url, file_bytes)
     logger.info("Detected file type: %s", file_type)
@@ -114,6 +150,8 @@ def extract_text_blocks(url: str, file_bytes: bytes) -> list[dict]:
         return extract_text_with_positions(file_bytes)
     elif file_type == "docx":
         return extract_text_from_docx(file_bytes)
+    elif file_type == "pptx":
+        return extract_text_from_pptx(file_bytes)
     else:
         return extract_text_from_markdown(file_bytes)
 
