@@ -4,4 +4,3 @@ healthcheckTimeout = 30
 restartPolicyType       = "on_failure"
 restartPolicyMaxRetries = 10
 startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py"
-web: PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py
