@@ -694,6 +694,31 @@ Format your response using clear Markdown:
 If the document excerpt does not contain the needed information, clearly state that."""
 
 
+_EXCERPT_SYSTEM = """You are a document excerpt extractor.
+Given a document passage and a question, return ONLY the single most relevant sentence or paragraph verbatim from the passage that best answers or relates to the question.
+- Do not paraphrase, summarize, or add any explanation.
+- Return ONLY the exact text from the passage.
+- If nothing is relevant, return an empty string."""
+
+
+def extract_relevant_excerpt(question: str, context: str) -> str:
+    """
+    Use AI to extract the single most relevant verbatim passage from context for the question.
+    Falls back to empty string on any failure — non-critical path.
+    """
+    if not context:
+        return ""
+    messages = [
+        {"role": "system", "content": _EXCERPT_SYSTEM},
+        {"role": "user", "content": f"Document passage:\n{context}\n\nQuestion: {question}"},
+    ]
+    try:
+        return _call_ai(messages, max_tokens=300, temperature=0.0)
+    except Exception:
+        logger.warning("extract_relevant_excerpt failed — returning empty string")
+        return ""
+
+
 def answer_question_stream(question: str, context: str, history: list | None = None):
     """
     Generator yielding markdown-formatted answer chunks for a Q&A question.

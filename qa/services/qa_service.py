@@ -177,9 +177,9 @@ def ask_stream(session, question: str, doc_data: dict):
         partial = True
 
     answer_status    = "partial" if partial else "success"
-    # G4 — resolve the page the answer came from using the context window position
-    relevant_excerpt = context[:200] if context else ""
-    page_hint        = find_page_for_excerpt(context, doc_data["full_text"], doc_data["char_page_map"])
+    # G4 — use AI to extract the exact relevant passage, then resolve page hint
+    relevant_excerpt = _offload_cpu(groq_service.extract_relevant_excerpt, question, context)
+    page_hint        = find_page_for_excerpt(relevant_excerpt or context, doc_data["full_text"], doc_data["char_page_map"])
 
     # DB save — raises on failure so the view layer emits event:error instead of event:done/partial
     with transaction.atomic():
@@ -235,9 +235,9 @@ def retry_stream(message, existing_answers: list, doc_data_list: list):
             partial     = True
             any_partial = True
 
-        # G4 — resolve page hint from context window position
-        relevant_excerpt = context[:200] if context else ""
-        page_hint        = find_page_for_excerpt(context, doc_data["full_text"], doc_data["char_page_map"])
+        # G4 — use AI to extract the exact relevant passage, then resolve page hint
+        relevant_excerpt = _offload_cpu(groq_service.extract_relevant_excerpt, message.question, context)
+        page_hint        = find_page_for_excerpt(relevant_excerpt or context, doc_data["full_text"], doc_data["char_page_map"])
 
         new_by_position[doc_data["position"]] = {
             "document_id":       doc_data["document_id"],
@@ -291,9 +291,9 @@ def regenerate_stream(message, existing_answers: list, reason: str, doc, previou
         partial = True
 
     existing_position = existing_answers[0].get("position", 0) if existing_answers else 0
-    # G4 — resolve page hint from context window position
-    relevant_excerpt  = context[:200] if context else ""
-    page_hint         = find_page_for_excerpt(context, doc.full_text, doc.char_page_map)
+    # G4 — use AI to extract the exact relevant passage, then resolve page hint
+    relevant_excerpt  = _offload_cpu(groq_service.extract_relevant_excerpt, message.question, context)
+    page_hint         = find_page_for_excerpt(relevant_excerpt or context, doc.full_text, doc.char_page_map)
     regenerated = {
         "document_id":         doc.document_id,
         "document_filename":   doc.document_filename,
