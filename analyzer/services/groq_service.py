@@ -4,7 +4,17 @@ import re
 import threading
 import time
 
-from openai import OpenAI, RateLimitError
+try:
+    # In production (gevent workers), use gevent.sleep so the sleep is
+    # cooperative and yields to other greenlets instead of blocking the worker.
+    from gevent import sleep as _sleep
+except ImportError:
+    # Dev / non-gevent environments: fall back to time.sleep.
+    # Gunicorn gevent monkey-patches time.sleep anyway, so this is equivalent
+    # in production if gevent is installed before this module is imported.
+    _sleep = time.sleep
+
+from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError
 from django.conf import settings
 
 # Matches a leading numbering prefix like "3.1 ", "7.10 ", "2.3.1 ", "6. ", "1) "
@@ -18,13 +28,38 @@ _RATE_LIMIT_RETRY_WAIT = 8.0
 _MAX_RETRIES = 3
 
 
-# ── Multi-provider client pool ────────────────────────────────────────────────────
+# ── Multi-provider client pool ─────────────────────────────────────────────────
 
 _pool_lock:   threading.Lock = threading.Lock()
 _pool:        list           = []
 _pool_built:  bool           = False
 _idx_lock:    threading.Lock = threading.Lock()
 _idx:         int            = 0
+
+# ── Circuit breaker ────────────────────────────────────────────────────────────
+# When a provider returns a 5xx error or a connection error, it is cooled down
+# for _PROVIDER_COOLDOWN_SECS seconds. All calls during that window skip it and
+# try the next provider. The cooldown resets automatically when the timer expires.
+
+_PROVIDER_COOLDOWN_SECS = 60
+_cooldown_lock:      threading.Lock = threading.Lock()
+_provider_cooldowns: dict           = {}  # {provider_name: float} — expiry unix timestamp
+
+
+def _mark_provider_down(name: str) -> None:
+    """Put provider in cooldown after a 5xx or connection error."""
+    with _cooldown_lock:
+        _provider_cooldowns[name] = time.time() + _PROVIDER_COOLDOWN_SECS
+    logger.warning(
+        "Provider %s cooling down for %ds (5xx or connection error)",
+        name, _PROVIDER_COOLDOWN_SECS,
+    )
+
+
+def _is_provider_available(name: str) -> bool:
+    """Return True if the provider's cooldown has expired (or was never set)."""
+    with _cooldown_lock:
+        return time.time() >= _provider_cooldowns.get(name, 0)
 
 
 def _build_provider_pool() -> list:
@@ -35,8 +70,8 @@ def _build_provider_pool() -> list:
     Any provider whose API key is not set is silently skipped.
     """
     pool = []
-    groq_model     = getattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
-    cerebras_model = "gpt-oss-120b"
+    groq_model     = getattr(settings, "GROQ_MODEL",     "llama-3.3-70b-versatile")
+    cerebras_model = getattr(settings, "CEREBRAS_MODEL", "gpt-oss-120b")
 
     for slot, attr in enumerate(["GROQ_API_KEY_1", "GROQ_API_KEY_2"], start=1):
         key = getattr(settings, attr, None)
@@ -93,15 +128,34 @@ def _next_start_idx() -> int:
     return i
 
 
+def _validated_pool() -> tuple[list, int, int]:
+    """
+    Validate the provider pool is non-empty and return (pool, n, start_idx).
+    Raises RuntimeError if no providers are configured.
+    """
+    pool = _get_pool()
+    if not pool:
+        raise RuntimeError(
+            "No AI providers configured. "
+            "Set at least one of: GROQ_API_KEY_1, GROQ_API_KEY_2, "
+            "CEREBRAS_KEY_1, CEREBRAS_KEY_2."
+        )
+    return pool, len(pool), _next_start_idx()
+
+
+# ── Core AI callers ────────────────────────────────────────────────────────────
+
 def _call_ai(
-    user_message: str,
-    system_prompt: str,
+    messages: list,
     *,
     max_tokens: int = 1500,
     temperature: float = 0.1,
 ) -> str:
     """
-    Call an AI provider from the pool using round-robin selection.
+    Non-streaming AI call using round-robin provider selection.
+
+    messages: pre-built list of {role, content} dicts (system + user, optionally
+              with assistant history turns for multi-turn conversations).
 
     Strategy:
       • Pick a start offset via global round-robin counter so parallel calls
@@ -111,28 +165,19 @@ def _call_ai(
         wait _RATE_LIMIT_RETRY_WAIT seconds then sweep again.
       • Raises RuntimeError after _MAX_RETRIES full sweeps all hit rate limits.
     """
-    pool = _get_pool()
-    if not pool:
-        raise RuntimeError(
-            "No AI providers configured. "
-            "Set at least one of: GROQ_API_KEY_1, GROQ_API_KEY_2, "
-            "CEREBRAS_KEY_1, CEREBRAS_KEY_2."
-        )
-
-    n     = len(pool)
-    start = _next_start_idx()
+    pool, n, start = _validated_pool()
 
     for attempt in range(_MAX_RETRIES + 1):
-        rate_limited = 0
-
         for offset in range(n):
             provider = pool[(start + offset) % n]
+
+            if not _is_provider_available(provider["name"]):
+                logger.debug("Skipping %s — in cooldown", provider["name"])
+                continue
+
             try:
                 resp = provider["client"].chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_message},
-                    ],
+                    messages=messages,
                     model=provider["model"],
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -142,30 +187,137 @@ def _call_ai(
 
             except RateLimitError:
                 logger.warning(
-                    "Rate limited on %s (sweep %d/%d), rotating to next provider",
+                    "Rate limited on %s (sweep %d/%d), trying next provider",
                     provider["name"], attempt + 1, _MAX_RETRIES + 1,
                 )
-                rate_limited += 1
+                continue
+
+            except APIStatusError as e:
+                if e.status_code >= 500:
+                    _mark_provider_down(provider["name"])
+                    continue
+                raise  # 4xx other than 429 — propagate immediately
+
+            except APIConnectionError:
+                _mark_provider_down(provider["name"])
                 continue
 
             except Exception:
-                raise   # Non-rate-limit errors propagate immediately
+                raise  # Unexpected errors propagate immediately
 
-        # All providers were rate-limited in this sweep
+        # All n providers were unavailable this sweep — wait and retry
         if attempt < _MAX_RETRIES:
             wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
             logger.warning(
-                "All %d providers rate-limited — waiting %.1fs before retry %d/%d",
-                n, wait, attempt + 1, _MAX_RETRIES,
+                "All %d providers unavailable (sweep %d/%d) — waiting %.1fs before retry",
+                n, attempt + 1, _MAX_RETRIES + 1, wait,
             )
-            time.sleep(wait)
+            _sleep(wait)
 
     raise RuntimeError(
         f"All {n} AI providers exhausted after {_MAX_RETRIES + 1} full sweeps."
     )
 
 
-# ── Per-clause analysis ──────────────────────────────────────────────────────────
+def _call_ai_stream(
+    messages: list,
+    *,
+    max_tokens: int = 1000,
+    temperature: float = 0.1,
+):
+    """
+    Streaming AI call using round-robin provider selection.
+
+    messages: pre-built list of {role, content} dicts — same format as _call_ai,
+              supports multi-turn history by including prior assistant turns.
+
+    Yields str chunks as they arrive from the provider.
+    Yields None every 15 s during provider-wait periods so the SSE layer can
+    emit keepalive comments and prevent proxy/browser idle-timeout disconnects.
+    """
+    pool, n, start = _validated_pool()
+
+    for attempt in range(_MAX_RETRIES + 1):
+        for offset in range(n):
+            provider = pool[(start + offset) % n]
+
+            if not _is_provider_available(provider["name"]):
+                logger.debug("Skipping %s — in cooldown", provider["name"])
+                continue
+
+            # ── Pre-stream: open the connection ───────────────────────────────
+            try:
+                stream = provider["client"].chat.completions.create(
+                    messages=messages,
+                    model=provider["model"],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                )
+            except RateLimitError:
+                logger.warning(
+                    "Rate limited on %s (pre-stream, sweep %d/%d), trying next provider",
+                    provider["name"], attempt + 1, _MAX_RETRIES + 1,
+                )
+                continue
+            except APIStatusError as e:
+                if e.status_code >= 500:
+                    _mark_provider_down(provider["name"])
+                    continue
+                raise
+            except APIConnectionError:
+                _mark_provider_down(provider["name"])
+                continue
+            except Exception:
+                raise
+
+            # ── Mid-stream: iterate chunks ─────────────────────────────────────
+            # Once chunks start flowing we cannot transparently retry on a
+            # different provider — partial output was already sent to the client.
+            # Any interruption here raises RuntimeError so the service layer
+            # saves the partial content and signals event:partial to the client.
+            try:
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        yield delta
+                return  # stream completed successfully
+            except RateLimitError:
+                logger.error(
+                    "Rate limited mid-stream on %s — partial output already sent",
+                    provider["name"],
+                )
+                raise RuntimeError("Rate limit hit mid-stream.")
+            except Exception as e:
+                logger.exception(
+                    "Stream interrupted on %s after partial output (%s)",
+                    provider["name"], type(e).__name__,
+                )
+                raise RuntimeError(f"Stream interrupted ({type(e).__name__}).")
+
+        # All n providers unavailable this sweep — wait and retry.
+        # Yield None every 15 s so the SSE layer can emit keepalive comments
+        # and prevent proxy/browser idle-timeout from dropping the connection.
+        if attempt < _MAX_RETRIES:
+            wait = _RATE_LIMIT_RETRY_WAIT * (attempt + 1)
+            logger.warning(
+                "All %d providers unavailable (stream, sweep %d/%d) — waiting %.1fs",
+                n, attempt + 1, _MAX_RETRIES + 1, wait,
+            )
+            elapsed = 0.0
+            while elapsed < wait:
+                interval = min(15.0, wait - elapsed)
+                _sleep(interval)
+                elapsed += interval
+                if elapsed < wait:
+                    yield None  # keepalive signal — SSE layer emits ": keepalive\n\n"
+
+    raise RuntimeError(
+        f"All {n} AI providers exhausted after {_MAX_RETRIES + 1} full sweeps (streaming)."
+    )
+
+
+# ── Per-clause analysis ────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a strict legal contract compliance auditor. You receive a REQUIRED CLAUSE and a FULL CONTRACT DOCUMENT. Your job is to:
 1. Scan the full document and locate the section(s) relevant to the clause topic.
@@ -367,19 +519,20 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     title   = clause["title"]
     content = clause["value"]
 
-    user_message = USER_PROMPT_TEMPLATE.format(
-        title=title,
-        content=content,
-        pdf_text=pdf_text,
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(
+            title=title, content=content, pdf_text=pdf_text,
+        )},
+    ]
 
     try:
-        response_text = _call_ai(user_message, SYSTEM_PROMPT, max_tokens=1500, temperature=0.1)
+        response_text = _call_ai(messages, max_tokens=1500, temperature=0.1)
         result = _parse_response(response_text)
         result["_provider"] = "pool"
         return result
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse AI JSON response for clause '%s': %s", title, e)
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse AI JSON response for clause '%s'", title)
         return {
             "result": "NOT_FOUND",
             "reason": "AI response could not be parsed",
@@ -391,8 +544,8 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
             "key_dates_durations": [],
             "_provider": "pool",
         }
-    except Exception as e:
-        logger.error("AI call failed for clause '%s': %s", title, e)
+    except Exception as e:  # G1 — bind exception so type(e).__name__ resolves correctly
+        logger.exception("AI call failed for clause '%s'", title)
         return {
             "result": "NOT_FOUND",
             "reason": f"AI analysis failed: {type(e).__name__}",
@@ -406,7 +559,7 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
         }
 
 
-# ── Document-level analysis ──────────────────────────────────────────────────────
+# ── Document-level analysis ────────────────────────────────────────────────────
 
 _JURISDICTION_SYSTEM = """You are a legal jurisdiction analyst. Analyze the provided contract text and identify the governing jurisdiction, agreement type, and applicable laws. Respond ONLY with valid JSON, no extra text or markdown."""
 
@@ -439,21 +592,21 @@ def detect_jurisdiction(pdf_text: str) -> dict:
 
     Returns: {jurisdiction, agreement_type, applicable_laws, checklist}
     """
-    excerpt = pdf_text[:3000]
-    user_message = _JURISDICTION_USER.format(pdf_excerpt=excerpt)
+    messages = [
+        {"role": "system", "content": _JURISDICTION_SYSTEM},
+        {"role": "user",   "content": _JURISDICTION_USER.format(pdf_excerpt=pdf_text[:3000])},
+    ]
 
     try:
-        response_text = _call_ai(
-            user_message, _JURISDICTION_SYSTEM, max_tokens=1000, temperature=0.1,
-        )
+        response_text = _call_ai(messages, max_tokens=1000, temperature=0.1)
         result = _safe_json_parse(response_text)
         if not isinstance(result.get("checklist"), list):
             result["checklist"] = []
         if not isinstance(result.get("applicable_laws"), list):
             result["applicable_laws"] = []
         return result
-    except Exception as e:
-        logger.error("detect_jurisdiction failed: %s", e)
+    except Exception:
+        logger.exception("detect_jurisdiction failed")
         return {
             "jurisdiction": "Unknown",
             "agreement_type": "Unknown",
@@ -499,47 +652,82 @@ def detect_conflicts(analysis_summary: list) -> list:
             f"- {entry['clause_title']} [{entry['result']}]: {entry.get('reason', '')}"
         )
     clause_summary_text = "\n".join(lines)
-    user_message = _CONFLICT_USER.format(clause_summary_text=clause_summary_text)
+
+    messages = [
+        {"role": "system", "content": _CONFLICT_SYSTEM},
+        {"role": "user",   "content": _CONFLICT_USER.format(clause_summary_text=clause_summary_text)},
+    ]
 
     try:
-        response_text = _call_ai(
-            user_message, _CONFLICT_SYSTEM, max_tokens=800, temperature=0.1,
-        )
+        response_text = _call_ai(messages, max_tokens=800, temperature=0.1)
         result = _safe_json_parse(response_text)
         conflicts = result.get("conflicts", [])
         return conflicts if isinstance(conflicts, list) else []
-    except Exception as e:
-        logger.error("detect_conflicts failed: %s", e)
+    except Exception:
+        logger.exception("detect_conflicts failed")
         return []
 
 
-# ── Q&A ──────────────────────────────────────────────────────────────────────
+# ── Q&A streaming ──────────────────────────────────────────────────────────────
 
-_QA_SYSTEM = (
-    "You are a legal document expert. Answer the user's question based strictly on the provided "
-    "document excerpt. If the answer is not in the excerpt, say so clearly. "
-    'Return JSON only: {"answer": "...", "relevant_excerpt": "exact quote from document or empty string"}'
-)
+_QA_STREAM_SYSTEM = """You are a legal document expert answering questions about documents.
+Answer the user's question based strictly on the provided document excerpt.
+Format your response using clear Markdown:
+- Use **bold** for key terms, clause names, dates, amounts, and party names
+- Use bullet points or numbered lists for multiple conditions, steps, or items
+- Use > blockquote for direct quotes from the document
+- Be specific — cite exact clause text, dates, amounts, or party names where relevant
+- Keep the answer concise and focused on what was asked
+
+If the answer is not found in the document excerpt, respond with:
+> The document does not contain information about this topic."""
+
+_REGEN_STREAM_SYSTEM = """You are a legal document expert. A user was not satisfied with a previous answer and has asked for a better one.
+Use the user's feedback to guide an improved response.
+Format your response using clear Markdown:
+- Use **bold** for key terms, clause names, dates, amounts, and party names
+- Use bullet points or numbered lists for multiple conditions, steps, or items
+- Use > blockquote for direct quotes from the document
+- Directly address the user's reason for dissatisfaction
+- Be specific — cite exact clause text, dates, amounts, or parties where relevant
+
+If the document excerpt does not contain the needed information, clearly state that."""
 
 
-def answer_question_in_document(question: str, context: str) -> dict:
+def answer_question_stream(question: str, context: str, history: list | None = None):
     """
-    Answer a single question from a document context window.
+    Generator yielding markdown-formatted answer chunks for a Q&A question.
 
-    Returns: {"answer": str, "relevant_excerpt": str}
-    Used by qa_service.answer_for_document() — called inside ThreadPoolExecutor.
+    history: list of prior {role, content} turns (user + assistant alternating),
+             oldest first. Injected between the system prompt and the current
+             question so the LLM has multi-turn conversation context.
     """
-    user = f"Document excerpt:\n{context}\n\nQuestion: {question}"
-    try:
-        raw    = _call_ai(user, _QA_SYSTEM, max_tokens=800, temperature=0.1)
-        parsed = _safe_json_parse(raw)
-        return {
-            "answer":           parsed.get("answer", "Could not determine from document."),
-            "relevant_excerpt": parsed.get("relevant_excerpt", "") or "",
-        }
-    except Exception as e:
-        logger.error("answer_question_in_document failed: %s", e)
-        return {
-            "answer":           f"Analysis failed: {type(e).__name__}. Manual review recommended.",
-            "relevant_excerpt": "",
-        }
+    messages = [{"role": "system", "content": _QA_STREAM_SYSTEM}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": f"Document excerpt:\n{context}\n\nQuestion: {question}"})
+    yield from _call_ai_stream(messages, max_tokens=1000, temperature=0.1)
+
+
+def regenerate_answer_stream(
+    question: str,
+    previous_answer: str,
+    reason: str,
+    context: str,
+):
+    """
+    Generator yielding markdown-formatted chunks for a regenerated answer.
+    Used by QARegenerateView for SSE streaming.
+    """
+    user = (
+        f"Document excerpt:\n{context}\n\n"
+        f"Original question: {question}\n\n"
+        f"Previous answer (the user was NOT satisfied with this):\n{previous_answer}\n\n"
+        f"User's reason for requesting regeneration: {reason}\n\n"
+        "Please provide an improved answer that directly addresses the user's concern."
+    )
+    messages = [
+        {"role": "system", "content": _REGEN_STREAM_SYSTEM},
+        {"role": "user",   "content": user},
+    ]
+    yield from _call_ai_stream(messages, max_tokens=1000, temperature=0.2)

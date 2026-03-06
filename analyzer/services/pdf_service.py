@@ -269,3 +269,26 @@ def find_text_location_in_pdf(text_blocks: list, search_text: str) -> dict | Non
             best_match = {"page_num": block["page_num"], "bbox": block["bbox"]}
 
     return best_match
+
+
+def build_char_page_map(text_blocks: list) -> list:
+    """
+    Build a [{page, start, end}] character-position map from extract_text_blocks output.
+
+    Each entry marks the inclusive byte range in the concatenated full_text string
+    that belongs to a given page. Used by qa_service to resolve a page number from
+    a relevant_excerpt string without re-scanning the entire document.
+
+    The +1 offset between blocks matches the '\\n' separator added by get_full_text.
+    """
+    result: list[dict] = []
+    pos = 0
+    for block in text_blocks:
+        length = len(block["text"])
+        result.append({
+            "page":  block.get("page_num", 1),
+            "start": pos,
+            "end":   pos + length,
+        })
+        pos += length + 1  # +1 matches the \n separator in get_full_text
+    return result

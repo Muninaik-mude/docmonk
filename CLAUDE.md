@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 DocMonk is a Django REST API that performs AI-powered legal document services:
 - **Clause Analysis** — check uploaded document clauses for compliance, generate color-coded reports
-- **Document Q&A** *(planned)* — ask freeform questions on an uploaded document
+- **Document Q&A** *(implemented)* — sequential chatbot for asking freeform questions on an uploaded document
 - **Contract Generation** *(planned)* — generate a contract document from structured party/property details
 
 ## Common Commands
@@ -58,12 +58,22 @@ analyzer/
 ├── job_views.py       — JobStatusView (GET), JobResumeView (POST resume)
 ├── urls.py            — URL routing
 ├── services/
-│   ├── groq_service.py    — AI calls: jurisdiction detection, clause analysis, conflict detection
+│   ├── groq_service.py    — AI calls: jurisdiction detection, clause analysis, conflict detection, Q&A streaming
 │   ├── pdf_service.py     — Text extraction (PDF/DOCX/MD/TXT), PDF annotation
 │   ├── r2_service.py      — Cloudflare R2 / local file storage
 │   └── report_service.py  — PDF/DOCX/Markdown report + summary generation
 └── utils/
     └── color_constants.py — Compliance status → highlight/insertion color maps
+
+qa/
+├── models.py          — QADocument, QASession, QASessionDocument, QAMessage
+├── serializers.py     — Input validation for session create, ask, rename, regenerate
+├── views.py           — All Q&A views + SSE helpers
+├── urls.py            — Q&A URL routing
+├── migrations/
+│   └── 0001_initial.py
+└── services/
+    └── qa_service.py  — Context window selection, page hint lookup, stream generators
 ```
 
 ### Services
@@ -83,6 +93,8 @@ analyzer/
 
 ## Database Models
 
+### Clause Analyzer models
+
 | Model | Table | Purpose |
 |---|---|---|
 | `AnalysisJob` | `analysis_jobs` | Top-level job: status machine, counters, stored full text |
@@ -91,6 +103,21 @@ analyzer/
 | `JobJurisdiction` | `job_jurisdiction` | Jurisdiction + applicable laws + checklist |
 | `ClauseConflict` | `clause_conflicts` | Conflict pairs (populated only if conflict detection is enabled) |
 | `JobReport` | `job_reports` | Stored report file keys + presigned URLs |
+
+### Q&A models (`qa/`)
+
+| Model | Table | Purpose |
+|---|---|---|
+| `QADocument` | `qa_documents` | Text extraction cache — one row per unique S3 object key. Multiple sessions can share the same extracted text without re-downloading. |
+| `QASession` | `qa_sessions` | One session per user per document. Holds the full chat history for that session. |
+| `QASessionDocument` | `qa_session_documents` | Junction between session and document. Always exactly 1 document per session (`MAX_DOCS_PER_SESSION = 1`). |
+| `QAMessage` | `qa_messages` | One row per question/answer exchange. `answers_per_document` is always a single-element list since sessions are limited to 1 document. |
+
+**Critical Q&A design constraints — do not second-guess these:**
+- `document_id` = the S3 object key. S3 keys are immutable content references. The same key always means the same file. There is no scenario where two different documents share a key, or where a key's content changes. Deduplication by `document_id` is safe and correct.
+- `MAX_DOCS_PER_SESSION = 1` is enforced at the serializer level. Multi-document logic does not exist and should not be designed for.
+- This is a **sequential chatbot**. The UI sends one question, waits for the SSE stream to complete, then enables the next question. Concurrent `/ask` calls from the same user to the same session are not a realistic scenario.
+- `answers_per_document` in `QAMessage` always contains exactly one entry. It is a list for schema flexibility only. Do not redesign it as a separate model unless multi-doc is explicitly requested.
 
 ## API Endpoints
 
@@ -141,7 +168,26 @@ Poll job state + retrieve full results including analysis_summary (with jurisdic
 
 Re-run only FAILED/PENDING clauses. Uses `full_text` stored in DB — no re-download. Only works when job is in `PARTIAL_FAILURE` state.
 
-## Analysis Pipeline
+### Q&A Endpoints (`/v1/qa/`)
+
+| Method | Endpoint | Purpose | Response |
+|--------|----------|---------|----------|
+| `POST` | `/sessions` | Create session, download + extract document text | JSON 201 |
+| `GET` | `/sessions?user_id=xxx` | List sessions for a user (paginated) | JSON 200 |
+| `GET` | `/sessions/{id}` | Session detail + full chat message history | JSON 200 |
+| `PATCH` | `/sessions/{id}` | Rename session | JSON 200 |
+| `DELETE` | `/sessions/{id}` | Delete session + cascade messages + orphan doc cleanup | JSON 200 |
+| `POST` | `/sessions/{id}/ask` | Ask a question — streams SSE answer | SSE stream |
+| `POST` | `/messages/{id}/retry` | Re-run failed answer — streams SSE answer | SSE stream |
+| `POST` | `/messages/{id}/regenerate` | Regenerate with user feedback reason — streams SSE answer | SSE stream |
+
+**SSE event format:**
+- Text chunks: `data: "word or phrase"\n\n` (JSON-encoded string — call `JSON.parse(event.data)`)
+- End of stream (saved): `event: done\ndata: {"success":true}\n\n`
+- Partial (stream cut short, partial saved): `event: partial\ndata: {...}\n\n`
+- Save failed: `event: error\ndata: {"success":false,...}\n\n`
+
+## Analysis Pipeline (Clause Analyzer)
 
 1. Decode base64 / download document from presigned URL
 2. Extract full text (`pdf_service`)
@@ -151,6 +197,26 @@ Re-run only FAILED/PENDING clauses. Uses `full_text` stored in DB — no re-down
 6. Annotate original PDF with color-coded highlights (`pdf_service`)
 7. Generate reports in requested format(s) (`report_service`)
 8. Store reports, return slim response
+
+## Q&A Pipeline
+
+### Session creation (`POST /v1/qa/sessions`)
+1. Check `QADocument` cache by `document_id` (= S3 object key) — skip download if already extracted
+2. Cache miss: download from presigned URL, extract text, build `char_page_map`
+3. Create `QASession` + `QASessionDocument` in one atomic block
+4. Return `session_id`
+
+### Ask flow (`POST /v1/qa/sessions/{id}/ask`)
+1. Load session + document via `prefetch_related`
+2. `qa_service.find_relevant_window(question, full_text)` — 5000-char sliding window keyword scan
+3. `groq_service.answer_question_stream(question, context)` — yields text chunks
+4. View wraps each chunk as SSE `data:` event and flushes immediately
+5. After all chunks: save `QAMessage` atomically, auto-name session from first question
+6. Emit `event: done` on success, `event: partial` if stream cut short, `event: error` if DB save failed
+
+### Retry / Regenerate
+- **Retry**: re-runs AI only for answers with `status in ("failed", "partial")`, merges results back
+- **Regenerate**: re-runs AI with `previous_answer + user reason` as additional context, replaces answer in-place
 
 ## Compliance Status Values
 

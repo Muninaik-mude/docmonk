@@ -23,6 +23,7 @@ class QADocument(models.Model):
     # Used to resolve page_hint for answers. Empty for TXT/DOCX.
     char_page_map     = models.JSONField(default=list)
     created_at        = models.DateTimeField(auto_now_add=True)
+    updated_at        = models.DateTimeField(auto_now=True)
 
     if TYPE_CHECKING:
         session_links: "RelatedManager[QASessionDocument]"
@@ -50,7 +51,7 @@ class QASession(models.Model):
 
     if TYPE_CHECKING:
         session_documents: "RelatedManager[QASessionDocument]"
-        interactions:      "RelatedManager[QAInteraction]"
+        messages:          "RelatedManager[QAMessage]"
 
     class Meta:
         db_table = "qa_sessions"
@@ -81,22 +82,27 @@ class QASessionDocument(models.Model):
         return f"Session {self.session_id} → Doc {self.document.document_id} (pos={self.position})"
 
 
-class QAInteraction(models.Model):
+class QAMessage(models.Model):
     """
     One row per question asked. Belongs to a session (hence to a user).
-    answers_per_document holds all per-document answers as JSON.
+    Exposes two message_ids in the API — question_message_id (role: user)
+    and id (role: assistant) — so the frontend can render a proper chat thread.
     """
     id                   = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    session              = models.ForeignKey(QASession, on_delete=models.CASCADE, related_name="interactions")
+    # Separate UUID for the user-side message (question). The primary key (id)
+    # is used as the assistant message_id and in retry/regenerate URLs.
+    question_message_id  = models.UUIDField(default=uuid.uuid4, editable=False)
+    session              = models.ForeignKey(QASession, on_delete=models.CASCADE, related_name="messages")
     question             = models.TextField()
     # answers_per_document: list of dicts:
-    # {document_id, document_filename, position, answer, relevant_excerpt, page_hint}
+    # {document_id, document_filename, answer, relevant_excerpt, page_hint, status}
     answers_per_document = models.JSONField(default=list)
-    asked_at             = models.DateTimeField(auto_now_add=True, db_index=True)
+    created_at           = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at           = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "qa_interactions"
-        ordering = ["asked_at"]
+        db_table = "qa_messages"
+        ordering = ["created_at"]
 
     def __str__(self):
         return f"Q: {self.question[:60]}... (session={self.session_id})"

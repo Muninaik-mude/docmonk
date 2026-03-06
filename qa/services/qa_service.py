@@ -1,18 +1,57 @@
 """
-Q&A service — finds relevant context windows and answers questions per document.
+Q&A service — context window selection, page hint lookup, and streaming answer generators.
 
-Called from QAAskView inside ThreadPoolExecutor threads.
+Stream generators yield raw markdown text chunks.
+The view layer wraps chunks in SSE format via _stream_to_sse() in views.py.
+DB persistence happens inside each generator after all chunks are yielded.
+
+Three outcomes are possible after a stream:
+
+  success  — all chunks received, full answer saved → view emits event:done
+  partial  — stream interrupted mid-way (network, rate-limit, etc.), partial
+             content saved → PartialAnswerError raised → view emits event:partial
+             The client shows the partial answer with a "regenerate" prompt,
+             exactly like Claude.ai / ChatGPT when generation is cut short.
+  error    — DB save failed after streaming → exception propagates → view emits
+             event:error (message was NOT saved, client should retry)
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from django.db import close_old_connections
+from django.db import transaction
 
 from analyzer.services import groq_service
 
+from ..models import QAMessage, QASession
+
+
+class PartialAnswerError(Exception):
+    """
+    Raised when an AI stream was interrupted mid-response but the partial
+    content was successfully saved to the database.
+
+    The view layer catches this and emits 'event: partial' (not 'event: done'),
+    allowing the frontend to display the partial answer with a regenerate prompt —
+    the same pattern used by Claude.ai and ChatGPT when generation is cut short.
+    """
+    pass
+
 logger = logging.getLogger(__name__)
 
-_MAX_PARALLEL = 3
+
+# ── Gevent CPU offload ─────────────────────────────────────────────────────────
+# find_relevant_window is a CPU-bound scan over potentially large documents.
+# In gevent workers it blocks the event loop for its entire duration, starving
+# all other concurrent greenlets. Offloading to gevent's OS threadpool lets
+# other greenlets run while the scan executes in a real OS thread.
+try:
+    from gevent import get_hub as _gevent_get_hub
+    def _offload_cpu(fn, *args):
+        return _gevent_get_hub().threadpool.spawn(fn, *args).get()
+except ImportError:
+    # Dev / test environment without gevent — run synchronously
+    def _offload_cpu(fn, *args):
+        return fn(*args)
+
 
 _STOP_WORDS = frozenset([
     "the", "and", "for", "are", "was", "this", "that", "with", "from",
@@ -24,9 +63,9 @@ _STOP_WORDS = frozenset([
 ])
 
 
-# ── Context window ────────────────────────────────────────────────────────────
+# ── Context window ─────────────────────────────────────────────────────────────
 
-def _find_relevant_window(question: str, full_text: str, window_size: int = 5000) -> str:
+def find_relevant_window(question: str, full_text: str, window_size: int = 5000) -> str:
     """
     Find the most relevant window in full_text for the given question.
 
@@ -50,7 +89,6 @@ def _find_relevant_window(question: str, full_text: str, window_size: int = 5000
     text_lower = full_text.lower()
     text_len   = len(full_text)
     step       = 200
-
     best_pos   = 0
     best_score = 0
 
@@ -66,14 +104,13 @@ def _find_relevant_window(question: str, full_text: str, window_size: int = 5000
     if best_score == 0:
         return full_text[:window_size]
 
-    # Centre the window on the best position
     centre = best_pos + window_size // 2
     start  = max(0, centre - window_size // 2)
     end    = min(text_len, start + window_size)
     return full_text[start:end]
 
 
-# ── Page hint lookup ──────────────────────────────────────────────────────────
+# ── Page hint lookup ───────────────────────────────────────────────────────────
 
 def find_page_for_excerpt(excerpt: str, full_text: str, char_page_map: list) -> int | None:
     """
@@ -93,112 +130,185 @@ def find_page_for_excerpt(excerpt: str, full_text: str, char_page_map: list) -> 
     return None
 
 
-# ── Per-document worker ───────────────────────────────────────────────────────
+# ── Stream generators ──────────────────────────────────────────────────────────
 
-def answer_for_document(question: str, doc_data: dict) -> dict:
+def ask_stream(session, question: str, doc_data: dict):
     """
-    Thread worker: answer one question from one document.
+    Generator yielding raw markdown text chunks for a Q&A ask.
 
-    doc_data keys:
-      full_text, document_id, document_filename, position, char_page_map
+    Yields None during provider wait periods — the SSE layer converts these
+    to keepalive comments so proxies don't drop the idle connection.
 
-    Returns:
-      {document_id, document_filename, position, answer, relevant_excerpt, page_hint, status}
-      status: "success" | "failed"  — used by retry to identify failed answers.
+    Outcome after the generator is exhausted:
+      - success  → full answer saved, caller emits event:done
+      - partial  → stream interrupted, partial answer saved, PartialAnswerError raised
+      - (DB fail)→ raises, caller emits event:error (message not saved)
     """
-    close_old_connections()
+    context       = _offload_cpu(find_relevant_window, question, doc_data["full_text"])
+    chunks:  list = []
+    partial: bool = False
 
-    document_id       = doc_data["document_id"]
-    document_filename = doc_data["document_filename"]
-    position          = doc_data["position"]
-    full_text         = doc_data["full_text"]
-    char_page_map     = doc_data.get("char_page_map", [])
+    # G3 — fetch last 10 exchanges as conversation history (oldest first).
+    # Gives the LLM context for follow-up questions that reference prior turns.
+    history_rows = list(
+        QAMessage.objects.filter(session=session).order_by("-created_at")[:10]
+    )
+    history_rows.reverse()
+    history = []
+    for msg in history_rows:
+        history.append({"role": "user", "content": msg.question})
+        first_ans = msg.answers_per_document[0] if msg.answers_per_document else {}
+        ans_text  = first_ans.get("answer", "")
+        if ans_text:
+            history.append({"role": "assistant", "content": ans_text})
 
     try:
-        context   = _find_relevant_window(question, full_text)
-        ai_result = groq_service.answer_question_in_document(question, context)
+        for chunk in groq_service.answer_question_stream(question, context, history=history):
+            if chunk is None:
+                yield None  # keepalive — pass through to SSE layer
+                continue
+            chunks.append(chunk)
+            yield chunk
+    except RuntimeError:
+        # Stream interrupted — _call_ai_stream raises RuntimeError for all
+        # recoverable stream failures. Fatal errors (MemoryError, etc.) are
+        # NOT caught here so they can propagate and crash the worker cleanly.
+        logger.exception("Stream interrupted for question '%s'", question[:60])
+        partial = True
 
-        relevant_excerpt = ai_result.get("relevant_excerpt", "") or ""
-        page_hint        = find_page_for_excerpt(relevant_excerpt, full_text, char_page_map)
+    answer_status    = "partial" if partial else "success"
+    # G4 — resolve the page the answer came from using the context window position
+    relevant_excerpt = context[:200] if context else ""
+    page_hint        = find_page_for_excerpt(context, doc_data["full_text"], doc_data["char_page_map"])
 
-        return {
-            "document_id":       document_id,
-            "document_filename": document_filename,
-            "position":          position,
-            "answer":            ai_result.get("answer", ""),
+    # DB save — raises on failure so the view layer emits event:error instead of event:done/partial
+    with transaction.atomic():
+        message = QAMessage.objects.create(
+            session              = session,
+            question             = question,
+            answers_per_document = [{
+                "document_id":       doc_data["document_id"],
+                "document_filename": doc_data["document_filename"],
+                "position":          doc_data["position"],
+                "answer":            "".join(chunks),
+                "relevant_excerpt":  relevant_excerpt,
+                "page_hint":         page_hint,
+                "status":            answer_status,
+            }],
+        )
+
+        # Auto-name session from the first question asked.
+        # filter+update is a single atomic SQL UPDATE — avoids the read-check-write
+        # race that would occur with session.save(update_fields=[...]).
+        QASession.objects.filter(id=session.id, name="").update(name=question[:100])
+
+    if partial:
+        raise PartialAnswerError()
+
+
+def retry_stream(message, existing_answers: list, doc_data_list: list):
+    """
+    Generator yielding raw markdown text chunks for a retry.
+
+    Re-runs answers with status in ("failed", "partial"). Merges new answers
+    with existing successful ones and saves on completion.
+    Raises PartialAnswerError if any answer was cut short.
+    Raises on DB failure.
+    """
+    new_by_position: dict = {}
+    any_partial = False
+
+    for doc_data in doc_data_list:
+        context       = _offload_cpu(find_relevant_window, message.question, doc_data["full_text"])
+        chunks:  list = []
+        partial: bool = False
+
+        try:
+            for chunk in groq_service.answer_question_stream(message.question, context):
+                if chunk is None:
+                    yield None  # keepalive — pass through to SSE layer
+                    continue
+                chunks.append(chunk)
+                yield chunk
+        except RuntimeError:
+            logger.exception("Retry stream interrupted for message %s", message.id)
+            partial     = True
+            any_partial = True
+
+        # G4 — resolve page hint from context window position
+        relevant_excerpt = context[:200] if context else ""
+        page_hint        = find_page_for_excerpt(context, doc_data["full_text"], doc_data["char_page_map"])
+
+        new_by_position[doc_data["position"]] = {
+            "document_id":       doc_data["document_id"],
+            "document_filename": doc_data["document_filename"],
+            "position":          doc_data["position"],
+            "answer":            "".join(chunks),
             "relevant_excerpt":  relevant_excerpt,
             "page_hint":         page_hint,
-            "status":            "success",
+            "status":            "partial" if partial else "success",
         }
 
-    except Exception as e:
-        logger.error(
-            "Q&A failed for doc '%s', question '%s': %s",
-            document_id, question[:60], e,
-        )
-        return {
-            "document_id":       document_id,
-            "document_filename": document_filename,
-            "position":          position,
-            "answer":            f"Analysis failed: {type(e).__name__}. Manual review recommended.",
-            "relevant_excerpt":  "",
-            "page_hint":         None,
-            "status":            "failed",
-        }
-
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
-
-def answer_questions(questions: list[str], doc_data_list: list[dict]) -> list[dict]:
-    """
-    Answer N questions across M documents in parallel.
-
-    Returns a list (one entry per question) with shape:
-      [{question, answers_per_document: [{...}, ...]}, ...]
-
-    All (question × document) pairs run concurrently in ThreadPoolExecutor.
-    """
-    # Build flat list of (q_idx, d_idx, question, doc_data)
-    pairs = [
-        (q_idx, d_idx, question, doc_data)
-        for q_idx, question in enumerate(questions)
-        for d_idx, doc_data in enumerate(doc_data_list)
+    # Merge: replace retried answers with new results, keep untouched successful ones
+    updated_answers = [
+        new_by_position.get(ans["position"], ans)
+        if ans.get("status") in ("failed", "partial")
+        else ans
+        for ans in existing_answers
     ]
 
-    result_map: dict[tuple, dict] = {}
+    # DB save — raises on failure
+    message.answers_per_document = updated_answers
+    message.save(update_fields=["answers_per_document", "updated_at"])
 
-    with ThreadPoolExecutor(max_workers=_MAX_PARALLEL) as executor:
-        future_to_key = {
-            executor.submit(answer_for_document, question, doc_data): (q_idx, d_idx)
-            for q_idx, d_idx, question, doc_data in pairs
-        }
-        for future in as_completed(future_to_key):
-            key = future_to_key[future]
-            try:
-                result_map[key] = future.result()
-            except Exception as e:
-                q_idx, d_idx = key
-                doc_data = doc_data_list[d_idx]
-                logger.error("Unexpected thread error for (q=%d, d=%d): %s", q_idx, d_idx, e)
-                result_map[key] = {
-                    "document_id":       doc_data["document_id"],
-                    "document_filename": doc_data["document_filename"],
-                    "position":          doc_data["position"],
-                    "answer":            f"Unexpected error: {type(e).__name__}",
-                    "relevant_excerpt":  "",
-                    "page_hint":         None,
-                    "status":            "failed",
-                }
+    if any_partial:
+        raise PartialAnswerError()
 
-    # Reconstruct ordered output
-    answers = []
-    for q_idx, question in enumerate(questions):
-        per_doc = [
-            result_map[(q_idx, d_idx)]
-            for d_idx in range(len(doc_data_list))
-            if (q_idx, d_idx) in result_map
-        ]
-        per_doc.sort(key=lambda x: x["position"])
-        answers.append({"question": question, "answers_per_document": per_doc})
 
-    return answers
+def regenerate_stream(message, existing_answers: list, reason: str, doc, previous_answer: str):
+    """
+    Generator yielding raw markdown text chunks for a regenerated answer.
+
+    Replaces the first answer in-place and saves on completion.
+    Raises PartialAnswerError if the stream was cut short.
+    Raises on DB failure.
+    """
+    context       = _offload_cpu(find_relevant_window, message.question, doc.full_text)
+    chunks: list  = []
+    partial: bool = False
+
+    try:
+        for chunk in groq_service.regenerate_answer_stream(
+            message.question, previous_answer, reason, context
+        ):
+            if chunk is None:
+                yield None  # keepalive — pass through to SSE layer
+                continue
+            chunks.append(chunk)
+            yield chunk
+    except RuntimeError:
+        logger.exception("Regenerate stream interrupted for message %s", message.id)
+        partial = True
+
+    existing_position = existing_answers[0].get("position", 0) if existing_answers else 0
+    # G4 — resolve page hint from context window position
+    relevant_excerpt  = context[:200] if context else ""
+    page_hint         = find_page_for_excerpt(context, doc.full_text, doc.char_page_map)
+    regenerated = {
+        "document_id":         doc.document_id,
+        "document_filename":   doc.document_filename,
+        "position":            existing_position,
+        "answer":              "".join(chunks),
+        "relevant_excerpt":    relevant_excerpt,
+        "page_hint":           page_hint,
+        "status":              "partial" if partial else "success",
+        "regenerated":         True,
+        "regeneration_reason": reason,
+    }
+
+    # DB save — raises on failure
+    message.answers_per_document = [regenerated]
+    message.save(update_fields=["answers_per_document", "updated_at"])
+
+    if partial:
+        raise PartialAnswerError()
