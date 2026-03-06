@@ -1,11 +1,7 @@
 [deploy]
-# Railway calls this path to decide whether a deployment succeeded.
-# Must return HTTP 200 within healthcheckTimeout seconds.
 healthcheckPath    = "/health"
-healthcheckTimeout = 30          # seconds; SSE endpoints can be slow to start
-
-# Restart the container automatically on non-zero exit codes.
-# "on_failure" avoids restart loops when the app crashes at startup
-# due to mis-configured env vars (they show up clearly in logs).
+healthcheckTimeout = 30
 restartPolicyType       = "on_failure"
 restartPolicyMaxRetries = 10
+startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py"
+web: PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py
