@@ -10,6 +10,8 @@ POST   /v1/qa/sessions/{id}/ask      — ask a question, stream SSE answer
 POST   /v1/qa/messages/{id}/retry    — retry failed answer (SSE)
 POST   /v1/qa/messages/{id}/regenerate — regenerate answer with user reason (SSE)
 """
+import base64
+import binascii
 import json
 import logging
 import math
@@ -212,10 +214,11 @@ class QASessionView(APIView):
 
         for doc_input in doc_inputs:
             document_id       = doc_input["document_id"]
-            s3_url            = doc_input["s3_download_url"]
+            s3_url            = doc_input.get("s3_download_url")
+            doc_b64           = doc_input.get("document_base64")
             document_filename = doc_input.get("document_filename", "document")
 
-            # Fast cache check — skip download if already extracted
+            # Fast cache check — skip download/decode if already extracted
             try:
                 cached = QADocument.objects.get(document_id=document_id)
                 logger.info("Cache hit for document_id=%s", document_id)
@@ -224,15 +227,28 @@ class QASessionView(APIView):
             except QADocument.DoesNotExist:
                 pass
 
-            # Download
-            try:
-                doc_bytes = r2_service.download_document_from_presigned_url(s3_url)
-            except Exception as e:
-                logger.exception("Failed to download document_id=%s", document_id)
-                return _err(
-                    f"Failed to download document '{document_filename}': {e}",
-                    status.HTTP_400_BAD_REQUEST,
-                )
+            # Acquire raw bytes — either from S3 or base64 payload
+            if doc_b64:
+                # Strip data-URI prefix if present (e.g. "data:application/pdf;base64,...")
+                if "," in doc_b64 and doc_b64.index(",") < 200:
+                    doc_b64 = doc_b64.split(",", 1)[1]
+                try:
+                    doc_bytes = base64.b64decode(doc_b64.strip())
+                    logger.info("Document decoded from base64 (%d bytes) document_id=%s", len(doc_bytes), document_id)
+                except (binascii.Error, ValueError) as e:
+                    return _err(
+                        f"Invalid base64 for document '{document_filename}': {e}",
+                        status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                try:
+                    doc_bytes = r2_service.download_document_from_presigned_url(s3_url)
+                except Exception as e:
+                    logger.exception("Failed to download document_id=%s", document_id)
+                    return _err(
+                        f"Failed to download document '{document_filename}': {e}",
+                        status.HTTP_400_BAD_REQUEST,
+                    )
 
             if len(doc_bytes) > MAX_FILE_SIZE_BYTES:
                 file_size_mb = len(doc_bytes) / (1024 * 1024)
@@ -267,7 +283,7 @@ class QASessionView(APIView):
             resolved_docs.append({
                 "cached":            None,
                 "document_id":       document_id,
-                "s3_download_url":   s3_url,
+                "s3_download_url":   s3_url or None,
                 "document_filename": document_filename,
                 "file_type":         file_type,
                 "full_text":         full_text,

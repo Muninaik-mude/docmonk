@@ -14,7 +14,7 @@ class QADocument(models.Model):
     """
     id                = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     document_id       = models.CharField(max_length=500, unique=True, db_index=True)
-    s3_download_url   = models.URLField(max_length=2000)
+    s3_download_url   = models.URLField(max_length=2000, null=True, blank=True)
     document_filename = models.CharField(max_length=500, default="document")
     file_type         = models.CharField(max_length=20, default="")
     full_text         = models.TextField()

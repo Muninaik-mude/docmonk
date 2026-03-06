@@ -7,8 +7,16 @@ MAX_QUESTIONS        = 50
 
 class QADocumentInputSerializer(serializers.Serializer):
     document_id       = serializers.CharField(max_length=500)
-    s3_download_url   = serializers.URLField()
+    s3_download_url   = serializers.URLField(required=False)
+    document_base64   = serializers.CharField(required=False)
     document_filename = serializers.CharField(required=False, default="document", max_length=500)
+
+    def validate(self, attrs):
+        if not attrs.get("s3_download_url") and not attrs.get("document_base64"):
+            raise serializers.ValidationError(
+                "Either 's3_download_url' or 'document_base64' is required."
+            )
+        return attrs
 
 
 class QASessionCreateSerializer(serializers.Serializer):
