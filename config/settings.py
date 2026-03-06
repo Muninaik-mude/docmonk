@@ -29,10 +29,19 @@ if not ALLOWED_HOSTS:
 # Railway serves behind a proxy over HTTPS
 CSRF_TRUSTED_ORIGINS = [f"https://{h}" for h in ALLOWED_HOSTS if h != '*']
 
+# CORS — set CORS_ALLOWED_ORIGINS env var to a comma-separated list of frontend origins.
+# Example: CORS_ALLOWED_ORIGINS=https://app.example.com,https://staging.example.com
+# Set CORS_ALLOW_ALL_ORIGINS=true only for fully public/open APIs.
+_cors_origins_env = os.getenv('CORS_ALLOWED_ORIGINS', '')
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(',') if o.strip()]
+CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False').lower() in ('true', '1', 'yes')
+CORS_ALLOW_CREDENTIALS = True
+
 INSTALLED_APPS = [
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.staticfiles',
+    'corsheaders',
     'rest_framework',
     'analyzer',
     'qa',
@@ -42,6 +51,7 @@ MIDDLEWARE = [
     'config.middleware.HealthCheckMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
 ]
 

@@ -20,4 +20,5 @@ gevent==24.2.1
 whitenoise==6.8.2
 psycopg2-binary==2.9.11
 dj-database-url==2.1.0
+django-cors-headers==4.6.0
 python-pptx==1.0.2

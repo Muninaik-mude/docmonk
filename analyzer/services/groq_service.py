@@ -19,6 +19,8 @@ from django.conf import settings
 
 # Matches a leading numbering prefix like "3.1 ", "7.10 ", "2.3.1 ", "6. ", "1) "
 _NUM_PREFIX_RE = re.compile(r'^(\d+(?:\.\d+)*[\s.):]+)')
+# Matches a bullet + numbering prefix like "• 2. ", "* 3.1 "
+_BULLET_NUM_PREFIX_RE = re.compile(r'^([•\*\-·]\s*)(\d+(?:\.\d+)*[\s.):]+)')
 
 logger = logging.getLogger(__name__)
 
@@ -360,7 +362,7 @@ Respond in this EXACT JSON format:
     "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
     "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
     "relevant_text": "the verbatim sentence(s) or paragraph(s) you located in the document for this clause topic — copied exactly as they appear including any numbering prefix (e.g. '3.1 Fees:') — or null if not found",
-    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — look at relevant_text and find the numbering prefix: (a) if relevant_text starts directly with a number (e.g. '2. Monthly Rent' or '3.1 Fees'), begin ai_recommendation with that exact number prefix; (b) if relevant_text starts with a bullet (•, *, -) followed by a number (e.g. '• 2. Monthly Rent'), skip the bullet and begin ai_recommendation with the number prefix only (e.g. '2. Monthly Rent ...'); (c) if relevant_text has no numbering at all, do NOT add any number prefix. If MATCH: null",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause title and content only — do NOT invent or add any numbering or sequence prefix. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — copy the EXACT leading prefix from relevant_text character-for-character: (a) if relevant_text starts directly with a number (e.g. '2. Monthly Rent'), begin ai_recommendation with that exact number prefix; (b) if relevant_text starts with a bullet followed by a number (e.g. '• 2. Monthly Rent'), begin ai_recommendation with the EXACT same bullet and number (e.g. '• 2. Monthly Rent ...') — do NOT drop the bullet; (c) if relevant_text has no numbering at all, do NOT add any prefix. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
     "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000", "no commencement date specified"] or [],
     "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",
@@ -467,9 +469,20 @@ def _fix_recommendation_prefix(relevant_text: str | None, recommendation: str | 
     rel = relevant_text.lstrip()
     rec = recommendation.lstrip()
 
+    # Case: bullet + number prefix (e.g. "• 2. Monthly Rent")
+    m_bullet = _BULLET_NUM_PREFIX_RE.match(rel)
+    if m_bullet:
+        bullet = m_bullet.group(1)      # e.g. "• "
+        num    = m_bullet.group(2)      # e.g. "2. "
+        full_prefix = bullet + num      # e.g. "• 2. "
+        # Strip any spurious bullet or number the AI may have added, then prepend the correct prefix
+        rec_clean = re.sub(r'^[•\*\-·]\s*', '', rec).lstrip()
+        rec_clean = _NUM_PREFIX_RE.sub('', rec_clean, count=1).lstrip()
+        return full_prefix + rec_clean
+
+    # Case: plain number prefix (e.g. "2. Monthly Rent")
     m_rel = _NUM_PREFIX_RE.match(rel)
     if m_rel:
-        # relevant_text has a numbering prefix — ensure recommendation starts with it
         prefix = m_rel.group(1)
         if not rec.startswith(prefix.rstrip()):
             return prefix + rec
