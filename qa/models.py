@@ -23,7 +23,6 @@ class QADocument(models.Model):
     # Used to resolve page_hint for answers. Empty for TXT/DOCX.
     char_page_map     = models.JSONField(default=list)
     created_at        = models.DateTimeField(auto_now_add=True)
-    updated_at        = models.DateTimeField(auto_now=True)
 
     if TYPE_CHECKING:
         session_links: "RelatedManager[QASessionDocument]"
