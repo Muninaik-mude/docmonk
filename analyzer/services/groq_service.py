@@ -80,7 +80,7 @@ def _build_provider_pool() -> list:
                 "name":   f"groq_{slot}",
                 "client": OpenAI(
                     api_key=key,
-                    base_url="https://api.groq.com/openai/v1",
+                    base_url="https://api.cerebras.ai/v1",
                     max_retries=0,
                     timeout=60.0,
                 ),
@@ -360,7 +360,7 @@ Respond in this EXACT JSON format:
     "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
     "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
     "relevant_text": "the verbatim sentence(s) or paragraph(s) you located in the document for this clause topic — copied exactly as they appear including any numbering prefix (e.g. '3.1 Fees:') — or null if not found",
-    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — if relevant_text literally starts with a numbering prefix such as '3.1', '7.10', '2.3', '1)', then begin ai_recommendation with that exact same prefix; if relevant_text starts with a bullet (•, *, -) or any non-digit character, do NOT add any number prefix. If MATCH: null",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause as it should appear. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — look at relevant_text and find the numbering prefix: (a) if relevant_text starts directly with a number (e.g. '2. Monthly Rent' or '3.1 Fees'), begin ai_recommendation with that exact number prefix; (b) if relevant_text starts with a bullet (•, *, -) followed by a number (e.g. '• 2. Monthly Rent'), skip the bullet and begin ai_recommendation with the number prefix only (e.g. '2. Monthly Rent ...'); (c) if relevant_text has no numbering at all, do NOT add any number prefix. If MATCH: null",
     "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
     "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000", "no commencement date specified"] or [],
     "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",

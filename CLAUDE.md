@@ -87,7 +87,7 @@ qa/
 
 ### AI Provider Pool
 
-`groq_service.py` maintains a pool of 4 clients (Groq key 1, Groq key 2, Cerebras key 1, Cerebras key 2). Calls round-robin across available clients. Includes JSON repair logic for truncated responses and intelligent 5,000-char context window excerpt selection.
+`groq_service.py` maintains a pool of 4 clients (Groq key 1, Groq key 2, Cerebras key 1, Cerebras key 2). Calls round-robin across available clients. Includes JSON repair logic for truncated responses, intelligent 5,000-char context window selection, and AI-powered relevant excerpt extraction (`extract_relevant_excerpt`).
 
 **Conflict detection** (`groq_service.detect_conflicts`) is implemented but intentionally NOT called — too expensive per request. Will be wired in on demand.
 
@@ -209,10 +209,13 @@ Re-run only FAILED/PENDING clauses. Uses `full_text` stored in DB — no re-down
 ### Ask flow (`POST /v1/qa/sessions/{id}/ask`)
 1. Load session + document via `prefetch_related`
 2. `qa_service.find_relevant_window(question, full_text)` — 5000-char sliding window keyword scan
-3. `groq_service.answer_question_stream(question, context)` — yields text chunks
-4. View wraps each chunk as SSE `data:` event and flushes immediately
-5. After all chunks: save `QAMessage` atomically, auto-name session from first question
-6. Emit `event: done` on success, `event: partial` if stream cut short, `event: error` if DB save failed
+3. Fetch last 10 Q&A exchanges as conversation history (oldest first) — passed to AI for multi-turn context
+4. `groq_service.answer_question_stream(question, context, history)` — yields text chunks
+5. View wraps each chunk as SSE `data:` event and flushes immediately
+6. After all chunks: `groq_service.extract_relevant_excerpt(question, context)` — AI extracts verbatim relevant passage from context (offloaded to gevent threadpool)
+7. `qa_service.find_page_for_excerpt(relevant_excerpt, full_text, char_page_map)` — resolves 1-based page number
+8. Save `QAMessage` atomically, auto-name session from first question
+9. Emit `event: done` on success, `event: partial` if stream cut short, `event: error` if DB save failed
 
 ### Retry / Regenerate
 - **Retry**: re-runs AI only for answers with `status in ("failed", "partial")`, merges results back

@@ -11,8 +11,13 @@
 # calls. Every Groq token chunk would block the entire worker thread instead of
 # yielding cooperatively, defeating the purpose of gevent workers.
 try:
+    import threading
     from gevent import monkey
-    monkey.patch_all()
+    # Only patch when running in the main thread (gunicorn).
+    # Django's runserver loads wsgi.py in a non-main thread, and
+    # monkey-patching there causes RuntimeError / lock corruption.
+    if threading.current_thread() is threading.main_thread():
+        monkey.patch_all()
 except ImportError:
     # Dev environment without gevent installed — sync workers, no-op.
     pass
