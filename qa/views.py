@@ -19,8 +19,18 @@ from django.db import transaction, IntegrityError
 from django.db.models import Count, Prefetch
 from django.http import StreamingHttpResponse
 from rest_framework import status
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+
+class ServerSentEventRenderer(BaseRenderer):
+    """Passthrough renderer for SSE streaming views."""
+    media_type = "text/event-stream"
+    format     = "txt"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return data
 
 from analyzer.services import pdf_service, r2_service
 from analyzer.serializers import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
@@ -499,6 +509,7 @@ class QAAskView(APIView):
     Ask a single question. Streams the markdown answer via SSE.
     Saves the message to DB after streaming completes.
     """
+    renderer_classes = [ServerSentEventRenderer, JSONRenderer]
 
     def post(self, request, session_id):
         try:
@@ -551,6 +562,7 @@ class QAMessageRetryView(APIView):
     Re-runs AI for failed answers in a message (SSE streaming).
     Only failed answers are retried; successful ones are preserved.
     """
+    renderer_classes = [ServerSentEventRenderer, JSONRenderer]
 
     def post(self, request, message_id):
         try:
@@ -608,6 +620,7 @@ class QARegenerateView(APIView):
     Body: {"reason": "Answer was too vague."}
     Always regenerates the first (only) document's answer.
     """
+    renderer_classes = [ServerSentEventRenderer, JSONRenderer]
 
     def post(self, request, message_id):
         try:
