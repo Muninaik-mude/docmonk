@@ -56,6 +56,7 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     parties = PartiesSerializer(required=False)
     property = PropertySerializer(required=False)
     clauses = ClauseSerializer(many=True)
+    context = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
 
     def validate(self, attrs):
         doc_url = attrs.get("document_presigned_url") or attrs.get("pdf_presigned_url")

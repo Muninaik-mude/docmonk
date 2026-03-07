@@ -54,7 +54,9 @@ def _fallback_ai_result(clause: dict, error: Exception) -> dict:
     }
 
 
-def _analyze_single_clause_with_db(clause_db_id: str, clause: dict, full_text: str) -> dict:
+def _analyze_single_clause_with_db(
+    clause_db_id: str, clause: dict, full_text: str, context: str = ""
+) -> dict:
     """
     Analyze one clause and persist state transitions to DB.
     Called inside ThreadPoolExecutor — uses close_old_connections() for thread safety.
@@ -68,7 +70,7 @@ def _analyze_single_clause_with_db(clause_db_id: str, clause: dict, full_text: s
     )
 
     try:
-        ai_result = groq_service.analyze_clause_against_pdf(clause, full_text)
+        ai_result = groq_service.analyze_clause_against_pdf(clause, full_text, context=context)
         result_status = ai_result.get("result", "NOT_FOUND")
         color = _STATUS_COLOR.get(result_status, "")
 
@@ -145,6 +147,7 @@ class ClauseAnalyzerView(APIView):
         doc_b64: str | None = validated_data.get("document_base64")
         doc_filename = validated_data.get("document_filename", "document.pdf")
         clauses      = validated_data["clauses"]
+        context      = validated_data.get("context") or ""
 
         agreement_meta = {
             "agreement_type":    validated_data.get("agreement_type", ""),
@@ -167,6 +170,7 @@ class ClauseAnalyzerView(APIView):
                 parties=agreement_meta["parties"],
                 property_details=agreement_meta["property"],
                 total_clauses=len(clauses),
+                context=context,
             )
             for i, clause in enumerate(clauses):
                 jc = JobClause.objects.create(
@@ -278,6 +282,7 @@ class ClauseAnalyzerView(APIView):
                     str(clause_db_map[clause["id"]].id),
                     clause,
                     full_text,
+                    context,
                 ): idx
                 for idx, clause in enumerate(clauses)
             }

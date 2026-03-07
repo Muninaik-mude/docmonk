@@ -516,13 +516,17 @@ def _parse_response(response_text: str) -> dict:
     return result
 
 
-def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
+def analyze_clause_against_pdf(clause: dict, pdf_text: str, *, context: str = "") -> dict:
     """
     Analyze clause compliance in a single AI call.
 
     The full document text is passed directly — the AI extracts the relevant
     text and performs compliance analysis in one shot, returning both
     relevant_text and the compliance verdict in a single JSON response.
+
+    context: optional user-supplied context about the document (e.g. party names,
+             agreement purpose, jurisdiction background). Injected into the prompt
+             when provided so the AI has richer background for analysis.
 
     Uses the shared multi-provider pool (round-robin, rate-limit aware).
 
@@ -532,11 +536,18 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str) -> dict:
     title   = clause["title"]
     content = clause["value"]
 
+    user_content = USER_PROMPT_TEMPLATE.format(
+        title=title, content=content, pdf_text=pdf_text,
+    )
+    if context and context.strip():
+        user_content = (
+            f"ADDITIONAL CONTEXT (background information about this document provided by the user):\n"
+            f"{context.strip()}\n\n"
+        ) + user_content
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(
-            title=title, content=content, pdf_text=pdf_text,
-        )},
+        {"role": "user",   "content": user_content},
     ]
 
     try:

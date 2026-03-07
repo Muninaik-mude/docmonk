@@ -34,6 +34,9 @@ class AnalysisJob(models.Model):
     # Extracted text stored for RESUME — avoids re-downloading the document
     full_text = models.TextField(blank=True, default="")
 
+    # Optional user-supplied context about the document (passed to AI during clause analysis)
+    context = models.TextField(blank=True, default="")
+
     # Agreement metadata
     agreement_type    = models.CharField(max_length=500, blank=True, default="")
     agreement_details = models.JSONField(default=dict)

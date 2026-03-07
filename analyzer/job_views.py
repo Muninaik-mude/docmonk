@@ -102,7 +102,9 @@ def _reconstruct_conflicts(job: AnalysisJob) -> list:
     ]
 
 
-def _analyze_clause_for_resume(clause_db_id: str, clause_dict: dict, full_text: str) -> dict:
+def _analyze_clause_for_resume(
+    clause_db_id: str, clause_dict: dict, full_text: str, context: str = ""
+) -> dict:
     """
     Resume variant of the thread worker. Identical to the main one but imported
     here to keep job_views self-contained (avoids import cycles).
@@ -115,7 +117,7 @@ def _analyze_clause_for_resume(clause_db_id: str, clause_dict: dict, full_text: 
     )
 
     try:
-        ai_result     = groq_service.analyze_clause_against_pdf(clause_dict, full_text)
+        ai_result     = groq_service.analyze_clause_against_pdf(clause_dict, full_text, context=context)
         result_status = ai_result.get("result", "NOT_FOUND")
         color         = _STATUS_COLOR.get(result_status, "")
 
@@ -276,6 +278,7 @@ class JobResumeView(APIView):
             )
 
         full_text = job.full_text
+        context   = job.context
         logger.info(
             "Resuming job %s — retrying %d failed clause(s)",
             job_id, failed_clauses_qs.count(),
@@ -296,6 +299,7 @@ class JobResumeView(APIView):
                     {"id": jc.clause_ref_id, "title": jc.title, "value": jc.value,
                      "category": jc.category},
                     full_text,
+                    context,
                 ): jc
                 for jc in failed_list
             }
