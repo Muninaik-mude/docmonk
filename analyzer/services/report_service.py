@@ -112,18 +112,14 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
         reason       = entry.get("reason", "") or ""
 
         if result == "VIOLATION":
-            key = rt or clause_title
+            key = rt or cc or clause_title
             if key:
                 violation_map[key] = (ai_text, reason)
-            if clause_title and clause_title not in violation_map:
-                violation_map[clause_title] = (ai_text, reason)
 
         elif result == "PARTIALLY_SATISFIED":
-            key = rt or clause_title
+            key = rt or cc or clause_title
             if key:
                 partial_map[key] = (ai_text, reason)
-            if clause_title and clause_title not in partial_map:
-                partial_map[clause_title] = (ai_text, reason)
 
         elif result == "NOT_FOUND":
             if ai_text:
@@ -135,11 +131,14 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
                 match_set.append(key)
 
     _junk       = re.compile(r'^[\d\.\-_\s\u2022\u00b7\u25cf\u25cb\u25cc\u25e6\*]+$')
-    _num_prefix = re.compile(r'^[\*\s]*\d+[\.\)]\\s*(?:[A-Z][A-Za-z ,&]+:\\s*)?')
+    _num_prefix = re.compile(r'^[\s\u2022\u00b7\u25cf\u25cb\u25cc\u25e6\*\-]*\d+[\.\)]\s*')
     _md_bullet  = re.compile(r'^\*\s+')
     _md_heading = re.compile(r'^#+\s*')
     _table_line = re.compile(r'^\|.+\|$')
     _table_sep  = re.compile(r'^\|[\s\-:|\\+]+\|$')
+    _punct_re   = re.compile(r'[^\w\s]')
+    _ws_re      = re.compile(r'\s+')
+    _html_tag   = re.compile(r'<[^>]+>')
 
     def _clean_display(s: str) -> str:
         s = _md_bullet.sub('&nbsp;&nbsp;&nbsp;&nbsp;\u2022 ', s).replace('\\.', '.')
@@ -147,19 +146,39 @@ def _build_inline_segments(full_text: str, analysis_summary: list) -> list:
             s = '<b>' + _md_heading.sub('', s) + '</b>'
         return s
 
+    def _normalize(s: str) -> str:
+        """Strip HTML tags, bullets/numbering, punctuation, collapse whitespace, lowercase."""
+        s = _html_tag.sub(' ', s)
+        s = _num_prefix.sub('', s.lstrip())
+        s = _punct_re.sub(' ', s)
+        return _ws_re.sub(' ', s).strip().lower()
+
     def _line_matches(s: str, key: str) -> bool:
         if not key or not s:
             return False
+
+        # Pass 1 — exact substring (case-sensitive, then case-insensitive)
         if key in s or s in key:
             return True
-        s_lower, key_lower = s.lower(), key.lower()
-        if key_lower in s_lower or s_lower in key_lower:
+        sl, kl = s.lower(), key.lower()
+        if kl in sl or sl in kl:
             return True
-        clean = _num_prefix.sub('', s).strip()
-        if clean and len(clean) > 6 and (clean in key or key in clean):
+
+        # Pass 2 — normalize both sides: strip bullets/numbering/punctuation, lowercase
+        sn, kn = _normalize(s), _normalize(key)
+        if sn and kn and (kn in sn or sn in kn):
             return True
-        if clean and len(clean) > 6 and (clean.lower() in key_lower or key_lower in clean.lower()):
-            return True
+
+        # Pass 3 — word overlap >= 80% on normalized strings
+        # relevant_text was extracted FROM this document — if AI rephrased slightly,
+        # word overlap guarantees we still locate it in the right place.
+        if sn and kn and len(sn) > 15 and len(kn) > 15:
+            sw, kw = set(sn.split()), set(kn.split())
+            shorter = sw if len(sw) <= len(kw) else kw
+            longer  = sw if len(sw) >  len(kw) else kw
+            if shorter and len(shorter & longer) / len(shorter) >= 0.80:
+                return True
+
         return False
 
     segments = []
@@ -402,54 +421,26 @@ def _md_agreement_block(agreement_meta: dict) -> list:
 
 _MD_DIFF_CSS = """\
 <style>
-.diff-container { font-family: 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; color: #000000 !important; background: #ffffff; padding: 16px; }
-.diff-group { border-radius: 6px; margin: 12px 0; overflow: visible; position: relative; }
-.diff-line { display: flex; align-items: flex-start; padding: 6px 10px; color: #000000 !important; }
-.diff-line .gutter { flex: 0 0 24px; font-weight: bold; text-align: center; }
-.diff-line .line-content { flex: 1; color: #000000 !important; }
-
-/* Reason info icon — top-right corner of each group */
+/* Reason info icon */
 .reason-icon {
-  position: absolute; top: 6px; right: 8px;
-  width: 20px; height: 20px; border-radius: 50%;
-  background: #6c757d; color: #fff !important;
-  font-size: 12px; font-weight: bold; font-style: normal;
   display: inline-flex; align-items: center; justify-content: center;
-  cursor: pointer; z-index: 2; flex-shrink: 0;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #6c757d; color: #fff !important;
+  font-size: 11px; font-weight: bold; font-style: normal;
+  text-decoration: none !important;
+  cursor: pointer; margin-left: 6px; vertical-align: middle;
+  position: relative; z-index: 2; flex-shrink: 0;
 }
 .reason-icon:hover { background: #495057; }
 .reason-icon .reason-tooltip {
-  display: none; position: absolute; top: 28px; right: 0;
-  background: #212529; color: #fff !important; padding: 10px 20px;
+  display: none; position: absolute; top: 24px; right: 0;
+  background: #212529; color: #fff !important; padding: 10px 14px;
   border-radius: 6px; font-size: 12px; font-weight: normal;
-  white-space: normal; width: 500px; line-height: 1.3;
+  white-space: normal; width: 440px; line-height: 1.4;
   box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 10;
+  text-decoration: none !important;
 }
 .reason-icon:hover .reason-tooltip { display: block; }
-
-/* Violation (modified) — deleted = red, added = green */
-.diff-group[data-type="modified"] .diff-line.deleted { background-color: #fde8e8; }
-.diff-group[data-type="modified"] .diff-line.deleted .gutter { color: #dc3545 !important; }
-.diff-group[data-type="modified"] .diff-line.deleted .old-text { color: #6b1015 !important; text-decoration: line-through; }
-.diff-group[data-type="modified"] .diff-line.added { background-color: #d4edda; }
-.diff-group[data-type="modified"] .diff-line.added .gutter { color: #28a745 !important; }
-.diff-group[data-type="modified"] .diff-line.added .line-content { color: #155724 !important; }
-
-/* Partially satisfied — deleted = orange, added = green */
-.diff-group[data-type="partial"] .diff-line.deleted { background-color: #fff3cd; }
-.diff-group[data-type="partial"] .diff-line.deleted .gutter { color: #fd7e14 !important; }
-.diff-group[data-type="partial"] .diff-line.deleted .old-text { color: #856404 !important; text-decoration: line-through; }
-.diff-group[data-type="partial"] .diff-line.added { background-color: #d4edda; }
-.diff-group[data-type="partial"] .diff-line.added .gutter { color: #28a745 !important; }
-.diff-group[data-type="partial"] .diff-line.added .line-content { color: #155724 !important; }
-
-/* Not found — new clause = blue */
-.diff-group[data-type="new"] .diff-line.new-clause { background-color: #e8f0fe; }
-.diff-group[data-type="new"] .diff-line.new-clause .gutter { color: #0d6efd !important; }
-.diff-group[data-type="new"] .diff-line.new-clause .line-content { color: #0a3577 !important; }
-
-/* Unchanged — match and normal: no bg, pure black text */
-.diff-group[data-type="unchanged"] .diff-line .line-content { color: #000000 !important; }
 
 /* Tables */
 .doc-table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
@@ -475,7 +466,54 @@ def generate_markdown_report(
     Inside: .diff-line.deleted / .added / .new-clause / .unchanged
     """
     segments = _build_inline_segments(full_text, analysis_summary)
-    lines = [_MD_DIFF_CSS, '<div class="diff-container">', ""]
+    lines = [_MD_DIFF_CSS]
+
+    # ── Extract document base style and heading span style from full_text ─────
+    _outer_div_re  = re.compile(r'<div\s+style="([^"]*)"')
+    _heading_sp_re = re.compile(r'<span\s+style="([^"]+)">\s*\d+[\.\)][^<]+</span>')
+    _section_re    = re.compile(r'^\d+[\.\)]\s+\S')
+
+    doc_base_style    = ""
+    doc_heading_style = ""
+    if full_text:
+        m = _outer_div_re.search(full_text)
+        if m:
+            doc_base_style = m.group(1)
+        m = _heading_sp_re.search(full_text)
+        if m:
+            doc_heading_style = m.group(1)
+
+    # Precompute combined styles so we don't repeat string concatenation per segment
+    _ai_sugg_style = "background-color:#d4edda;padding:4px 8px;margin:2px 0;"
+    _nf_style      = "background-color:#e8f0fe;padding:8px 12px;margin:4px 0;"
+    if doc_base_style:
+        _ai_sugg_style = doc_base_style + ";" + _ai_sugg_style
+        _nf_style      = doc_base_style + ";" + _nf_style
+
+    def _format_ai_text(ai_text: str, source_html: str = "") -> str:
+        """
+        Format the AI suggestion text preserving document styling:
+        - Lines matching a numbered section pattern (e.g. "4. Rent") get wrapped
+          with the heading span style extracted from source_html (or doc_heading_style).
+        - All other lines are wrapped in <p> tags.
+        """
+        if not ai_text:
+            return ""
+        heading_style = doc_heading_style
+        if source_html:
+            m = _heading_sp_re.search(source_html)
+            if m:
+                heading_style = m.group(1)
+        parts = []
+        for line in ai_text.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if heading_style and _section_re.match(stripped):
+                parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
+            else:
+                parts.append(f'<p>{stripped}</p>')
+        return ''.join(parts)
 
     def _icon_html(reason: str) -> str:
         if not reason:
@@ -496,102 +534,181 @@ def generate_markdown_report(
         icon   = _icon_html(reason)
 
         if stype == "violation":
-            lines.append(f'<div class="diff-group" data-type="modified">')
-            lines.append(icon) if icon else None
-            lines.append('  <div class="diff-line deleted">')
-            lines.append('    <div class="gutter">&minus;</div>')
-            lines.append(f'    <div class="line-content"><span class="old-text" style="text-decoration:line-through">{text}</span></div>')
-            lines.append("  </div>")
+            ai_text = ""
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1
                 ai_text = segments[i]["text"]
-                lines.append('  <div class="diff-line added">')
-                lines.append('    <div class="gutter">+</div>')
-                lines.append(f'    <div class="line-content">{ai_text}</div>')
-                lines.append("  </div>")
-            lines.append("</div>")
-            lines.append("")
+            lines.append(
+                f'<div style="background-color:#fde8e8;position:relative;'
+                f'text-decoration:line-through;margin:2px 0;">'
+                f'{icon}{text}</div>'
+            )
+            if ai_text:
+                lines.append(
+                    f'<div style="{_ai_sugg_style}">'
+                    f'{_format_ai_text(ai_text, text)}</div>'
+                )
 
         elif stype == "partial":
-            lines.append(f'<div class="diff-group" data-type="partial">')
-            lines.append(icon) if icon else None
-            lines.append('  <div class="diff-line deleted">')
-            lines.append('    <div class="gutter">&minus;</div>')
-            lines.append(f'    <div class="line-content"><span class="old-text" style="text-decoration:line-through">{text}</span></div>')
-            lines.append("  </div>")
+            ai_text = ""
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1
                 ai_text = segments[i]["text"]
-                lines.append('  <div class="diff-line added">')
-                lines.append('    <div class="gutter">+</div>')
-                lines.append(f'    <div class="line-content">{ai_text}</div>')
-                lines.append("  </div>")
-            lines.append("</div>")
-            lines.append("")
+            lines.append(
+                f'<div style="background-color:#fff3cd;position:relative;'
+                f'text-decoration:line-through;margin:2px 0;">'
+                f'{icon}{text}</div>'
+            )
+            if ai_text:
+                lines.append(
+                    f'<div style="{_ai_sugg_style}">'
+                    f'{_format_ai_text(ai_text, text)}</div>'
+                )
 
         elif stype == "not_found_ai":
-            lines.append(f'<div class="diff-group" data-type="new">')
-            lines.append(icon) if icon else None
-            lines.append('  <div class="diff-line new-clause">')
-            lines.append('    <div class="gutter">+</div>')
-            lines.append(f'    <div class="line-content">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
-            lines.append("")
+            lines.append(
+                f'<div style="{_nf_style}">'
+                f'{icon}{_format_ai_text(text)}</div>'
+            )
 
-        elif stype == "match":
-            lines.append('<div class="diff-group" data-type="unchanged">')
-            lines.append('  <div class="diff-line normal">')
-            lines.append(f'    <div class="line-content">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
-
-        elif stype == "normal":
-            lines.append('<div class="diff-group" data-type="unchanged">')
-            lines.append('  <div class="diff-line normal">')
-            lines.append(f'    <div class="line-content">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
-
-        elif stype == "heading":
-            lines.append('<div class="diff-group" data-type="unchanged">')
-            lines.append('  <div class="diff-line normal">')
-            lines.append(f'    <div class="line-content" style="font-size:18px;font-weight:bold;color:#1a1a2e;margin-top:12px;">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
-
-        elif stype == "bullet":
-            lines.append('<div class="diff-group" data-type="unchanged">')
-            lines.append('  <div class="diff-line normal">')
-            lines.append(f'    <div class="line-content" style="padding-left:20px;">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
+        elif stype in ("match", "normal", "heading", "bullet"):
+            lines.append(text)
 
         elif stype == "ai":
-            lines.append('<div class="diff-group" data-type="modified">')
-            lines.append('  <div class="diff-line added">')
-            lines.append('    <div class="gutter">+</div>')
-            lines.append(f'    <div class="line-content">{text}</div>')
-            lines.append("  </div>")
-            lines.append("</div>")
-            lines.append("")
+            lines.append(
+                f'<div style="{_ai_sugg_style}">'
+                f'{_format_ai_text(text)}</div>'
+            )
 
         elif stype == "table":
             lines.append(text)
-            lines.append("")
 
         elif stype == "blank":
-            lines.append('<div style="height: 8px;"></div>')
+            pass  # original HTML <p> tags handle spacing naturally
 
         i += 1
 
-    lines.append("</div>")
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
 #  MARKDOWN SUMMARY (Analytics) — score, tables, jurisdiction, timeline
 # ══════════════════════════════════════════════════════════════════════════════════
+
+_SUMMARY_CSS = """\
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+.sr { font-family: 'Segoe UI', Roboto, Arial, sans-serif; font-size: 14px;
+      line-height: 1.6; color: #1a1a2e; background: #f4f6fb; padding: 24px; }
+
+/* ── Section card ── */
+.sr-card { background: #fff; border-radius: 10px; padding: 20px 24px;
+           margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+.sr-card-title { font-size: 13px; font-weight: 700; letter-spacing: .06em;
+                 text-transform: uppercase; color: #6c757d; margin-bottom: 14px;
+                 padding-bottom: 10px; border-bottom: 1px solid #e9ecef; }
+
+/* ── Header banner (score circle + report title) ── */
+.sr-header { display: flex; align-items: center; gap: 28px;
+             background: #fff; border-radius: 12px; padding: 28px 32px;
+             margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+.sr-header-text { flex: 1; }
+.sr-header-title { font-size: 22px; font-weight: 800; color: #1a1a2e; margin-bottom: 10px; }
+.sr-header-sub   { font-size: 13px; color: #6c757d; display: flex;
+                   gap: 8px; align-items: center; flex-wrap: wrap; }
+.sr-header-sub .dot { color: #ced4da; font-size: 16px; line-height: 1; }
+
+/* ── Stats row (separate cards below header) ── */
+.sr-stats-row { display: flex; gap: 12px; margin-bottom: 20px; }
+.sr-stat-card { flex: 1; background: #fff; border-radius: 10px; padding: 20px 16px;
+                text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+                border-top: 3px solid transparent; }
+.sr-stat-card.total { border-top-color: #495057; }
+.sr-stat-card.match { border-top-color: #28a745; }
+.sr-stat-card.viol  { border-top-color: #dc3545; }
+.sr-stat-card.part  { border-top-color: #fd7e14; }
+.sr-stat-card.nf    { border-top-color: #0d6efd; }
+.sr-stat-num { font-size: 32px; font-weight: 800; line-height: 1; }
+.sr-stat-lbl { font-size: 10px; font-weight: 700; letter-spacing: .06em;
+               text-transform: uppercase; margin-top: 6px; color: #6c757d; }
+.sr-stat-card.total .sr-stat-num { color: #212529; }
+.sr-stat-card.match .sr-stat-num { color: #28a745; }
+.sr-stat-card.viol  .sr-stat-num { color: #dc3545; }
+.sr-stat-card.part  .sr-stat-num { color: #fd7e14; }
+.sr-stat-card.nf    .sr-stat-num { color: #0d6efd; }
+
+/* ── Badges ── */
+.badge { display: inline-block; padding: 2px 10px; border-radius: 20px;
+         font-size: 11px; font-weight: 700; white-space: nowrap; }
+.badge-match   { background: #d4edda; color: #155724; }
+.badge-viol    { background: #fde8e8; color: #7b0d14; }
+.badge-part    { background: #fff3cd; color: #7d4e00; }
+.badge-nf      { background: #e8f0fe; color: #0a3577; }
+.badge-req     { background: #fde8e8; color: #7b0d14; }
+.badge-opt     { background: #e9ecef; color: #495057; }
+.badge-high    { background: #fde8e8; color: #7b0d14; }
+.badge-medium  { background: #fff3cd; color: #7d4e00; }
+.badge-low     { background: #d4edda; color: #155724; }
+
+/* ── Tables ── */
+.sr-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.sr-table th { background: #f8f9fa; font-weight: 700; font-size: 11px;
+               letter-spacing: .05em; text-transform: uppercase; color: #6c757d;
+               padding: 10px 12px; text-align: left; border-bottom: 2px solid #e9ecef; }
+.sr-table td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0;
+               vertical-align: top; }
+.sr-table tr:last-child td { border-bottom: none; }
+.sr-table tr:hover td { background: #fafbff; }
+
+/* ── Critical issues ── */
+.sr-flag { border-left: 4px solid #dc3545; padding: 10px 14px;
+           background: #fffafa; border-radius: 0 6px 6px 0; margin-bottom: 10px; }
+.sr-flag.nf { border-left-color: #0d6efd; background: #f5f8ff; }
+.sr-flag-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+.sr-flag-reason { font-size: 12px; color: #555; line-height: 1.5; }
+
+/* ── Progress bar ── */
+.sr-bar-wrap { background: #e9ecef; border-radius: 4px; height: 6px;
+               margin-top: 6px; overflow: hidden; }
+.sr-bar      { height: 6px; border-radius: 4px; background: #28a745; }
+
+/* ── Checklist ── */
+.sr-check-item { display: flex; justify-content: space-between;
+                 align-items: center; padding: 9px 0;
+                 border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+.sr-check-item:last-child { border-bottom: none; }
+
+/* ── Meta pills ── */
+.sr-meta { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.sr-meta-pill { background: #f0f4ff; border: 1px solid #d0dcff; border-radius: 20px;
+                padding: 3px 12px; font-size: 12px; color: #1a3a8f; font-weight: 500; }
+
+/* ── Timeline ── */
+.sr-tl-clause { font-weight: 600; font-size: 13px; }
+.sr-tl-item   { font-size: 12px; color: #495057; }
+
+/* ── Section header ── */
+.sr-section-hdr { font-size: 15px; font-weight: 700; color: #1a1a2e;
+                  margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+.sr-section-hdr::before { content: ''; display: inline-block; width: 4px;
+                           height: 18px; border-radius: 2px; background: currentColor;
+                           opacity: .35; }
+</style>
+"""
+
+
+def _badge(result: str) -> str:
+    cls = {"MATCH": "badge-match", "VIOLATION": "badge-viol",
+           "PARTIALLY_SATISFIED": "badge-part", "NOT_FOUND": "badge-nf"}.get(result, "badge-opt")
+    label = {"MATCH": "Match", "VIOLATION": "Violation",
+              "PARTIALLY_SATISFIED": "Partial", "NOT_FOUND": "Not Found"}.get(result, result)
+    return f'<span class="badge {cls}">{label}</span>'
+
+
+def _risk_badge(level: str) -> str:
+    cls = {"HIGH": "badge-high", "MEDIUM": "badge-medium", "LOW": "badge-low"}.get(level, "badge-opt")
+    return f'<span class="badge {cls}">{level}</span>'
+
 
 def generate_markdown_summary(
     analysis_summary: list,
@@ -601,8 +718,9 @@ def generate_markdown_summary(
     full_text: str = "",
     agreement_meta: dict = None,
 ) -> str:
-    """Generate a Markdown analytics summary — score, tables, jurisdiction, timeline."""
+    """Generate a premium HTML analytics summary — score, tables, jurisdiction, timeline."""
     jurisdiction_info = jurisdiction_info or {}
+    agreement_meta    = agreement_meta or {}
 
     match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
     violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
@@ -612,11 +730,11 @@ def generate_markdown_summary(
     compliance_score = round((match_count / total) * 100) if total else 0
 
     if compliance_score >= 80:
-        score_status = "Compliant"
+        score_status, score_color, score_bg = "Compliant",       "#28a745", "#d4edda"
     elif compliance_score >= 50:
-        score_status = "Needs Attention"
+        score_status, score_color, score_bg = "Needs Attention", "#fd7e14", "#fff3cd"
     else:
-        score_status = "Critical"
+        score_status, score_color, score_bg = "Critical",        "#dc3545", "#fde8e8"
 
     category_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "compliant": 0, "issues": 0})
     for entry in analysis_summary:
@@ -627,90 +745,187 @@ def generate_markdown_summary(
         else:
             category_stats[cat]["issues"] += 1
 
-    lines = [
-        "## Summary",
-        "",
-        f"**Overall Compliance Score: {compliance_score}% — {score_status}**",
-        "",
-        "| Total | Match | Violation | Partial | Not Found |",
-        "|:---:|:---:|:---:|:---:|:---:|",
-        f"| **{total}** | **{match_count}** | **{violation_count}** | **{partial_count}** | **{not_found_count}** |",
-        "",
-    ]
+    h = [_SUMMARY_CSS, '<div class="sr">']
 
-    # ── Red Flag Summary ──────────────────────────────────────────────────────
-    lines += ["## Critical Issues Requiring Immediate Attention", ""]
+    # ── Agreement meta header ─────────────────────────────────────────────────
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+    parties   = agreement_meta.get("parties") or {}
+    if agmt_type or agmt_det or parties:
+        h.append('<div class="sr-card">')
+        if agmt_type:
+            h.append(f'<div style="font-size:18px;font-weight:800;color:#1a1a2e;margin-bottom:10px;">{agmt_type}</div>')
+        pills = []
+        if agmt_det.get("agreement_date"):
+            pills.append(agmt_det["agreement_date"])
+        place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
+        if place:
+            pills.append(place)
+        landlord = (parties.get("landlord") or {}).get("name", "")
+        tenant   = (parties.get("tenant") or {}).get("company_name") or (parties.get("tenant") or {}).get("name", "")
+        if landlord:
+            pills.append(f"Landlord: {landlord}")
+        if tenant:
+            pills.append(f"Tenant: {tenant}")
+        if pills:
+            h.append('<div class="sr-meta">')
+            for p in pills:
+                h.append(f'<span class="sr-meta-pill">{p}</span>')
+            h.append('</div>')
+        h.append('</div>')
+
+    # ── Header banner: circular score + report title ─────────────────────────
+    circ = 251.33  # 2 * pi * 40
+    dash = round(circ * compliance_score / 100, 2)
+    h.append(f'''
+<div class="sr-header">
+  <svg width="110" height="110" viewBox="0 0 100 100" style="flex-shrink:0;">
+    <circle cx="50" cy="50" r="40" fill="none" stroke="#e9ecef" stroke-width="8"/>
+    <circle cx="50" cy="50" r="40" fill="none" stroke="{score_color}" stroke-width="8"
+            stroke-dasharray="{dash} {circ}" stroke-linecap="round"
+            transform="rotate(-90 50 50)"/>
+    <text x="50" y="46" text-anchor="middle" font-size="19" font-weight="800"
+          fill="{score_color}" font-family="Segoe UI,Roboto,Arial,sans-serif">{compliance_score}%</text>
+    <text x="50" y="62" text-anchor="middle" font-size="9" font-weight="600"
+          fill="#6c757d" font-family="Segoe UI,Roboto,Arial,sans-serif" letter-spacing="0.04em">SCORE</text>
+  </svg>
+  <div class="sr-header-text">
+    <div class="sr-header-title">Compliance Analysis Report</div>
+    <div class="sr-header-sub">
+      Overall status:&nbsp;<span style="color:{score_color};font-weight:700;">{score_status}</span>
+      <span class="dot">·</span> {total} clauses reviewed
+      <span class="dot">·</span> {violation_count} violation{"s" if violation_count != 1 else ""} found
+    </div>
+  </div>
+</div>''')
+
+    # ── Stats row ─────────────────────────────────────────────────────────────
+    h.append('<div class="sr-stats-row">')
+    for css, num, lbl in [
+        ("total", total,           "Total"),
+        ("match", match_count,     "Match"),
+        ("viol",  violation_count, "Violation"),
+        ("part",  partial_count,   "Partial"),
+        ("nf",    not_found_count, "Not Found"),
+    ]:
+        h.append(f'''
+<div class="sr-stat-card {css}">
+  <div class="sr-stat-num">{num}</div>
+  <div class="sr-stat-lbl">{lbl}</div>
+</div>''')
+    h.append('</div>')  # sr-stats-row
+
+    # ── Critical Issues ───────────────────────────────────────────────────────
     red_flags = [e for e in analysis_summary if e["result"] == "VIOLATION"]
     red_flags += [e for e in analysis_summary if e["result"] == "NOT_FOUND"]
-    red_flags = red_flags[:3]
-    if not red_flags:
-        lines.append("No critical issues found.")
-    else:
-        lines += [
-            "| Clause | Status | Issue |",
-            "|:---|:---:|:---|",
-        ]
+    if red_flags:
+        h.append('<div class="sr-card">')
+        h.append('<div class="sr-card-title">Critical Issues Requiring Immediate Attention</div>')
         for flag in red_flags:
-            lines.append(f"| {flag['clause_title']} | **{flag['result']}** | {flag.get('reason', '')} |")
-    lines += ["", "---", ""]
+            css_extra = " nf" if flag["result"] == "NOT_FOUND" else ""
+            reason = (flag.get("reason") or "").replace("<", "&lt;").replace(">", "&gt;")
+            h.append(f'''
+<div class="sr-flag{css_extra}">
+  <div class="sr-flag-title">{flag["clause_title"]} &nbsp; {_badge(flag["result"])}</div>
+  <div class="sr-flag-reason">{reason}</div>
+</div>''')
+        h.append('</div>')
+
+    # ── Full Clause Results ───────────────────────────────────────────────────
+    h.append('<div class="sr-card">')
+    h.append('<div class="sr-card-title">All Clause Results</div>')
+    h.append('<table class="sr-table"><thead><tr>')
+    h.append('<th>#</th><th>Clause</th><th>Category</th><th>Status</th><th>Finding</th>')
+    h.append('</tr></thead><tbody>')
+    for i, entry in enumerate(analysis_summary, 1):
+        reason = (entry.get("reason") or "").replace("<", "&lt;").replace(">", "&gt;")
+        cat, _ = _get_risk_info(entry.get("clause_title", ""))
+        h.append(f'''<tr>
+  <td style="color:#adb5bd;font-size:12px;">{i}</td>
+  <td style="font-weight:600;">{entry["clause_title"]}</td>
+  <td style="font-size:12px;color:#6c757d;">{cat}</td>
+  <td>{_badge(entry["result"])}</td>
+  <td style="font-size:12px;color:#555;">{reason}</td>
+</tr>''')
+    h.append('</tbody></table></div>')
 
     # ── Risk Category Breakdown ───────────────────────────────────────────────
-    lines += [
-        "## Risk Category Breakdown",
-        "",
-        "| Category | Risk Level | Total | Compliant | Issues |",
-        "|:---|:---:|:---:|:---:|:---:|",
-    ]
+    h.append('<div class="sr-card">')
+    h.append('<div class="sr-card-title">Risk Category Breakdown</div>')
+    h.append('<table class="sr-table"><thead><tr>')
+    h.append('<th>Category</th><th>Risk Level</th><th>Total</th><th>Compliant</th><th>Issues</th><th>Pass Rate</th>')
+    h.append('</tr></thead><tbody>')
     for cat in CATEGORY_ORDER:
         if cat not in category_stats:
             continue
         risk_lv, _ = _CATEGORY_RISK_LEVEL[cat]
         s = category_stats[cat]
-        lines.append(
-            f"| {cat} | {risk_lv} | {s['total']} | {s['compliant']} | {s['issues']} |"
-        )
-    lines += ["", "---", ""]
+        pass_pct = round((s["compliant"] / s["total"]) * 100) if s["total"] else 0
+        bar_color = "#28a745" if pass_pct >= 80 else "#fd7e14" if pass_pct >= 50 else "#dc3545"
+        h.append(f'''<tr>
+  <td style="font-weight:600;">{cat}</td>
+  <td>{_risk_badge(risk_lv)}</td>
+  <td style="text-align:center;">{s["total"]}</td>
+  <td style="text-align:center;color:#28a745;font-weight:700;">{s["compliant"]}</td>
+  <td style="text-align:center;color:#dc3545;font-weight:700;">{s["issues"]}</td>
+  <td style="min-width:100px;">
+    <div style="font-size:11px;font-weight:700;color:{bar_color};margin-bottom:3px;">{pass_pct}%</div>
+    <div class="sr-bar-wrap"><div class="sr-bar" style="width:{pass_pct}%;background:{bar_color};"></div></div>
+  </td>
+</tr>''')
+    h.append('</tbody></table></div>')
 
     # ── Jurisdiction & Compliance Checklist ───────────────────────────────────
-    lines += ["## Jurisdiction & Compliance Checklist", ""]
+    h.append('<div class="sr-card">')
+    h.append('<div class="sr-card-title">Jurisdiction &amp; Compliance Checklist</div>')
     if jurisdiction_info:
         juris     = jurisdiction_info.get("jurisdiction", "Unknown")
-        agmt_type = jurisdiction_info.get("agreement_type", "Unknown")
-        laws      = ", ".join(jurisdiction_info.get("applicable_laws", []))
-        lines.append(f"**Jurisdiction:** {juris}   **Agreement Type:** {agmt_type}")
+        agmt_type_j = jurisdiction_info.get("agreement_type", "")
+        laws      = jurisdiction_info.get("applicable_laws", [])
+        pills_j = [juris]
+        if agmt_type_j:
+            pills_j.append(agmt_type_j)
+        h.append('<div class="sr-meta">')
+        for p in pills_j:
+            h.append(f'<span class="sr-meta-pill">{p}</span>')
+        h.append('</div>')
         if laws:
-            lines.append(f"**Applicable Laws:** {laws}")
-        lines.append("")
+            h.append('<div style="font-size:12px;color:#6c757d;margin-bottom:12px;">')
+            h.append('<strong>Applicable Laws:</strong> ' + " &nbsp;·&nbsp; ".join(laws))
+            h.append('</div>')
         checklist = jurisdiction_info.get("checklist", [])
-        if checklist:
-            lines += [
-                "| Requirement | Status |",
-                "|:---|:---:|",
-            ]
-            for item in checklist:
-                req_label = "**Required**" if item.get("required") else "Optional"
-                lines.append(f"| {item.get('item', '')} | {req_label} |")
+        for item in checklist:
+            req     = item.get("required", False)
+            lbl_cls = "badge-req" if req else "badge-opt"
+            lbl_txt = "Required" if req else "Optional"
+            item_text = (item.get("item") or "").replace("<", "&lt;").replace(">", "&gt;")
+            h.append(f'''
+<div class="sr-check-item">
+  <span>{item_text}</span>
+  <span class="badge {lbl_cls}">{lbl_txt}</span>
+</div>''')
     else:
-        lines.append("Jurisdiction information not available.")
-    lines += ["", "---", ""]
+        h.append('<p style="color:#6c757d;font-size:13px;">Jurisdiction information not available.</p>')
+    h.append('</div>')
 
     # ── Contract Timeline ─────────────────────────────────────────────────────
-    lines += ["## Contract Timeline", ""]
     timeline_rows = [
         (entry["clause_title"], dt)
         for entry in analysis_summary
         for dt in entry.get("key_dates_durations", [])
         if dt
     ]
-    if not timeline_rows:
-        lines.append("No key dates or durations identified.")
-    else:
-        lines += [
-            "| Clause | Timeline Item |",
-            "|:---|:---|",
-        ]
+    if timeline_rows:
+        h.append('<div class="sr-card">')
+        h.append('<div class="sr-card-title">Contract Timeline &amp; Key Dates</div>')
+        h.append('<table class="sr-table"><thead><tr><th>Clause</th><th>Timeline Item</th></tr></thead><tbody>')
         for clause_title, tl_item in timeline_rows:
-            lines.append(f"| {clause_title} | {tl_item} |")
-    lines += [""]
+            tl_safe = tl_item.replace("<", "&lt;").replace(">", "&gt;")
+            h.append(f'''<tr>
+  <td class="sr-tl-clause">{clause_title}</td>
+  <td class="sr-tl-item">{tl_safe}</td>
+</tr>''')
+        h.append('</tbody></table></div>')
 
-    return "\n".join(lines)
+    h.append('</div>')  # .sr
+    return "\n".join(h)
