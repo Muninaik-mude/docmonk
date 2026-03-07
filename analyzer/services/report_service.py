@@ -470,7 +470,8 @@ def generate_markdown_report(
 
     # ── Extract document base style and heading span style from full_text ─────
     _outer_div_re  = re.compile(r'<div\s+style="([^"]*)"')
-    _heading_sp_re = re.compile(r'<span\s+style="([^"]+)">\s*\d+[\.\)][^<]+</span>')
+    # Group 1 = span style, Group 2 = heading text (e.g. "4. Rent")
+    _heading_sp_re = re.compile(r'<span\s+style="([^"]+)">\s*(\d+[\.\)][^<]+)</span>')
     _section_re    = re.compile(r'^\d+[\.\)]\s+\S')
 
     doc_base_style    = ""
@@ -500,17 +501,26 @@ def generate_markdown_report(
         if not ai_text:
             return ""
         heading_style = doc_heading_style
+        heading_text = ""
         if source_html:
             m = _heading_sp_re.search(source_html)
             if m:
                 heading_style = m.group(1)
+                heading_text = m.group(2).strip()
         parts = []
         for line in ai_text.split('\n'):
             stripped = line.strip()
             if not stripped:
                 continue
             if heading_style and _section_re.match(stripped):
-                parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
+                # If the AI concatenated heading + body on one line, split them
+                if heading_text and stripped.lower().startswith(heading_text.lower()) and len(stripped) > len(heading_text) + 2:
+                    rest = stripped[len(heading_text):].strip()
+                    parts.append(f'<p><span style="{heading_style}">{heading_text}</span></p>')
+                    if rest:
+                        parts.append(f'<p>{rest}</p>')
+                else:
+                    parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
             else:
                 parts.append(f'<p>{stripped}</p>')
         return ''.join(parts)
