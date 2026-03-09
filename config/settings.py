@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'analyzer',
     'qa',
+    'policy',
 ]
 
 MIDDLEWARE = [
@@ -137,6 +138,11 @@ LOGGING = {
             'propagate': False,
         },
         'qa': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'policy': {
             'handlers': ['console'],
             'level': 'INFO',
             'propagate': False,

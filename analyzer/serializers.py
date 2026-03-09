@@ -55,7 +55,7 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
     agreement_details = AgreementDetailsSerializer(required=False)
     parties = PartiesSerializer(required=False)
     property = PropertySerializer(required=False)
-    clauses = ClauseSerializer(many=True)
+    clauses = ClauseSerializer(many=True, required=False, default=list)
     context = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
 
     def validate(self, attrs):
@@ -67,11 +67,15 @@ class ClauseAnalyzerSerializer(serializers.Serializer):
             )
         if doc_url:
             attrs["document_presigned_url"] = doc_url
+
+        if not attrs.get("clauses"):
+            raise serializers.ValidationError(
+                "'clauses' is required and must contain at least one clause."
+            )
+
         return attrs
 
     def validate_clauses(self, value):
-        if not value:
-            raise serializers.ValidationError("At least one clause is required.")
         if len(value) > MAX_CLAUSES:
             raise serializers.ValidationError(
                 f"Too many clauses. Maximum allowed is {MAX_CLAUSES}, you sent {len(value)}."

@@ -120,16 +120,15 @@ class ClauseAnalyzerView(APIView):
     """
     POST /api/v1/analyze
 
-    Synchronous pipeline — blocks until all clauses are analyzed and reports are generated.
-    Persists full state to DB as analysis progresses, enabling resume on partial failures.
+    Synchronous pipeline — blocks until analysis is complete and reports are generated.
+    Supports two modes based on the request payload:
 
-    New response fields vs old:
-      job_id        — UUID to track/resume this analysis
-      status        — final job state (completed | partial_failure | failed)
-      can_resume    — true when some clauses failed and can be retried
-      progress      — {total, completed, failed} clause counts
-      analysis_summary[].analysis_status  — per-clause COMPLETED | FAILED
-      analysis_summary[].retry_count      — how many times this clause was retried
+    Clause mode  (default): clauses[] provided — analyze each clause against the document.
+    Policy mode  (new):     policy_text provided — analyze the document against a policy document.
+                            In policy mode, clause analysis is skipped entirely.
+
+    Persists full state to DB as analysis progresses, enabling resume on partial failures
+    (clause mode only — policy mode never partially fails).
     """
 
     def post(self, request):
@@ -146,7 +145,7 @@ class ClauseAnalyzerView(APIView):
         doc_url: str | None = validated_data.get("document_presigned_url")
         doc_b64: str | None = validated_data.get("document_base64")
         doc_filename = validated_data.get("document_filename", "document.pdf")
-        clauses      = validated_data["clauses"]
+        clauses      = validated_data.get("clauses") or []
         context      = validated_data.get("context") or ""
 
         agreement_meta = {
@@ -232,10 +231,10 @@ class ClauseAnalyzerView(APIView):
         job.status = JobStatus.EXTRACTING
         job.save(update_fields=["status", "updated_at"])
 
-        type_hint  = doc_url or doc_filename
-        file_type  = pdf_service.detect_file_type(type_hint, doc_bytes)
+        type_hint   = doc_url or doc_filename
+        file_type   = pdf_service.detect_file_type(type_hint, doc_bytes)
         text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
-        full_text  = pdf_service.get_full_text(text_blocks)
+        full_text   = pdf_service.get_full_text(text_blocks)
         logger.info("Extracted %d text blocks from %s", len(text_blocks), file_type)
 
         if not full_text.strip():
@@ -267,9 +266,14 @@ class ClauseAnalyzerView(APIView):
             checklist=jurisdiction_info.get("checklist", []),
         )
 
-        # ── Step 4: Analyze clauses in parallel ───────────────────────────────
+        # ── Step 4: Analyze clauses ────────────────────────────────────────────
         job.status = JobStatus.ANALYZING
         job.save(update_fields=["status", "updated_at"])
+
+        response_data: dict[str, Any] = {
+            "status": "success",
+            "job_id": str(job.id),
+        }
 
         # Use a dict keyed by index to avoid the list[None] invariance issue that
         # causes Pylance to report "__getitem__ not defined on None" when iterating.
@@ -342,14 +346,9 @@ class ClauseAnalyzerView(APIView):
 
         conflicts = []
 
-        # ── Step 5: Generate markdown reports ─────────────────────────────────
+        # ── Generate markdown reports ──────────────────────────────────────────
         job.status = JobStatus.GENERATING_REPORTS
         job.save(update_fields=["status", "updated_at"])
-
-        response_data: dict[str, Any] = {
-            "status": "success",
-            "job_id": str(job.id),
-        }
 
         report_kwargs: dict[str, Any] = dict(
             conflicts=conflicts,
@@ -376,7 +375,6 @@ class ClauseAnalyzerView(APIView):
             job.completed_at = timezone.now()
         job.save(update_fields=["status", "completed_at", "updated_at"])
 
-        # Enrich response with job tracking fields
         response_data["status"]     = job.status.lower()
         response_data["can_resume"] = job.status == JobStatus.PARTIAL_FAILURE
         response_data["progress"]   = {

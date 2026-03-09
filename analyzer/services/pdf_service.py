@@ -71,21 +71,59 @@ def detect_file_type(url: str, file_bytes: bytes) -> str:
 
 def extract_text_from_docx(file_bytes: bytes) -> list[dict]:
     """
-    Extract text blocks from a DOCX file.
+    Extract text blocks from a DOCX file preserving document order.
+
+    Walks the raw XML body so paragraphs AND tables are read in the order
+    they appear in the document.  Table rows are rendered as pipe-delimited
+    lines so the AI sees the cell values in a readable, structured form.
+
     Returns same format as extract_text_with_positions for compatibility:
     [{page_num, text, bbox}]
     """
-    doc = DocxDocument(io.BytesIO(file_bytes))
-    text_blocks = []
+    from docx.text.paragraph import Paragraph as DocxParagraph
+    from docx.table     import Table     as DocxTable
 
-    for i, para in enumerate(doc.paragraphs):
-        text = para.text.strip()
-        if text:
-            text_blocks.append({
-                "page_num": 0,
-                "text": text,
-                "bbox": (30, 30 + i * 20, 550, 50 + i * 20),
-            })
+    doc         = DocxDocument(io.BytesIO(file_bytes))
+    text_blocks = []
+    y_offset    = 0
+
+    for child in doc.element.body:
+        raw_tag = child.tag
+        tag     = raw_tag.split("}")[-1] if "}" in raw_tag else raw_tag
+
+        # ── Paragraph ──────────────────────────────────────────────────────
+        if tag == "p":
+            para = DocxParagraph(child, doc)
+            text = para.text.strip()
+            if text:
+                text_blocks.append({
+                    "page_num": 0,
+                    "text":     text,
+                    "bbox":     (30, y_offset, 550, y_offset + 18),
+                })
+                y_offset += 20
+
+        # ── Table ───────────────────────────────────────────────────────────
+        elif tag == "tbl":
+            table = DocxTable(child, doc)
+            for row in table.rows:
+                # Deduplicate merged cells (python-docx repeats merged cell text)
+                seen:    list[str] = []
+                seen_set: set[str] = set()
+                for cell in row.cells:
+                    cv = cell.text.strip()
+                    if cv not in seen_set:
+                        seen.append(cv)
+                        seen_set.add(cv)
+
+                row_text = " | ".join(seen)
+                if row_text.strip():
+                    text_blocks.append({
+                        "page_num": 0,
+                        "text":     row_text,
+                        "bbox":     (30, y_offset, 550, y_offset + 18),
+                    })
+                    y_offset += 20
 
     return text_blocks
 

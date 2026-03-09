@@ -442,10 +442,39 @@ def _safe_json_parse(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Strategy 3: strip trailing partial field + dangling comma, then force-close
-    stripped = text.rstrip().rstrip(",")
-    if not stripped.endswith("}"):
-        stripped += "}"
+    # Strategy 3: close all open structures
+    # Walk the text tracking string state and structure depth
+    closers = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch in closers:
+                stack.append(closers[ch])
+            elif ch in ("}", "]") and stack and stack[-1] == ch:
+                stack.pop()
+
+    stripped = text.rstrip()
+    if in_str:
+        # Truncated inside a string value — just close the string, then close structures
+        stripped += '"'
+        in_str = False
+    # Strip trailing dangling comma or incomplete key (bare word after comma)
+    stripped = stripped.rstrip(",").rstrip()
+    # If last meaningful char is a colon (incomplete value), add null
+    if stripped.endswith(":"):
+        stripped += "null"
+    # Close all open structures in reverse
+    stripped += "".join(reversed(stack))
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:

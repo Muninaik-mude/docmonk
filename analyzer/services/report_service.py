@@ -433,18 +433,18 @@ _MD_DIFF_CSS = """\
 }
 .reason-icon:hover { background: #495057; }
 .reason-icon .reason-tooltip {
-  display: none; position: absolute; top: 24px; right: 0;
+  display: none; position: absolute; top: -6px; left: calc(100% + 8px);
   background: #212529; color: #fff !important; padding: 10px 14px;
   border-radius: 6px; font-size: 12px; font-weight: normal;
-  white-space: normal; width: 440px; line-height: 1.4;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 10;
-  text-decoration: none !important;
+  white-space: normal; width: 340px; line-height: 1.4;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 9999;
+  text-decoration: none !important; pointer-events: none;
 }
 .reason-icon:hover .reason-tooltip { display: block; }
 
 /* Diff structure */
-.diff-group { margin: 2px 0; position: relative; }
-.diff-line { display: flex; align-items: baseline; }
+.diff-group { margin: 2px 0; position: relative; overflow: visible; }
+.diff-line { display: flex; align-items: baseline; overflow: visible; }
 .diff-line .gutter {
   width: 20px; flex-shrink: 0; text-align: center;
   font-weight: bold; user-select: none; padding: 4px 2px;

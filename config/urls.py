@@ -16,4 +16,5 @@ urlpatterns = [
     path('health', health),
     path('v1/', include('analyzer.urls')),
     path('v1/qa/', include('qa.urls')),
+    path('v1/policy/', include('policy.urls')),
 ]
