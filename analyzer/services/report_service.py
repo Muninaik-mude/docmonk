@@ -442,6 +442,35 @@ _MD_DIFF_CSS = """\
 }
 .reason-icon:hover .reason-tooltip { display: block; }
 
+/* Diff structure */
+.diff-group { margin: 2px 0; position: relative; }
+.diff-line { display: flex; align-items: baseline; }
+.diff-line .gutter {
+  width: 20px; flex-shrink: 0; text-align: center;
+  font-weight: bold; user-select: none; padding: 4px 2px;
+}
+.diff-line .line-content { flex: 1; padding: 4px 8px; }
+
+/* Deleted lines — violation (red) */
+.diff-line.deleted .line-content { background-color: #fde8e8; }
+.diff-line.deleted .gutter { color: #dc3545; }
+.diff-line.deleted .old-text { text-decoration: line-through; }
+
+/* Deleted lines — partial (orange) */
+.diff-group[data-type="partial"] .diff-line.deleted .line-content { background-color: #fff3cd; }
+.diff-group[data-type="partial"] .diff-line.deleted .gutter { color: #fd7e14; }
+
+/* Added lines — suggestion (green) */
+.diff-line.added .line-content { background-color: #d4edda; }
+.diff-line.added .gutter { color: #28a745; }
+
+/* Added lines — missing clause (blue) */
+.diff-group[data-type="new"] .diff-line.added .line-content { background-color: #e8f0fe; }
+.diff-group[data-type="new"] .diff-line.added .gutter { color: #0d6efd; }
+
+/* Normal / unchanged lines — no background change */
+.diff-line.normal .line-content { }
+
 /* Tables */
 .doc-table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
 .doc-table th, .doc-table td { border: 1px solid #dee2e6; padding: 8px 12px; text-align: left; }
@@ -484,12 +513,6 @@ def generate_markdown_report(
         if m:
             doc_heading_style = m.group(1)
 
-    # Precompute combined styles so we don't repeat string concatenation per segment
-    _ai_sugg_style = "background-color:#d4edda;padding:4px 8px;margin:2px 0;"
-    _nf_style      = "background-color:#e8f0fe;padding:8px 12px;margin:4px 0;"
-    if doc_base_style:
-        _ai_sugg_style = doc_base_style + ";" + _ai_sugg_style
-        _nf_style      = doc_base_style + ";" + _nf_style
 
     def _format_ai_text(ai_text: str, source_html: str = "") -> str:
         """
@@ -548,46 +571,78 @@ def generate_markdown_report(
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1
                 ai_text = segments[i]["text"]
-            lines.append(
-                f'<div style="background-color:#fde8e8;position:relative;'
-                f'text-decoration:line-through;margin:2px 0;">'
-                f'{icon}{text}</div>'
+            html = f'<div class="diff-group" data-type="modified">\n'
+            if icon:
+                html += f'{icon}\n'
+            html += (
+                f'  <div class="diff-line deleted">\n'
+                f'    <div class="gutter">&minus;</div>\n'
+                f'    <div class="line-content" style="background-color:#fde8e8;text-decoration:line-through;"><span class="old-text">{text}</span></div>\n'
+                f'  </div>\n'
             )
             if ai_text:
-                lines.append(
-                    f'<div style="{_ai_sugg_style}">'
-                    f'{_format_ai_text(ai_text, text)}</div>'
+                html += (
+                    f'  <div class="diff-line added">\n'
+                    f'    <div class="gutter">+</div>\n'
+                    f'    <div class="line-content" style="background-color:#d4edda;">{_format_ai_text(ai_text, text)}</div>\n'
+                    f'  </div>\n'
                 )
+            html += '</div>'
+            lines.append(html)
 
         elif stype == "partial":
             ai_text = ""
             if i + 1 < len(segments) and segments[i + 1]["type"] == "ai":
                 i += 1
                 ai_text = segments[i]["text"]
-            lines.append(
-                f'<div style="background-color:#fff3cd;position:relative;'
-                f'text-decoration:line-through;margin:2px 0;">'
-                f'{icon}{text}</div>'
+            html = f'<div class="diff-group" data-type="partial">\n'
+            if icon:
+                html += f'{icon}\n'
+            html += (
+                f'  <div class="diff-line deleted">\n'
+                f'    <div class="gutter">&minus;</div>\n'
+                f'    <div class="line-content" style="background-color:#fff3cd;text-decoration:line-through;"><span class="old-text">{text}</span></div>\n'
+                f'  </div>\n'
             )
             if ai_text:
-                lines.append(
-                    f'<div style="{_ai_sugg_style}">'
-                    f'{_format_ai_text(ai_text, text)}</div>'
+                html += (
+                    f'  <div class="diff-line added">\n'
+                    f'    <div class="gutter">+</div>\n'
+                    f'    <div class="line-content" style="background-color:#d4edda;">{_format_ai_text(ai_text, text)}</div>\n'
+                    f'  </div>\n'
                 )
+            html += '</div>'
+            lines.append(html)
 
         elif stype == "not_found_ai":
-            lines.append(
-                f'<div style="{_nf_style}">'
-                f'{icon}{_format_ai_text(text)}</div>'
+            html = f'<div class="diff-group" data-type="new">\n'
+            if icon:
+                html += f'{icon}\n'
+            html += (
+                f'  <div class="diff-line added">\n'
+                f'    <div class="gutter">+</div>\n'
+                f'    <div class="line-content" style="background-color:#e8f0fe;">{_format_ai_text(text)}</div>\n'
+                f'  </div>\n'
+                f'</div>'
             )
+            lines.append(html)
 
         elif stype in ("match", "normal", "heading", "bullet"):
-            lines.append(text)
+            lines.append(
+                f'<div class="diff-group" data-type="unchanged">'
+                f'<div class="diff-line normal">'
+                f'<div class="line-content">{text}</div>'
+                f'</div></div>'
+            )
 
         elif stype == "ai":
+            # orphaned ai segment (no preceding violation/partial) — render as suggestion
             lines.append(
-                f'<div style="{_ai_sugg_style}">'
-                f'{_format_ai_text(text)}</div>'
+                f'<div class="diff-group" data-type="new">'
+                f'<div class="diff-line added">'
+                f'<div class="gutter">+</div>'
+                f'<div class="line-content" style="background-color:#d4edda;">{_format_ai_text(text)}</div>'
+                f'</div></div>'
             )
 
         elif stype == "table":
@@ -598,7 +653,10 @@ def generate_markdown_report(
 
         i += 1
 
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    if doc_base_style:
+        content = f'<div style="{doc_base_style}">\n{content}\n</div>'
+    return content
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
