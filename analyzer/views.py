@@ -20,7 +20,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_PARALLEL_CLAUSES = 5
+_MAX_PARALLEL_CLAUSES = 4  # matches number of AI providers — one clause per provider at a time
 
 # Maps compliance result → color string stored in DB and returned in response
 _STATUS_COLOR = {
