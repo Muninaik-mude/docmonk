@@ -316,11 +316,11 @@ class ClauseAnalyzerView(APIView):
 
         _result_map: dict[int, dict[str, Any]] = {}
 
-        # Split clauses evenly across all 4 providers — ceil(n/4) clauses per batch.
-        # Capped at _CLAUSE_BATCH_SIZE (10) to stay within output token limits.
-        # Examples: 10 clauses → [3,3,2,2], 20 → [5,5,5,5], 50 → [10,10,10,10,10]
-        n_clauses  = len(clauses)
-        batch_size = max(1, min(math.ceil(n_clauses / _MAX_PARALLEL_CLAUSES), _CLAUSE_BATCH_SIZE))
+        # Use only as many providers as needed — no point burning extra API tokens.
+        # <10 clauses → 2 providers, <20 → 3 providers, ≥20 → all 4 providers.
+        n_clauses = len(clauses)
+        n_workers  = 2 if n_clauses < 10 else (3 if n_clauses < 20 else _MAX_PARALLEL_CLAUSES)
+        batch_size = max(1, min(math.ceil(n_clauses / n_workers), _CLAUSE_BATCH_SIZE))
         batches = [
             (i, clauses[i:i + batch_size])
             for i in range(0, n_clauses, batch_size)

@@ -516,10 +516,15 @@ def generate_markdown_report(
 
     def _format_ai_text(ai_text: str, source_html: str = "") -> str:
         """
-        Format the AI suggestion text preserving document styling:
-        - Lines matching a numbered section pattern (e.g. "4. Rent") get wrapped
-          with the heading span style extracted from source_html (or doc_heading_style).
-        - All other lines are wrapped in <p> tags.
+        Format AI suggestion text mirroring the exact structure of source_html.
+
+        Case A — heading IS in source_html (it was struck through):
+          Prepend the heading in its original styled span, then render the body.
+          If the AI also wrote the heading on the same line, skip it (already prepended).
+
+        Case B — heading NOT in source_html (separate unchanged group above):
+          Source was plain content. Strip any numbered "N. Title" prefix the AI
+          added and render only the body, matching the source style exactly.
         """
         if not ai_text:
             return ""
@@ -530,30 +535,43 @@ def generate_markdown_report(
             if m:
                 heading_style = m.group(1)
                 heading_text = m.group(2).strip()
+
         parts = []
+
+        # Case A: prepend heading in same style as original
+        if heading_text and heading_style:
+            parts.append(f'<p><span style="{heading_style}">{heading_text}</span></p>')
+
         for line in ai_text.split('\n'):
             stripped = line.strip()
             if not stripped:
                 continue
-            if heading_style and _section_re.match(stripped):
+
+            if _section_re.match(stripped):
                 if heading_text:
-                    # Source had a heading — apply heading style, split off any body text
-                    if stripped.lower().startswith(heading_text.lower()) and len(stripped) > len(heading_text) + 2:
-                        rest = stripped[len(heading_text):].strip()
-                        parts.append(f'<p><span style="{heading_style}">{heading_text}</span></p>')
+                    # Case A — AI included heading in recommendation line.
+                    # Already prepended above; extract body if concatenated on same line.
+                    if stripped.lower().startswith(heading_text.lower()):
+                        rest = stripped[len(heading_text):].strip().lstrip(':').strip()
                         if rest:
                             parts.append(f'<p>{rest}</p>')
+                        # else pure heading line — already prepended, skip
                     else:
-                        parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
+                        # Numbered content line (not a heading) — render as plain text
+                        parts.append(f'<p>{stripped}</p>')
                 else:
-                    # Source had NO heading — relevant_text was plain content.
-                    # AI incorrectly prefixed "N. Title: body" — strip the prefix,
-                    # render only the body as plain content to match source style.
+                    # Case B — source had no heading, strip the AI's prefix.
+                    # Try colon split ("N. Title: body"), else strip number+title word(s).
                     colon_pos = stripped.find(':')
-                    body = stripped[colon_pos + 1:].strip() if colon_pos > 0 else stripped
-                    parts.append(f'<p>{body}</p>')
+                    if colon_pos > 0:
+                        body = stripped[colon_pos + 1:].strip()
+                    else:
+                        # Strip "N. " number prefix
+                        body = re.sub(r'^\d+[\.\)]\s*', '', stripped).strip()
+                    parts.append(f'<p>{body}</p>' if body else '')
             else:
                 parts.append(f'<p>{stripped}</p>')
+
         return ''.join(parts)
 
     def _icon_html(reason: str) -> str:

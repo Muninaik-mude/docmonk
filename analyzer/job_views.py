@@ -240,8 +240,9 @@ class JobResumeView(APIView):
                            "value": jc.value, "category": jc.category})
             for jc in failed_list
         ]
-        n_items    = len(all_items)
-        batch_size = max(1, min(math.ceil(n_items / _MAX_PARALLEL_CLAUSES), _CLAUSE_BATCH_SIZE))
+        n_items   = len(all_items)
+        n_workers  = 2 if n_items < 10 else (3 if n_items < 20 else _MAX_PARALLEL_CLAUSES)
+        batch_size = max(1, min(math.ceil(n_items / n_workers), _CLAUSE_BATCH_SIZE))
         batches = [
             all_items[i:i + batch_size]
             for i in range(0, n_items, batch_size)
