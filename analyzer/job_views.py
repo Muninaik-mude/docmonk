@@ -6,24 +6,23 @@ POST /api/v1/jobs/{job_id}/resume — Re-run only FAILED/PENDING clauses (no re-
 """
 import base64
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from django.db import close_old_connections
-from django.db.models import F
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .services import groq_service, report_service
+from .services import report_service
 from .models import (
     AnalysisJob, JobClause, ClauseResult, JobJurisdiction,
     JobStatus, ClauseStatus,
 )
 from .views import (
-    _fallback_ai_result,
-    _STATUS_COLOR, _MAX_PARALLEL_CLAUSES,
+    _MAX_PARALLEL_CLAUSES, _CLAUSE_BATCH_SIZE,
+    _analyze_batch_with_db,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,60 +101,6 @@ def _reconstruct_conflicts(job: AnalysisJob) -> list:
     ]
 
 
-def _analyze_clause_for_resume(
-    clause_db_id: str, clause_dict: dict, full_text: str, context: str = ""
-) -> dict:
-    """
-    Resume variant of the thread worker. Identical to the main one but imported
-    here to keep job_views self-contained (avoids import cycles).
-    """
-    close_old_connections()
-
-    JobClause.objects.filter(id=clause_db_id).update(
-        status=ClauseStatus.IN_PROGRESS,
-        updated_at=timezone.now(),
-    )
-
-    try:
-        ai_result     = groq_service.analyze_clause_against_pdf(clause_dict, full_text, context=context)
-        result_status = ai_result.get("result", "NOT_FOUND")
-        color         = _STATUS_COLOR.get(result_status, "")
-
-        clause_obj = JobClause.objects.get(id=clause_db_id)
-
-        ClauseResult.objects.update_or_create(
-            clause=clause_obj,
-            defaults={
-                "result":              result_status,
-                "color":               color,
-                "reason":              ai_result.get("reason", "") or "",
-                "relevant_text":       ai_result.get("relevant_text", "") or "",
-                "ai_added_text":       ai_result.get("ai_recommendation", "") or "",
-                "parties_obligated":   ai_result.get("parties_obligated", []),
-                "missing_values":      ai_result.get("missing_values", []),
-                "key_dates_durations": ai_result.get("key_dates_durations", []),
-                "binding_strength":    ai_result.get("binding_strength", "VAGUE"),
-                "ai_provider_used":    ai_result.get("_provider", ""),
-                "analysis_attempt":    clause_obj.retry_count + 1,
-            },
-        )
-
-        JobClause.objects.filter(id=clause_db_id).update(
-            status=ClauseStatus.COMPLETED,
-            updated_at=timezone.now(),
-        )
-        return {"clause": clause_dict, "ai_result": ai_result, "success": True}
-
-    except Exception as e:
-        logger.error("Resume clause analysis failed for '%s': %s", clause_dict.get("id"), e)
-        JobClause.objects.filter(id=clause_db_id).update(
-            status=ClauseStatus.FAILED,
-            error_message=str(e)[:2000],
-            retry_count=F("retry_count") + 1,
-            failed_at=timezone.now(),
-            updated_at=timezone.now(),
-        )
-        return {"clause": clause_dict, "ai_result": _fallback_ai_result(clause_dict, e), "success": False}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,27 +233,32 @@ class JobResumeView(APIView):
         job.status = JobStatus.ANALYZING
         job.save(update_fields=["status", "updated_at"])
 
-        # ── Re-run failed clauses in parallel ─────────────────────────────────
+        # ── Re-run failed clauses in parallel batches ─────────────────────────
         failed_list = list(failed_clauses_qs)
+        all_items = [
+            (str(jc.id), {"id": jc.clause_ref_id, "title": jc.title,
+                           "value": jc.value, "category": jc.category})
+            for jc in failed_list
+        ]
+        n_items    = len(all_items)
+        batch_size = max(1, min(math.ceil(n_items / _MAX_PARALLEL_CLAUSES), _CLAUSE_BATCH_SIZE))
+        batches = [
+            all_items[i:i + batch_size]
+            for i in range(0, n_items, batch_size)
+        ]
 
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CLAUSES) as executor:
             futures = {
-                executor.submit(
-                    _analyze_clause_for_resume,
-                    str(jc.id),
-                    {"id": jc.clause_ref_id, "title": jc.title, "value": jc.value,
-                     "category": jc.category},
-                    full_text,
-                    context,
-                ): jc
-                for jc in failed_list
+                executor.submit(_analyze_batch_with_db, batch, full_text, context): batch
+                for batch in batches
             }
             for future in as_completed(futures):
-                jc = futures[future]
+                batch = futures[future]
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error("Unexpected resume thread error for clause %s: %s", jc.clause_ref_id, e)
+                    ids = [item[0] for item in batch]
+                    logger.error("Unexpected resume batch error for clauses %s: %s", ids, e)
 
         # ── Refresh counters ───────────────────────────────────────────────────
         completed_count = job.clauses.filter(status=ClauseStatus.COMPLETED).count()

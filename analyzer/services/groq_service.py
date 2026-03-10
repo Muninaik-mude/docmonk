@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_RETRY_WAIT = 8.0
 # Max full-pool sweeps before giving up (on a single _call_ai invocation)
 _MAX_RETRIES = 3
+# Max clauses per single batch AI call (keeps output tokens well within 8 k limit)
+CLAUSE_BATCH_SIZE = 10
 
 
 # ── Multi-provider client pool ─────────────────────────────────────────────────
@@ -519,10 +521,8 @@ def _fix_recommendation_prefix(relevant_text: str | None, recommendation: str | 
     return recommendation
 
 
-def _parse_response(response_text: str) -> dict:
-    """Parse and validate the AI JSON response."""
-    result = _safe_json_parse(response_text)
-
+def _validate_clause_result(result: dict) -> dict:
+    """Normalise and validate a single parsed clause result dict (shared by single and batch parsers)."""
     if result.get("result") not in ("MATCH", "NOT_FOUND", "VIOLATION", "PARTIALLY_SATISFIED"):
         logger.warning("Invalid result value: %s, defaulting to NOT_FOUND", result.get("result"))
         result["result"] = "NOT_FOUND"
@@ -536,13 +536,17 @@ def _parse_response(response_text: str) -> dict:
     if not isinstance(result.get("key_dates_durations"), list):
         result["key_dates_durations"] = []
 
-    # Fix prefix alignment: ensure ai_recommendation prefix matches relevant_text
     result["ai_recommendation"] = _fix_recommendation_prefix(
         result.get("relevant_text"),
         result.get("ai_recommendation"),
     )
-
     return result
+
+
+def _parse_response(response_text: str) -> dict:
+    """Parse and validate the AI JSON response for a single clause."""
+    result = _safe_json_parse(response_text)
+    return _validate_clause_result(result)
 
 
 def analyze_clause_against_pdf(clause: dict, pdf_text: str, *, context: str = "") -> dict:
@@ -610,6 +614,153 @@ def analyze_clause_against_pdf(clause: dict, pdf_text: str, *, context: str = ""
             "key_dates_durations": [],
             "_provider": "pool",
         }
+
+
+# ── Batch clause analysis ──────────────────────────────────────────────────────
+
+_BATCH_SYSTEM_PROMPT = """You are a strict legal contract compliance auditor. You receive multiple REQUIRED CLAUSES and a FULL CONTRACT DOCUMENT. Analyze each clause independently against the document.
+
+For each clause:
+1. Scan the full document and locate the section(s) relevant to that clause topic.
+2. Compare the required clause against what the document actually says in that section.
+3. Determine whether the document satisfies, violates, or is missing that clause.
+
+You are not checking if a topic merely exists. You are verifying whether the document's specific terms — amounts, dates, jurisdictions, named acts, restrictions, percentages, locations — exactly match or conflict with the required clause.
+
+You must respond ONLY with a valid JSON array, no extra text or markdown formatting.
+The array MUST contain EXACTLY the same number of objects as clauses in the input, in the same order."""
+
+_BATCH_USER_TEMPLATE = """REQUIRED CLAUSES ({n} clauses — analyze each one independently against the contract document below):
+
+{clauses_block}
+FULL CONTRACT DOCUMENT:
+{pdf_text}
+
+Your task: For each of the {n} REQUIRED CLAUSES above, analyze the FULL CONTRACT DOCUMENT using this strict methodology:
+
+STEP 1 — Scan the full document and locate the section(s) relevant to that clause's "{title_placeholder}" topic.
+  - Copy the verbatim sentence(s) or paragraph(s) you find into the "relevant_text" field.
+  - If nothing relevant exists anywhere in the document → result is NOT_FOUND, relevant_text is null.
+
+STEP 2 — If relevant text is found, compare every specific value in the required clause against it:
+  - Monetary amounts (e.g. Rs.2,25,000 required vs Rs.1,50,000 in document → VIOLATION)
+  - Named laws/acts (e.g. "Telangana Stamp Act" required vs "Indian Stamp Act" in document → VIOLATION)
+  - Locations/jurisdictions (e.g. "Hyderabad" required vs "Bengaluru" in document → VIOLATION)
+  - Dates and durations (e.g. "7-day grace period" required vs no grace period in document → VIOLATION)
+  - Scope restrictions (e.g. "IT and Software Development only" required vs "commercial/business" in document — narrowing scope is a VIOLATION)
+  - If ANY specific value conflicts → result is VIOLATION
+
+STEP 3 — If no conflicts, check completeness:
+  - If the document clause is vague where the required clause is specific → PARTIALLY_SATISFIED
+  - If the document clause is missing required sub-conditions → PARTIALLY_SATISFIED
+
+STEP 4 — If all values match and clause is complete → MATCH
+
+Respond with a JSON array of EXACTLY {n} objects — one per clause, in the same order they were listed above. Each object MUST use this EXACT format:
+{{
+    "result": "MATCH" or "NOT_FOUND" or "VIOLATION" or "PARTIALLY_SATISFIED",
+    "reason": "Specific explanation citing the exact conflicting/missing values — quote the document text and the required clause value side by side",
+    "relevant_text": "the verbatim sentence(s) or paragraph(s) you located in the document for this clause topic — copied exactly as they appear including any numbering prefix (e.g. '3.1 Fees:') — or null if not found",
+    "ai_recommendation": "If NOT_FOUND: write the missing clause title and content only — do NOT invent or add any numbering or sequence prefix. If VIOLATION or PARTIALLY_SATISFIED: write a corrective/improved clause — copy the EXACT leading prefix from relevant_text character-for-character. If MATCH: null",
+    "parties_obligated": ["Tenant"] or ["Landlord"] or ["Both"] or [],
+    "missing_values": ["document says Rs.1,50,000 but required clause says Rs.2,25,000"] or [],
+    "binding_strength": "MUST/SHALL" or "SHOULD" or "MAY/CAN" or "VAGUE",
+    "key_dates_durations": ["30 days notice required", "lease ends March 2029"] or []
+}}
+
+Classification rules (apply strictly to each clause):
+- MATCH: ALL specific values in the required clause are present and consistent in the document — no deviations whatsoever
+- VIOLATION: The topic exists in the document BUT at least one specific value differs — even a single Rs.1 difference or a different city name is a VIOLATION
+- PARTIALLY_SATISFIED: The topic exists and no direct value conflict, but the document version is vaguer or missing sub-conditions
+- NOT_FOUND: The clause topic is entirely absent from the document
+
+Additional field rules:
+- reason: Write a precise, professional legal finding (one sentence). VIOLATION → "The agreement specifies '[doc text]' whereas the prescribed standard requires '[required text]'."; NOT_FOUND → "The executed agreement contains no provision for [clause title]."; PARTIALLY_SATISFIED → "The agreement addresses [topic] as '[doc text]' but lacks the required specificity."; MATCH → "The agreement satisfies this requirement — [brief confirmation]."
+- missing_values: List every specific value that differs or is absent
+- binding_strength: "MUST/SHALL" for mandatory, "SHOULD" for advisory, "MAY/CAN" for permissive, "VAGUE" for non-binding phrases
+- key_dates_durations: list all dates and durations found in the clause
+
+CRITICAL: Your response must be a JSON array of EXACTLY {n} objects. No more, no fewer."""
+
+
+def _parse_batch_response(response_text: str, clauses: list) -> list:
+    """
+    Parse and validate the batch AI JSON array response.
+    Returns a list of validated clause result dicts in the same order as input clauses.
+    Raises ValueError if the array length does not match len(clauses).
+    """
+    text = response_text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = re.sub(r'^```[^\n]*\n?', '', text)
+        text = re.sub(r'\n?```$', '', text.strip())
+
+    raw = json.loads(text.strip())
+
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected JSON array from batch AI call, got {type(raw).__name__}")
+
+    if len(raw) < len(clauses):
+        raise ValueError(
+            f"Batch AI returned {len(raw)} results for {len(clauses)} clauses — count mismatch"
+        )
+
+    # If AI returned more items than clauses (shouldn't happen), trim to expected count
+    raw = raw[:len(clauses)]
+
+    results = []
+    for item in raw:
+        if not isinstance(item, dict):
+            item = {}
+        results.append(_validate_clause_result(item))
+
+    return results
+
+
+def analyze_clauses_against_pdf(clauses: list, pdf_text: str, *, context: str = "") -> list:
+    """
+    Analyze multiple clauses against the document in a single AI call.
+
+    Sends all clauses together with the full document text once — the AI returns
+    a JSON array with one result per clause, in the same order.
+
+    Each result dict has the same fields as analyze_clause_against_pdf:
+    result, reason, relevant_text, ai_recommendation, parties_obligated,
+    missing_values, binding_strength, key_dates_durations, _provider.
+
+    Raises RuntimeError (propagated from _call_ai) if all providers are exhausted.
+    Raises ValueError if the AI returns a misaligned result count.
+    """
+    n = len(clauses)
+
+    clauses_block = "\n\n".join(
+        f"CLAUSE {i}:\nTITLE: {c['title']}\nCONTENT: {c['value']}"
+        for i, c in enumerate(clauses, 1)
+    )
+
+    user_content = _BATCH_USER_TEMPLATE.format(
+        n=n,
+        clauses_block=clauses_block,
+        pdf_text=pdf_text,
+        title_placeholder="each clause",
+    )
+
+    if context and context.strip():
+        user_content = (
+            f"ADDITIONAL CONTEXT (background information about this document provided by the user):\n"
+            f"{context.strip()}\n\n"
+        ) + user_content
+
+    messages = [
+        {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
+
+    response_text = _call_ai(messages, max_tokens=8000, temperature=0.1)
+    results = _parse_batch_response(response_text, clauses)
+    for r in results:
+        r["_provider"] = "pool"
+    return results
 
 
 # ── Document-level analysis ────────────────────────────────────────────────────

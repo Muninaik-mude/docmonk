@@ -1,6 +1,7 @@
 import base64
 import binascii
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
@@ -20,7 +21,8 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_PARALLEL_CLAUSES = 4  # matches number of AI providers — one clause per provider at a time
+_MAX_PARALLEL_CLAUSES = 4  # number of parallel batch workers (= number of AI providers)
+_CLAUSE_BATCH_SIZE    = groq_service.CLAUSE_BATCH_SIZE  # max clauses per single AI call
 
 # Maps compliance result → color string stored in DB and returned in response
 _STATUS_COLOR = {
@@ -77,67 +79,89 @@ def _detect_jurisdiction_with_db(job_id: str, full_text: str) -> dict:
         return {"jurisdiction": "Unknown", "agreement_type": "", "applicable_laws": [], "checklist": []}
 
 
-def _analyze_single_clause_with_db(
-    clause_db_id: str, clause: dict, full_text: str, context: str = ""
-) -> dict:
+def _analyze_batch_with_db(
+    batch_items: list, full_text: str, context: str = ""
+) -> list:
     """
-    Analyze one clause and persist state transitions to DB.
+    Analyze a batch of clauses in a single AI call and persist results to DB.
+
+    batch_items: list of (clause_db_id, clause_dict)
+    Returns list of {clause, ai_result, success} in the same order as batch_items.
     Called inside ThreadPoolExecutor — uses close_old_connections() for thread safety.
     """
     close_old_connections()
-    logger.info("Clause analysis started: '%s'", clause.get("id"))
-
-    # Transition → IN_PROGRESS
-    JobClause.objects.filter(id=clause_db_id).update(
-        status=ClauseStatus.IN_PROGRESS,
-        updated_at=timezone.now(),
+    clauses = [c for _, c in batch_items]
+    logger.info(
+        "Batch clause analysis started: %s",
+        [c.get("id") for c in clauses],
     )
 
+    # Transition all clauses → IN_PROGRESS
+    for clause_db_id, _ in batch_items:
+        JobClause.objects.filter(id=clause_db_id).update(
+            status=ClauseStatus.IN_PROGRESS,
+            updated_at=timezone.now(),
+        )
+
+    # Single AI call for the whole batch
     try:
-        ai_result = groq_service.analyze_clause_against_pdf(clause, full_text, context=context)
-        result_status = ai_result.get("result", "NOT_FOUND")
-        color = _STATUS_COLOR.get(result_status, "")
-
-        clause_obj = JobClause.objects.get(id=clause_db_id)
-
-        ClauseResult.objects.update_or_create(
-            clause=clause_obj,
-            defaults={
-                "result": result_status,
-                "color": color,
-                "reason": ai_result.get("reason", "") or "",
-                "relevant_text": ai_result.get("relevant_text", "") or "",
-                "ai_added_text": ai_result.get("ai_recommendation", "") or "",
-                "parties_obligated": ai_result.get("parties_obligated", []),
-                "missing_values": ai_result.get("missing_values", []),
-                "key_dates_durations": ai_result.get("key_dates_durations", []),
-                "binding_strength": ai_result.get("binding_strength", "VAGUE"),
-                "ai_provider_used": ai_result.get("_provider", ""),
-                "analysis_attempt": clause_obj.retry_count + 1,
-            },
-        )
-
-        # Transition → COMPLETED
-        JobClause.objects.filter(id=clause_db_id).update(
-            status=ClauseStatus.COMPLETED,
-            updated_at=timezone.now(),
-        )
-
-        return {"clause": clause, "ai_result": ai_result, "success": True}
-
+        ai_results = groq_service.analyze_clauses_against_pdf(clauses, full_text, context=context)
     except Exception as e:
-        logger.error("Clause analysis failed for '%s': %s", clause.get("id"), e)
+        logger.error("Batch AI call failed: %s", e)
+        results = []
+        for clause_db_id, clause in batch_items:
+            JobClause.objects.filter(id=clause_db_id).update(
+                status=ClauseStatus.FAILED,
+                error_message=str(e)[:2000],
+                retry_count=models_F("retry_count") + 1,
+                failed_at=timezone.now(),
+                updated_at=timezone.now(),
+            )
+            results.append({"clause": clause, "ai_result": _fallback_ai_result(clause, e), "success": False})
+        return results
 
-        # Transition → FAILED, increment retry_count
-        JobClause.objects.filter(id=clause_db_id).update(
-            status=ClauseStatus.FAILED,
-            error_message=str(e)[:2000],
-            retry_count=models_F("retry_count") + 1,
-            failed_at=timezone.now(),
-            updated_at=timezone.now(),
-        )
+    # Persist each result individually (same DB writes as before)
+    results = []
+    for (clause_db_id, clause), ai_result in zip(batch_items, ai_results):
+        try:
+            result_status = ai_result.get("result", "NOT_FOUND")
+            color = _STATUS_COLOR.get(result_status, "")
+            clause_obj = JobClause.objects.get(id=clause_db_id)
 
-        return {"clause": clause, "ai_result": _fallback_ai_result(clause, e), "success": False}
+            ClauseResult.objects.update_or_create(
+                clause=clause_obj,
+                defaults={
+                    "result": result_status,
+                    "color": color,
+                    "reason": ai_result.get("reason", "") or "",
+                    "relevant_text": ai_result.get("relevant_text", "") or "",
+                    "ai_added_text": ai_result.get("ai_recommendation", "") or "",
+                    "parties_obligated": ai_result.get("parties_obligated", []),
+                    "missing_values": ai_result.get("missing_values", []),
+                    "key_dates_durations": ai_result.get("key_dates_durations", []),
+                    "binding_strength": ai_result.get("binding_strength", "VAGUE"),
+                    "ai_provider_used": ai_result.get("_provider", ""),
+                    "analysis_attempt": clause_obj.retry_count + 1,
+                },
+            )
+            JobClause.objects.filter(id=clause_db_id).update(
+                status=ClauseStatus.COMPLETED,
+                updated_at=timezone.now(),
+            )
+            results.append({"clause": clause, "ai_result": ai_result, "success": True})
+
+        except Exception as e:
+            logger.error("DB save failed for clause '%s': %s", clause.get("id"), e)
+            JobClause.objects.filter(id=clause_db_id).update(
+                status=ClauseStatus.FAILED,
+                error_message=str(e)[:2000],
+                retry_count=models_F("retry_count") + 1,
+                failed_at=timezone.now(),
+                updated_at=timezone.now(),
+            )
+            results.append({"clause": clause, "ai_result": _fallback_ai_result(clause, e), "success": False})
+
+    return results
 
 
 class ClauseAnalyzerView(APIView):
@@ -292,33 +316,42 @@ class ClauseAnalyzerView(APIView):
 
         _result_map: dict[int, dict[str, Any]] = {}
 
+        # Split clauses evenly across all 4 providers — ceil(n/4) clauses per batch.
+        # Capped at _CLAUSE_BATCH_SIZE (10) to stay within output token limits.
+        # Examples: 10 clauses → [3,3,2,2], 20 → [5,5,5,5], 50 → [10,10,10,10,10]
+        n_clauses  = len(clauses)
+        batch_size = max(1, min(math.ceil(n_clauses / _MAX_PARALLEL_CLAUSES), _CLAUSE_BATCH_SIZE))
+        batches = [
+            (i, clauses[i:i + batch_size])
+            for i in range(0, n_clauses, batch_size)
+        ]
+
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CLAUSES + 1) as executor:
-            # Submit jurisdiction detection alongside clauses (does not block them)
+            # Submit jurisdiction detection alongside clause batches (does not block them)
             jurisdiction_future = executor.submit(
                 _detect_jurisdiction_with_db, str(job.id), full_text
             )
 
-            future_to_idx = {
-                executor.submit(
-                    _analyze_single_clause_with_db,
-                    str(clause_db_map[clause["id"]].id),
-                    clause,
-                    full_text,
-                    context,
-                ): idx
-                for idx, clause in enumerate(clauses)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+            future_to_batch: dict = {}
+            for start_idx, batch in batches:
+                batch_items = [(str(clause_db_map[c["id"]].id), c) for c in batch]
+                f = executor.submit(_analyze_batch_with_db, batch_items, full_text, context)
+                future_to_batch[f] = (start_idx, batch_items)
+
+            for future in as_completed(future_to_batch):
+                start_idx, batch_items = future_to_batch[future]
                 try:
-                    _result_map[idx] = future.result()
+                    batch_results = future.result()
+                    for offset, item in enumerate(batch_results):
+                        _result_map[start_idx + offset] = item
                 except Exception as e:
-                    logger.error("Unexpected thread error for index %d: %s", idx, e)
-                    _result_map[idx] = {
-                        "clause": clauses[idx],
-                        "ai_result": _fallback_ai_result(clauses[idx], e),
-                        "success": False,
-                    }
+                    logger.error("Unexpected batch thread error at index %d: %s", start_idx, e)
+                    for offset, (_, clause) in enumerate(batch_items):
+                        _result_map[start_idx + offset] = {
+                            "clause": clause,
+                            "ai_result": _fallback_ai_result(clause, e),
+                            "success": False,
+                        }
 
             # Collect jurisdiction result — will already be done in most cases
             jurisdiction_info = jurisdiction_future.result()

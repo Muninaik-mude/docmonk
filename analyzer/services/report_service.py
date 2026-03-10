@@ -536,14 +536,22 @@ def generate_markdown_report(
             if not stripped:
                 continue
             if heading_style and _section_re.match(stripped):
-                # If the AI concatenated heading + body on one line, split them
-                if heading_text and stripped.lower().startswith(heading_text.lower()) and len(stripped) > len(heading_text) + 2:
-                    rest = stripped[len(heading_text):].strip()
-                    parts.append(f'<p><span style="{heading_style}">{heading_text}</span></p>')
-                    if rest:
-                        parts.append(f'<p>{rest}</p>')
+                if heading_text:
+                    # Source had a heading — apply heading style, split off any body text
+                    if stripped.lower().startswith(heading_text.lower()) and len(stripped) > len(heading_text) + 2:
+                        rest = stripped[len(heading_text):].strip()
+                        parts.append(f'<p><span style="{heading_style}">{heading_text}</span></p>')
+                        if rest:
+                            parts.append(f'<p>{rest}</p>')
+                    else:
+                        parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
                 else:
-                    parts.append(f'<p><span style="{heading_style}">{stripped}</span></p>')
+                    # Source had NO heading — relevant_text was plain content.
+                    # AI incorrectly prefixed "N. Title: body" — strip the prefix,
+                    # render only the body as plain content to match source style.
+                    colon_pos = stripped.find(':')
+                    body = stripped[colon_pos + 1:].strip() if colon_pos > 0 else stripped
+                    parts.append(f'<p>{body}</p>')
             else:
                 parts.append(f'<p>{stripped}</p>')
         return ''.join(parts)
