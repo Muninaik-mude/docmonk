@@ -60,6 +60,7 @@ def _detect_jurisdiction_with_db(job_id: str, full_text: str) -> dict:
     Called inside ThreadPoolExecutor alongside clause analysis — runs concurrently.
     """
     close_old_connections()
+    logger.info("Jurisdiction detection started (concurrent with clause analysis)")
     try:
         jurisdiction_info = groq_service.detect_jurisdiction(full_text)
         JobJurisdiction.objects.create(
@@ -84,6 +85,7 @@ def _analyze_single_clause_with_db(
     Called inside ThreadPoolExecutor — uses close_old_connections() for thread safety.
     """
     close_old_connections()
+    logger.info("Clause analysis started: '%s'", clause.get("id"))
 
     # Transition → IN_PROGRESS
     JobClause.objects.filter(id=clause_db_id).update(
