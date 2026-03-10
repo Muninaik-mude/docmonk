@@ -51,12 +51,12 @@ Respond in this EXACT JSON format:
             "status": "SATISFIES" or "VIOLATES" or "RISKY" or "NOT_ADDRESSED",
             "reason": "Specific finding citing exact text from both documents where possible",
             "relevant_text": "Verbatim sentence(s) from the subject document relevant to this requirement, or null if nothing found",
-            "recommendation": "What must be changed or added to satisfy this requirement — null if status is SATISFIES"
+            "recommendation": "Concrete, actionable fix — e.g. 'Reduce loan amount to $100,000 or below to meet the policy cap' — null if status is SATISFIES"
         }}
     ],
-    "risk_points": ["Specific risk 1", "Specific risk 2"],
-    "approval_recommendation": "APPROVE" or "REJECT" or "CONDITIONAL_APPROVE",
-    "conditions": ["Condition that must be met before approval — only if CONDITIONAL_APPROVE, else empty list"]
+    "risk_points": ["Specific risk with brief explanation — only for RISKY or NOT_ADDRESSED items"],
+    "approval_recommendation": "APPROVE" or "CONDITIONAL_APPROVE" or "REJECT",
+    "conditions": ["Exact corrective action required — one entry per VIOLATES item — empty list if no violations"]
 }}
 
 Status classification rules:
@@ -67,14 +67,14 @@ Status classification rules:
 
 Compliance score: count of SATISFIES ÷ total requirements × 100 (rounded to nearest integer)
 Overall verdict:
-- COMPLIANT: compliance_score >= 80 and no VIOLATES
-- NON_COMPLIANT: any VIOLATES present, or compliance_score < 50
-- PARTIALLY_COMPLIANT: otherwise (50–79 score, no direct violations)
+- COMPLIANT: compliance_score >= 70 and no VIOLATES
+- NON_COMPLIANT: compliance_score < 60
+- PARTIALLY_COMPLIANT: otherwise (60–69, or score >= 70 with VIOLATES present)
 
-Approval recommendation:
-- APPROVE: COMPLIANT verdict
-- REJECT: NON_COMPLIANT verdict
-- CONDITIONAL_APPROVE: PARTIALLY_COMPLIANT verdict — list conditions for approval
+Approval recommendation — THREE possible values:
+- APPROVE: compliance_score >= 70 AND no VIOLATES (RISKY items are warnings only, do not block approval)
+- CONDITIONAL_APPROVE: compliance_score >= 60 but below 70, OR score >= 70 with VIOLATES present — populate "conditions" with one concrete corrective action per violation
+- REJECT: compliance_score < 60 — document has too many unmet or violated requirements to be conditionally approved
 """
 
 
@@ -104,14 +104,6 @@ def analyze_document_against_policy(
         result = _safe_json_parse(response_text)
 
         # Normalize / validate fields
-        valid_verdicts = ("COMPLIANT", "NON_COMPLIANT", "PARTIALLY_COMPLIANT")
-        if result.get("overall_verdict") not in valid_verdicts:
-            result["overall_verdict"] = "PARTIALLY_COMPLIANT"
-
-        valid_recs = ("APPROVE", "REJECT", "CONDITIONAL_APPROVE")
-        if result.get("approval_recommendation") not in valid_recs:
-            result["approval_recommendation"] = "CONDITIONAL_APPROVE"
-
         if not isinstance(result.get("policy_requirements"), list):
             result["policy_requirements"] = []
         if not isinstance(result.get("risk_points"), list):
@@ -119,11 +111,39 @@ def analyze_document_against_policy(
         if not isinstance(result.get("conditions"), list):
             result["conditions"] = []
 
-        score = result.get("compliance_score")
-        if not isinstance(score, int) or not (0 <= score <= 100):
-            reqs = result["policy_requirements"]
-            sat  = sum(1 for r in reqs if r.get("status") == "SATISFIES")
-            result["compliance_score"] = round(sat / len(reqs) * 100) if reqs else 0
+        reqs = result["policy_requirements"]
+
+        # Recalculate compliance score from requirements (source of truth)
+        sat = sum(1 for r in reqs if r.get("status") == "SATISFIES")
+        score = round(sat / len(reqs) * 100) if reqs else 0
+        result["compliance_score"] = score
+
+        # Derive overall_verdict from score + violations
+        has_violations = any(r.get("status") == "VIOLATES" for r in reqs)
+        if score >= 70 and not has_violations:
+            result["overall_verdict"] = "COMPLIANT"
+        elif score < 60:
+            result["overall_verdict"] = "NON_COMPLIANT"
+        else:
+            result["overall_verdict"] = "PARTIALLY_COMPLIANT"
+
+        # Derive approval_recommendation from score + violations
+        if score >= 70 and not has_violations:
+            result["approval_recommendation"] = "APPROVE"
+            result["conditions"] = []
+        elif score < 60:
+            result["approval_recommendation"] = "REJECT"
+            result["conditions"] = []
+        else:
+            # score 60–69, OR score >= 70 with violations
+            result["approval_recommendation"] = "CONDITIONAL_APPROVE"
+            # Ensure conditions lists one fix per violation if AI didn't populate them
+            if not result["conditions"]:
+                result["conditions"] = [
+                    r["recommendation"]
+                    for r in reqs
+                    if r.get("status") == "VIOLATES" and r.get("recommendation")
+                ]
 
         return result
 

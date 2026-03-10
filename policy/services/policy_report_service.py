@@ -1216,7 +1216,6 @@ def build_policy_summary_json(
     rec      = policy_analysis.get("approval_recommendation", "CONDITIONAL_APPROVE")
     conditions = policy_analysis.get("conditions", [])
 
-    score_color = _score_color(score)
     verdict_label = {
         "COMPLIANT": "Compliant", "NON_COMPLIANT": "Non-Compliant",
         "PARTIALLY_COMPLIANT": "Partially Compliant",
@@ -1227,7 +1226,13 @@ def build_policy_summary_json(
     }.get(rec, rec)
 
     # ── Grouped categories ────────────────────────────────────────────────────
+    # Stamp each requirement with its category so the frontend can filter
+    # policy_analysis.policy_requirements by category without needing a
+    # separate requirements list inside each group.
     groups = _group_requirements(reqs)
+    for cat, cat_reqs in groups.items():
+        for r in cat_reqs:
+            r["category"] = cat
     grouped_categories = []
     for cat, cat_reqs in groups.items():
         cat_sat  = sum(1 for r in cat_reqs if r.get("status") == "SATISFIES")
@@ -1238,13 +1243,11 @@ def build_policy_summary_json(
         grouped_categories.append({
             "name":          cat,
             "score":         cat_score,
-            "score_color":   _score_color(cat_score),
             "total":         len(cat_reqs),
             "satisfies":     cat_sat,
             "violates":      cat_viol,
             "risky":         cat_risk,
             "not_addressed": cat_na,
-            "requirements":  cat_reqs,
         })
 
     # ── Path to approval ──────────────────────────────────────────────────────
@@ -1259,9 +1262,7 @@ def build_policy_summary_json(
 
     path_to_approval = {
         "current_score":         score,
-        "current_score_color":   score_color,
         "projected_score":       proj_score,
-        "projected_score_color": _score_color(proj_score),
         "improvement_pp":        proj_score - score,
         "exceptions_to_resolve": len(issues),
         "projected_verdict":     proj_label,
@@ -1292,15 +1293,10 @@ def build_policy_summary_json(
     parties   = agreement_meta.get("parties") or {}
 
     return {
-        # ── Top-level verdict & score ──────────────────────────────────────
-        "score":               score,
-        "score_color":         score_color,
-        "overall_verdict":     verdict,
-        "verdict_label":       verdict_label,
-        "approval_recommendation": rec,
-        "rec_label":           rec_label,
-        "summary":             policy_analysis.get("summary", ""),
-        "policy_type":         policy_type,
+        # ── Display labels (derived, not in raw AI output) ─────────────────
+        "verdict_label":  verdict_label,
+        "rec_label":      rec_label,
+        "policy_type":    policy_type,
 
         # ── Counts ────────────────────────────────────────────────────────
         "stats": {
@@ -1311,17 +1307,10 @@ def build_policy_summary_json(
             "not_addressed": not_addr,
         },
 
-        # ── All requirements (full detail) ────────────────────────────────
-        "policy_requirements": reqs,
-
-        # ── Issues only ───────────────────────────────────────────────────
+        # ── Issues only (violations + risky + not addressed) ─────────────
         "issues": issues_list,
 
-        # ── Risk & conditions ─────────────────────────────────────────────
-        "risk_points": policy_analysis.get("risk_points", []),
-        "conditions":  conditions,
-
-        # ── Grouped category breakdown + radar data ───────────────────────
+        # ── Grouped category breakdown ────────────────────────────────────
         "grouped_categories": grouped_categories,
 
         # ── Path to approval ──────────────────────────────────────────────
@@ -1337,13 +1326,13 @@ def build_policy_summary_json(
 
         # ── Agreement / client info ───────────────────────────────────────
         "agreement": {
-            "type":         agmt_type,
-            "date":         agmt_det.get("agreement_date", ""),
-            "city":         agmt_det.get("city", ""),
-            "state":        agmt_det.get("state", ""),
-            "party_a":      (parties.get("landlord") or {}).get("name", ""),
-            "party_b":      (parties.get("tenant") or {}).get("company_name")
-                            or (parties.get("tenant") or {}).get("name", ""),
+            "type":    agmt_type,
+            "date":    agmt_det.get("agreement_date", ""),
+            "city":    agmt_det.get("city", ""),
+            "state":   agmt_det.get("state", ""),
+            "party_a": (parties.get("landlord") or {}).get("name", ""),
+            "party_b": (parties.get("tenant") or {}).get("company_name")
+                       or (parties.get("tenant") or {}).get("name", ""),
         },
 
         # ── Loan metrics (pass-through for frontend tiles) ────────────────

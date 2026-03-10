@@ -190,19 +190,12 @@ class PolicyAnalyzerView(APIView):
                 jurisdiction_info={},
                 agreement_meta=agreement_meta,
             )
-            report_json = policy_report_service.build_policy_report_json(
-                policy_analysis,
-                policy_type=policy_type,
-                agreement_meta=agreement_meta,
-                document_text=full_text,
-                doc_bytes=doc_bytes,
-                file_type=file_type,
-            )
-            response_data["report_md_base64"]    = base64.b64encode(md_report.encode()).decode()
-            response_data["summary_md_base64"]   = base64.b64encode(md_summary.encode()).decode()
-            response_data["policy_analysis"]     = policy_analysis
-            response_data["policy_summary_data"] = summary_json
-            response_data["policy_report_data"]  = report_json
+            # Merge structured summary fields into policy_analysis so the
+            # frontend receives a single, unified analysis object.
+            policy_analysis.update(summary_json)
+            response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
+            response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
+            response_data["policy_analysis"]   = policy_analysis
             logger.info("Policy job %s: report + summary generated", job.job_id)
         except Exception as e:
             logger.error("Policy job %s: report generation failed: %s", job.job_id, e)
