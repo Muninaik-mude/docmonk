@@ -20,7 +20,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_PARALLEL_CLAUSES = 3
+_MAX_PARALLEL_CLAUSES = 5
 
 # Maps compliance result → color string stored in DB and returned in response
 _STATUS_COLOR = {
@@ -52,6 +52,28 @@ def _fallback_ai_result(clause: dict, error: Exception) -> dict:
         "key_dates_durations": [],
         "_provider": "",
     }
+
+
+def _detect_jurisdiction_with_db(job_id: str, full_text: str) -> dict:
+    """
+    Run jurisdiction detection and persist result to DB.
+    Called inside ThreadPoolExecutor alongside clause analysis — runs concurrently.
+    """
+    close_old_connections()
+    try:
+        jurisdiction_info = groq_service.detect_jurisdiction(full_text)
+        JobJurisdiction.objects.create(
+            job_id=job_id,
+            jurisdiction=jurisdiction_info.get("jurisdiction", "Unknown"),
+            agreement_type=jurisdiction_info.get("agreement_type", ""),
+            applicable_laws=jurisdiction_info.get("applicable_laws", []),
+            checklist=jurisdiction_info.get("checklist", []),
+        )
+        logger.info("Jurisdiction detected: %s", jurisdiction_info.get("jurisdiction"))
+        return jurisdiction_info
+    except Exception as e:
+        logger.error("Jurisdiction detection failed: %s", e)
+        return {"jurisdiction": "Unknown", "agreement_type": "", "applicable_laws": [], "checklist": []}
 
 
 def _analyze_single_clause_with_db(
@@ -251,22 +273,13 @@ class ClauseAnalyzerView(APIView):
         job.full_text = full_text
         job.file_type = file_type
         job.file_size_bytes = len(doc_bytes)
-        job.status = JobStatus.DETECTING_JURISDICTION
+        job.status = JobStatus.ANALYZING
         job.save(update_fields=["full_text", "file_type", "file_size_bytes", "status", "updated_at"])
 
-        # ── Step 3: Detect jurisdiction ────────────────────────────────────────
-        jurisdiction_info = groq_service.detect_jurisdiction(full_text)
-        logger.info("Jurisdiction detected: %s", jurisdiction_info.get("jurisdiction"))
-
-        JobJurisdiction.objects.create(
-            job=job,
-            jurisdiction=jurisdiction_info.get("jurisdiction", "Unknown"),
-            agreement_type=jurisdiction_info.get("agreement_type", ""),
-            applicable_laws=jurisdiction_info.get("applicable_laws", []),
-            checklist=jurisdiction_info.get("checklist", []),
-        )
-
-        # ── Step 4: Analyze clauses ────────────────────────────────────────────
+        # ── Steps 3+4: Detect jurisdiction and analyze clauses concurrently ──────
+        # Jurisdiction detection no longer blocks the clause loop — both run in
+        # parallel inside the same executor. Jurisdiction result is collected after
+        # all clause futures complete (it is only needed for report generation).
         job.status = JobStatus.ANALYZING
         job.save(update_fields=["status", "updated_at"])
 
@@ -275,11 +288,14 @@ class ClauseAnalyzerView(APIView):
             "job_id": str(job.id),
         }
 
-        # Use a dict keyed by index to avoid the list[None] invariance issue that
-        # causes Pylance to report "__getitem__ not defined on None" when iterating.
         _result_map: dict[int, dict[str, Any]] = {}
 
-        with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CLAUSES) as executor:
+        with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CLAUSES + 1) as executor:
+            # Submit jurisdiction detection alongside clauses (does not block them)
+            jurisdiction_future = executor.submit(
+                _detect_jurisdiction_with_db, str(job.id), full_text
+            )
+
             future_to_idx = {
                 executor.submit(
                     _analyze_single_clause_with_db,
@@ -295,13 +311,15 @@ class ClauseAnalyzerView(APIView):
                 try:
                     _result_map[idx] = future.result()
                 except Exception as e:
-                    # Outer catch — _analyze_single_clause_with_db already handles internally
                     logger.error("Unexpected thread error for index %d: %s", idx, e)
                     _result_map[idx] = {
                         "clause": clauses[idx],
                         "ai_result": _fallback_ai_result(clauses[idx], e),
                         "success": False,
                     }
+
+            # Collect jurisdiction result — will already be done in most cases
+            jurisdiction_info = jurisdiction_future.result()
 
         # Rebuild as an ordered list (preserves original clause order)
         clause_results: list[dict[str, Any]] = [_result_map[i] for i in range(len(clauses))]
