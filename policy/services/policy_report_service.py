@@ -3,7 +3,7 @@ import logging
 import math
 import re
 
-from analyzer.services.report_service import _MD_DIFF_CSS, _SUMMARY_CSS
+from analyzer.services.report_service import _SUMMARY_CSS
 
 logger = logging.getLogger(__name__)
 
@@ -18,32 +18,41 @@ _STATUS_BG = {
 # Priority when multiple requirements overlap the same text
 _STATUS_PRIORITY = {"VIOLATES": 0, "RISKY": 1, "SATISFIES": 2, "NOT_ADDRESSED": 3}
 
-# ── Global-tooltip JS (mouse-following, always stays in viewport) ──────────────
+# ── Global-tooltip JS (mouse-following, animated card, always stays in viewport) ─
 _TOOLTIP_JS = """
 <div id="g-tip" style="
-  display:none; position:fixed; background:#1e2430; color:#f0f0f0;
-  padding:10px 14px; border-radius:7px; width:300px; max-width:90vw;
-  font-size:12px; line-height:1.5; z-index:99999; pointer-events:none;
-  box-shadow:0 4px 16px rgba(0,0,0,0.35);
+  display:none; position:fixed;
+  background:#ffffff; border-radius:10px; width:340px; max-width:92vw;
+  font-size:13px; line-height:1.5; z-index:99999; pointer-events:none;
+  box-shadow:0 12px 40px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.10);
+  border:1px solid rgba(0,0,0,0.07); overflow:hidden;
+  opacity:0; transition:opacity 0.14s ease;
 "></div>
 <script>
 (function(){
   var tip = document.getElementById('g-tip');
+  var fadeOut;
   function pos(e){
-    var w=tip.offsetWidth||300, h=tip.offsetHeight||80;
+    var w=tip.offsetWidth||340, h=tip.offsetHeight||120;
     var vw=window.innerWidth, vh=window.innerHeight;
-    var x=e.clientX+14, y=e.clientY+14;
-    if(x+w>vw-8) x=e.clientX-w-10;
-    if(y+h>vh-8) y=e.clientY-h-10;
+    var x=e.clientX+18, y=e.clientY+18;
+    if(x+w>vw-10) x=e.clientX-w-14;
+    if(y+h>vh-10) y=e.clientY-h-14;
     tip.style.left=x+'px'; tip.style.top=y+'px';
   }
   document.querySelectorAll('[data-tip]').forEach(function(el){
     el.addEventListener('mouseenter',function(e){
+      clearTimeout(fadeOut);
       tip.innerHTML=this.getAttribute('data-tip');
-      tip.style.display='block'; pos(e);
+      tip.style.display='block';
+      pos(e);
+      requestAnimationFrame(function(){ tip.style.opacity='1'; });
     });
     el.addEventListener('mousemove',pos);
-    el.addEventListener('mouseleave',function(){tip.style.display='none';});
+    el.addEventListener('mouseleave',function(){
+      tip.style.opacity='0';
+      fadeOut=setTimeout(function(){ tip.style.display='none'; },150);
+    });
   });
 })();
 </script>
@@ -51,55 +60,112 @@ _TOOLTIP_JS = """
 
 _DOC_CSS = """
 <style>
+/* ── Document body ── */
 .pdv-wrap {
-  font-family: 'Segoe UI', Roboto, Arial, sans-serif;
-  font-size: 13px; line-height: 1.6; color: #212529;
+  font-family: Arial, sans-serif;
+  font-size: 10pt; line-height: 1.5; color: #000;
+  max-width: 860px; margin: 0 auto; padding: 4px 0;
 }
-.pdv-title {
-  font-size: 16px; font-weight: 800; text-align: center;
-  color: #1a1a2e; margin: 6px 0 2px;
-}
-.pdv-subtitle {
-  font-size: 12px; text-align: center; color: #6c757d; margin-bottom: 8px;
-}
-.pdv-heading {
-  font-weight: 700; font-size: 13px; color: #1a1a2e;
-  margin: 12px 0 4px; padding: 4px 0;
-  border-bottom: 1px solid #dee2e6;
-}
-.pdv-para { margin: 3px 0; padding: 2px 0; }
+/* Paragraph: minimal margin, inline styles carry all formatting */
+.pdv-para { margin: 2px 0; padding: 0; }
+
+/* Heading classes — used by Markdown/plain-text renderers */
+.pdv-title   { font-size:20pt; font-weight:700; text-align:center; color:#1F4E79; margin:14px 0 4px; font-family:Arial,sans-serif; }
+.pdv-subtitle{ font-size:13pt; font-weight:700; text-align:center; color:#2E75B6; margin-bottom:8px; font-family:Arial,sans-serif; }
+.pdv-h1      { font-size:13pt; font-weight:700; color:#1F4E79; margin:14px 0 4px; padding-bottom:4px; border-bottom:2px solid #1F4E79; font-family:Arial,sans-serif; }
+.pdv-h2      { font-size:12pt; font-weight:700; color:#1F4E79; margin:12px 0 3px; padding-bottom:2px; border-bottom:1px solid #dee2e6; font-family:Arial,sans-serif; }
+.pdv-h3      { font-size:11pt; font-weight:700; color:#2E75B6; margin:10px 0 3px; font-family:Arial,sans-serif; }
+.pdv-h4      { font-size:10pt; font-weight:600; color:#34495e;  margin:8px 0 2px; font-style:italic; font-family:Arial,sans-serif; }
+.pdv-heading { font-size:13pt; font-weight:700; color:#1F4E79; margin:14px 0 4px; padding:3px 0; border-bottom:1px solid #e5e7eb; font-family:Arial,sans-serif; }
+
+/* Tables — DOCX cells carry all inline styling; this just sets structure */
 .pdv-table {
-  border-collapse: collapse; width: 100%; margin: 6px 0 10px; font-size: 13px;
+  border-collapse: collapse; width: 100%; margin: 6px 0 12px;
 }
-.pdv-table td {
-  border: 1px solid #dee2e6; padding: 5px 10px; vertical-align: top;
+.pdv-table td, .pdv-table th {
+  border: 1px solid #d1d5db; padding: 5px 10px; vertical-align: top;
 }
-.pdv-table td.lbl {
-  width: 40%; font-weight: 600; background: #f8f9fa; color: #343a40;
-}
-.pdv-table td.val { width: 60%; }
-/* highlight cursor */
+
+/* Highlighted text: smooth pill feel */
 [data-tip] { cursor: help; border-radius: 3px; }
+[data-tip]:hover { filter: brightness(0.96); }
 
-/* legend badges */
-.leg-sat { background:#d4edda; padding:2px 8px; border-radius:3px; margin-right:5px; font-size:12px; }
-.leg-vio { background:#fde8e8; padding:2px 8px; border-radius:3px; margin-right:5px; font-size:12px; }
-.leg-rsk { background:#fff3cd; padding:2px 8px; border-radius:3px; margin-right:5px; font-size:12px; }
-.leg-na  { background:#e8f0fe; padding:2px 8px; border-radius:3px; margin-right:5px; font-size:12px; }
+/* ── Legend bar ── */
+.pdv-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 8px 12px; margin-bottom: 14px;
+  background: #fafafa; border: 1px solid #e5e7eb; border-radius: 8px;
+  font-size: 12px; color: #4b5563;
+}
+.leg-sat {
+  display:inline-flex; align-items:center; gap:4px;
+  background:#d1fae5; color:#065f46; padding:3px 10px;
+  border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
+}
+.leg-vio {
+  display:inline-flex; align-items:center; gap:4px;
+  background:#fee2e2; color:#991b1b; padding:3px 10px;
+  border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
+}
+.leg-rsk {
+  display:inline-flex; align-items:center; gap:4px;
+  background:#fef3c7; color:#92400e; padding:3px 10px;
+  border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
+}
+.leg-na {
+  display:inline-flex; align-items:center; gap:4px;
+  background:#e0e7ff; color:#3730a3; padding:3px 10px;
+  border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
+}
 
-/* NOT_ADDRESSED / Risk / Conditions panels */
-.na-panel  { border:1px solid #b8d0fb; border-radius:6px; background:#f0f4ff; padding:12px 16px; margin-top:14px; }
-.na-title  { font-weight:700; font-size:13px; color:#0a3577; margin-bottom:7px; }
-.na-item   { font-size:13px; color:#1a3a6b; padding:3px 0 3px 14px; position:relative; }
-.na-item::before { content:"•"; position:absolute; left:0; color:#0d6efd; }
-.risk-panel { border:1px solid #f5c04a; border-radius:6px; background:#fffbf0; padding:12px 16px; margin-top:12px; }
-.risk-title { font-weight:700; font-size:13px; color:#7d4e00; margin-bottom:6px; }
-.risk-item  { font-size:13px; color:#6b4000; padding:3px 0 3px 16px; position:relative; }
-.risk-item::before { content:"⚠"; position:absolute; left:0; font-size:11px; }
-.cond-panel { border:1px solid #b0e0c8; border-radius:6px; background:#f0fbf5; padding:12px 16px; margin-top:12px; }
-.cond-title { font-weight:700; font-size:13px; color:#155724; margin-bottom:6px; }
-.cond-item  { font-size:13px; color:#155724; padding:3px 0 3px 14px; position:relative; }
-.cond-item::before { content:"›"; position:absolute; left:0; font-weight:900; }
+/* ── Panels (NOT_ADDRESSED / Risk / Conditions) ── */
+.na-panel {
+  border-left: 4px solid #3b82f6; border-radius: 8px;
+  background: #eff6ff; padding: 14px 18px; margin-top: 18px;
+  box-shadow: 0 1px 4px rgba(59,130,246,0.08);
+}
+.na-title {
+  font-weight: 700; font-size: 13px; color: #1e40af;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.na-item {
+  font-size: 13px; color: #1e3a8a; padding: 5px 0 5px 16px; position: relative;
+  border-bottom: 1px solid rgba(59,130,246,0.12);
+}
+.na-item:last-child { border-bottom: none; }
+.na-item::before { content:"·"; position:absolute; left:3px; color:#3b82f6; font-size:18px; line-height:1; top:4px; }
+
+.risk-panel {
+  border-left: 4px solid #f59e0b; border-radius: 8px;
+  background: #fffbeb; padding: 14px 18px; margin-top: 14px;
+  box-shadow: 0 1px 4px rgba(245,158,11,0.08);
+}
+.risk-title {
+  font-weight: 700; font-size: 13px; color: #92400e;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.risk-item {
+  font-size: 13px; color: #78350f; padding: 5px 0 5px 20px; position: relative;
+  border-bottom: 1px solid rgba(245,158,11,0.12);
+}
+.risk-item:last-child { border-bottom: none; }
+.risk-item::before { content:"⚠"; position:absolute; left:0; font-size:12px; top:5px; }
+
+.cond-panel {
+  border-left: 4px solid #10b981; border-radius: 8px;
+  background: #ecfdf5; padding: 14px 18px; margin-top: 14px;
+  box-shadow: 0 1px 4px rgba(16,185,129,0.08);
+}
+.cond-title {
+  font-weight: 700; font-size: 13px; color: #065f46;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.cond-item {
+  font-size: 13px; color: #064e3b; padding: 5px 0 5px 16px; position: relative;
+  border-bottom: 1px solid rgba(16,185,129,0.12);
+}
+.cond-item:last-child { border-bottom: none; }
+.cond-item::before { content:"›"; position:absolute; left:2px; font-weight:900; color:#10b981; }
 </style>
 """
 
@@ -108,6 +174,27 @@ _DOC_CSS = """
 
 def _esc(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _para_runs_to_html(para) -> str:
+    """Convert DOCX paragraph runs to HTML, preserving bold/italic/underline per run."""
+    parts = []
+    for run in para.runs:
+        text = run.text
+        if not text:
+            continue
+        chunk = _esc(text)
+        if run.bold and run.italic:
+            chunk = f"<strong><em>{chunk}</em></strong>"
+        elif run.bold:
+            chunk = f"<strong>{chunk}</strong>"
+        elif run.italic:
+            chunk = f"<em>{chunk}</em>"
+        if run.underline:
+            chunk = f"<u>{chunk}</u>"
+        parts.append(chunk)
+    # Fallback: if no runs processed, use paragraph plain text
+    return "".join(parts) if parts else _esc(para.text)
 
 
 def _build_highlight_map(requirements: list) -> list:
@@ -140,23 +227,42 @@ def _match_highlight(text: str, highlight_map: list):
 
 
 def _tip_attr(status: str, requirement: str, reason: str) -> str:
-    """Build the data-tip HTML string (used as attribute value — safe HTML inside JS innerHTML)."""
+    """Build the data-tip HTML string — a rich card rendered in tooltip innerHTML."""
     badge_map = {
-        "SATISFIES": ("&#x2714;", "#28a745"),
-        "VIOLATES":  ("&#x2716;", "#dc3545"),
-        "RISKY":     ("&#x26A0;", "#fd7e14"),
+        "SATISFIES": ("&#x2714;", "#059669", "#d1fae5", "#065f46", "Satisfies"),
+        "VIOLATES":  ("&#x2716;", "#dc2626", "#fee2e2", "#991b1b", "Violates"),
+        "RISKY":     ("&#x26A0;", "#d97706", "#fef3c7", "#92400e", "Risky"),
     }
-    icon, color = badge_map.get(status, ("&#x2022;", "#6c757d"))
+    icon, accent, bg, text_dark, label = badge_map.get(
+        status, ("&#x2022;", "#6b7280", "#f3f4f6", "#374151", status.replace("_", " ").title())
+    )
     req_s    = _esc(requirement)
     reason_s = _esc(reason)
-    label    = status.replace("_", " ").title()
+    # Card: colored header bar + body
     tip_html = (
-        f'<span style="background:{color};color:#fff;padding:1px 7px;border-radius:10px;'
-        f'font-size:11px;font-weight:700;letter-spacing:.04em;">{icon} {label}</span>'
-        f'<br><strong style="font-size:12px;">{req_s}</strong>'
-        + (f'<br><span style="opacity:.85;font-size:11px;">{reason_s}</span>' if reason_s else "")
+        # Header strip
+        f'<div style="background:{bg};border-bottom:3px solid {accent};'
+        f'padding:9px 13px;display:flex;align-items:center;gap:8px;">'
+        f'<span style="background:{accent};color:#fff;width:22px;height:22px;border-radius:50%;'
+        f'display:inline-flex;align-items:center;justify-content:center;'
+        f'font-size:12px;font-weight:700;flex-shrink:0;">{icon}</span>'
+        f'<span style="color:{text_dark};font-weight:700;font-size:12px;'
+        f'letter-spacing:.04em;text-transform:uppercase;">{label}</span>'
+        f'</div>'
+        # Body
+        f'<div style="padding:10px 13px;">'
     )
-    # Escape for use as HTML attribute value (single-quoted on the element)
+    if req_s:
+        tip_html += (
+            f'<div style="font-weight:700;font-size:12px;color:#111827;'
+            f'margin-bottom:{6 if reason_s else 0}px;line-height:1.45;">{req_s}</div>'
+        )
+    if reason_s:
+        tip_html += (
+            f'<div style="font-size:11px;color:#4b5563;line-height:1.55;">{reason_s}</div>'
+        )
+    tip_html += '</div>'
+    # Escape single-quotes for HTML attribute
     return tip_html.replace("'", "&#39;")
 
 
@@ -164,17 +270,148 @@ def _tip_attr(status: str, requirement: str, reason: str) -> str:
 
 def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
     """
-    Convert a DOCX file to HTML preserving paragraphs AND tables in document order.
-    Applies inline background highlights and data-tip attributes where text matches
-    a policy requirement.
+    Convert DOCX to HTML applying exact run-level font/color/size/alignment from
+    the source file — a true mirror image of the original document.
+    Overlays highlight background + tooltip only on policy-matched text.
     """
     try:
         from docx import Document as DocxDocument
         from docx.text.paragraph import Paragraph as DocxPara
         from docx.table import Table as DocxTable
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
     except ImportError:
         return "<p><em>python-docx not available for document rendering.</em></p>"
 
+    _ALIGN = {
+        WD_ALIGN_PARAGRAPH.CENTER:  "center",
+        WD_ALIGN_PARAGRAPH.RIGHT:   "right",
+        WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
+    }
+
+    def _run_rgb(run):
+        """Return '#RRGGBB' from run font color, or None."""
+        try:
+            c = run.font.color
+            if c and c.type and c.rgb:
+                return f"#{str(c.rgb)}"
+        except Exception:
+            pass
+        return None
+
+    def _para_inline_style(para):
+        """
+        Build an inline CSS style string from the paragraph's alignment and
+        the first non-empty run's font (size, color, bold, italic, family).
+        """
+        css = ["font-family:Arial,sans-serif"]
+        align = _ALIGN.get(para.alignment)
+        if align:
+            css.append(f"text-align:{align}")
+        for run in para.runs:
+            if not run.text.strip():
+                continue
+            sz = run.font.size
+            if sz:
+                css.append(f"font-size:{sz.pt:.1f}pt")
+            rgb = _run_rgb(run)
+            if rgb:
+                css.append(f"color:{rgb}")
+            if run.bold:
+                css.append("font-weight:700")
+            if run.italic:
+                css.append("font-style:italic")
+            fn = run.font.name
+            if fn:
+                css[0] = f"font-family:'{fn}',Arial,sans-serif"
+            break
+        return ";".join(css)
+
+    def _runs_html(para):
+        """
+        Convert runs to HTML. The paragraph container already carries the
+        dominant style, so here we only wrap runs that deviate (different
+        color, size, bold toggle, italic).
+        """
+        # Detect paragraph-level dominant color and bold from first real run
+        dom_rgb  = None
+        dom_bold = False
+        dom_sz   = None
+        for r in para.runs:
+            if r.text.strip():
+                dom_rgb  = _run_rgb(r)
+                dom_bold = bool(r.bold)
+                sz = r.font.size
+                dom_sz = sz.pt if sz else None
+                break
+
+        out = []
+        for run in para.runs:
+            text = run.text
+            if not text:
+                continue
+            chunk = _esc(text)
+
+            # Collect per-run deviations
+            span_css = []
+            run_rgb = _run_rgb(run)
+            if run_rgb and run_rgb != dom_rgb:
+                span_css.append(f"color:{run_rgb}")
+            sz = run.font.size
+            run_sz = sz.pt if sz else None
+            if run_sz and run_sz != dom_sz:
+                span_css.append(f"font-size:{run_sz:.1f}pt")
+            run_bold = bool(run.bold)
+            if run_bold and not dom_bold:
+                span_css.append("font-weight:700")
+            elif not run_bold and dom_bold and run.bold is False:
+                span_css.append("font-weight:400")
+
+            if span_css:
+                chunk = f'<span style="{";".join(span_css)}">{chunk}</span>'
+            if run.italic:
+                chunk = f"<em>{chunk}</em>"
+            if run.underline:
+                chunk = f"<u>{chunk}</u>"
+            out.append(chunk)
+
+        return "".join(out) if out else _esc(para.text)
+
+    def _cell_bg(cell):
+        """Return '#RRGGBB' cell shading from w:shd, or None."""
+        try:
+            tc   = cell._tc
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is not None:
+                shd  = tcPr.find(qn("w:shd"))
+                if shd is not None:
+                    fill = shd.get(qn("w:fill"))
+                    if fill and len(fill) == 6 and fill.upper() not in ("AUTO",):
+                        return f"#{fill}"
+        except Exception:
+            pass
+        return None
+
+    def _cell_text_style(cell):
+        """Return inline CSS for a cell's text (font/color/bold from first run)."""
+        css = ["font-family:Arial,sans-serif;font-size:10pt"]
+        for para in cell.paragraphs:
+            for run in para.runs:
+                if not run.text.strip():
+                    continue
+                rgb = _run_rgb(run)
+                if rgb:
+                    css.append(f"color:{rgb}")
+                if run.bold:
+                    css.append("font-weight:700")
+                fn = run.font.name
+                if fn:
+                    css[0] = f"font-family:'{fn}',Arial,sans-serif;font-size:10pt"
+                break
+            break
+        return ";".join(css)
+
+    # ── Build HTML ────────────────────────────────────────────────────────────
     doc   = DocxDocument(io.BytesIO(doc_bytes))
     parts = ['<div class="pdv-wrap">']
 
@@ -189,32 +426,17 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
             if not text:
                 continue
 
-            esc_text = _esc(text)
-            is_heading = bool(
-                re.match(r"^(\d+\.\s|\bExhibit\b|[IVXLC]+\.\s)", text, re.I)
-                or (len(text) < 80 and text == text.upper() and len(text.split()) > 1)
-            )
+            base_style = _para_inline_style(para)
+            inner_html = _runs_html(para)
 
             match = _match_highlight(text, highlight_map)
-            if is_heading:
-                tag_open = f'<div class="pdv-heading'
-                if match:
-                    bg  = _STATUS_BG.get(match[0], "")
-                    tip = _tip_attr(*match)
-                    tag_open += f'" style="background-color:{bg};" data-tip=\'{tip}\''
-                else:
-                    tag_open += '"'
-                parts.append(f'{tag_open}>{esc_text}</div>')
+            if match:
+                hl_bg = _STATUS_BG.get(match[0], "")
+                tip   = _tip_attr(*match)
+                style = f"{base_style};background-color:{hl_bg};" if hl_bg else base_style
+                parts.append(f'<p class="pdv-para" style="{style}" data-tip=\'{tip}\'>{inner_html}</p>')
             else:
-                if match:
-                    bg  = _STATUS_BG.get(match[0], "")
-                    tip = _tip_attr(*match)
-                    parts.append(
-                        f'<p class="pdv-para" style="background-color:{bg};" data-tip=\'{tip}\'>'
-                        f'{esc_text}</p>'
-                    )
-                else:
-                    parts.append(f'<p class="pdv-para">{esc_text}</p>')
+                parts.append(f'<p class="pdv-para" style="{base_style}">{inner_html}</p>')
 
         # ── Table ─────────────────────────────────────────────────────────────
         elif tag == "tbl":
@@ -222,40 +444,42 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
             parts.append('<table class="pdv-table">')
 
             for row in table.rows:
-                # Deduplicate merged cells (python-docx repeats merged cell text)
-                seen_vals  = []
+                # Deduplicate merged cells
+                seen_cells = []
                 seen_set   = set()
                 for cell in row.cells:
                     cv = cell.text.strip()
                     if cv not in seen_set:
-                        seen_vals.append(cv)
+                        seen_cells.append(cell)
                         seen_set.add(cv)
 
-                if not any(seen_vals):
+                if not any(c.text.strip() for c in seen_cells):
                     continue
 
-                # Determine highlight: check full row text against highlight map
-                row_text = " | ".join(seen_vals)
+                # Determine highlight
+                row_text = " | ".join(c.text.strip() for c in seen_cells)
                 match    = _match_highlight(row_text, highlight_map)
-                # Also try each individual cell
                 if not match:
-                    for cv in seen_vals:
-                        match = _match_highlight(cv, highlight_map)
+                    for cell in seen_cells:
+                        match = _match_highlight(cell.text.strip(), highlight_map)
                         if match:
                             break
 
-                bg_style  = f"background-color:{_STATUS_BG[match[0]]};" if match and _STATUS_BG.get(match[0]) else ""
-                tip_attr  = f" data-tip='{_tip_attr(*match)}'" if match else ""
+                hl_bg   = _STATUS_BG.get(match[0]) if match else None
+                tip_str = f" data-tip='{_tip_attr(*match)}'" if match else ""
 
                 parts.append("<tr>")
-                for ci, cv in enumerate(seen_vals):
-                    esc_cv = _esc(cv)
-                    if ci == 0:
-                        # Label cell
-                        parts.append(f'<td class="lbl" style="{bg_style}"{tip_attr}>{esc_cv}</td>')
-                    else:
-                        # Value cell
-                        parts.append(f'<td class="val" style="{bg_style}"{tip_attr}>{esc_cv}</td>')
+                for cell in seen_cells:
+                    cv         = cell.text.strip()
+                    text_style = _cell_text_style(cell)
+                    # Background: highlight wins over original DOCX cell shading
+                    bg         = hl_bg if hl_bg else (_cell_bg(cell) or None)
+                    bg_css     = f"background-color:{bg};" if bg else ""
+                    parts.append(
+                        f'<td style="{text_style};{bg_css}vertical-align:top;'
+                        f'border:1px solid #d1d5db;padding:5px 10px;"{tip_str}>'
+                        f'{_esc(cv)}</td>'
+                    )
                 parts.append("</tr>")
 
             parts.append("</table>")
@@ -295,15 +519,16 @@ def _is_md_separator(row: str) -> bool:
 
 def _markdown_to_html(md_text: str, highlight_map: list) -> str:
     """
-    Convert Markdown document to HTML, preserving tables and bold text,
-    and applying inline background highlights where text matches a policy requirement.
+    Convert Markdown document to HTML preserving full heading hierarchy (h1-h4),
+    tables with header rows, and inline bold/italic. Applies background highlights
+    and tooltip attributes where text matches a policy requirement.
     """
     parts = ['<div class="pdv-wrap">']
     lines = md_text.split("\n")
     i = 0
 
     while i < len(lines):
-        raw     = lines[i]
+        raw      = lines[i]
         stripped = raw.strip()
         i += 1
 
@@ -317,20 +542,17 @@ def _markdown_to_html(md_text: str, highlight_map: list) -> str:
                 table_lines.append(lines[i].strip())
                 i += 1
 
-            # Filter separator rows
             data_rows = [l for l in table_lines if not _is_md_separator(l)]
             if not data_rows:
                 continue
 
             parts.append('<table class="pdv-table">')
-            for row_line in data_rows:
+            for row_idx, row_line in enumerate(data_rows):
                 cells_raw = [c.strip() for c in row_line.split("|")]
-                # Remove empty strings caused by leading/trailing |
                 cells_raw = [c for c in cells_raw if c]
                 if not cells_raw:
                     continue
 
-                # Plain text of entire row for matching
                 row_plain = " | ".join(_md_strip(c) for c in cells_raw)
                 match = _match_highlight(row_plain, highlight_map)
                 if not match:
@@ -340,38 +562,75 @@ def _markdown_to_html(md_text: str, highlight_map: list) -> str:
                             break
 
                 bg_style = f"background-color:{_STATUS_BG[match[0]]};" if match and _STATUS_BG.get(match[0]) else ""
-                tip_attr = f" data-tip='{_tip_attr(*match)}'" if match else ""
+                tip_str  = f" data-tip='{_tip_attr(*match)}'" if match else ""
 
+                is_header = (row_idx == 0)
                 parts.append("<tr>")
                 for ci, cell_raw in enumerate(cells_raw):
                     cell_html = _md_inline(cell_raw)
-                    cls       = "lbl" if ci == 0 else "val"
-                    parts.append(f'<td class="{cls}" style="{bg_style}"{tip_attr}>{cell_html}</td>')
+                    if is_header:
+                        parts.append(f'<th style="{bg_style}"{tip_str}>{cell_html}</th>')
+                    else:
+                        cls = "lbl" if ci == 0 else "val"
+                        parts.append(f'<td class="{cls}" style="{bg_style}"{tip_str}>{cell_html}</td>')
                 parts.append("</tr>")
 
             parts.append("</table>")
             continue
 
-        # ── Heading-style bold line: **N. Section** or all-caps title ────────
+        # ── ATX Headings: #, ##, ###, #### ───────────────────────────────────
+        heading_match = re.match(r"^(#{1,4})\s+(.*)", stripped)
+        if heading_match:
+            level  = len(heading_match.group(1))
+            htext  = heading_match.group(2).strip()
+            plain  = _md_strip(htext)
+            inner  = _md_inline(htext)
+            css    = {1: "pdv-h1", 2: "pdv-h2", 3: "pdv-h3", 4: "pdv-h4"}.get(level, "pdv-h3")
+            match  = _match_highlight(plain, highlight_map)
+            bg     = f' style="background-color:{_STATUS_BG[match[0]]};"' if match and _STATUS_BG.get(match[0]) else ""
+            tip    = f" data-tip='{_tip_attr(*match)}'" if match else ""
+            parts.append(f'<div class="{css}"{bg}{tip}>{inner}</div>')
+            continue
+
+        # ── Setext heading: underline with === or --- ─────────────────────────
+        if i < len(lines):
+            next_stripped = lines[i].strip()
+            if re.match(r"^=+$", next_stripped):
+                i += 1
+                plain = _md_strip(stripped)
+                inner = _md_inline(stripped)
+                match = _match_highlight(plain, highlight_map)
+                bg    = f' style="background-color:{_STATUS_BG[match[0]]};"' if match and _STATUS_BG.get(match[0]) else ""
+                tip   = f" data-tip='{_tip_attr(*match)}'" if match else ""
+                parts.append(f'<div class="pdv-h1"{bg}{tip}>{inner}</div>')
+                continue
+            elif re.match(r"^-+$", next_stripped) and len(next_stripped) > 2:
+                i += 1
+                plain = _md_strip(stripped)
+                inner = _md_inline(stripped)
+                match = _match_highlight(plain, highlight_map)
+                bg    = f' style="background-color:{_STATUS_BG[match[0]]};"' if match and _STATUS_BG.get(match[0]) else ""
+                tip   = f" data-tip='{_tip_attr(*match)}'" if match else ""
+                parts.append(f'<div class="pdv-h2"{bg}{tip}>{inner}</div>')
+                continue
+
+        # ── Bold-headed lines: **N. Section** or **ALL CAPS** ────────────────
         plain = _md_strip(stripped)
-        is_title   = bool(re.match(r"^(YOUR |HOUSING |FOR OFFICE)", plain, re.I))
-        is_heading = (
-            bool(re.match(r"^\*\*\d+\.", stripped))          # **1. Section**
-            or bool(re.match(r"^\*\*[A-Z][^*]{2,}\*\*$", stripped))  # **ALL CAPS TITLE**
-            or stripped.startswith("#")
-        )
+        is_all_caps_title = (len(plain) < 100 and plain == plain.upper() and len(plain.split()) > 1)
+        is_bold_section   = bool(re.match(r"^\*\*\d+[\.\)]\s", stripped))
+        is_bold_heading   = bool(re.match(r"^\*\*[A-Z][^*]{2,}\*\*\s*$", stripped))
 
         inline_html = _md_inline(stripped)
         match       = _match_highlight(plain, highlight_map)
-        bg_style    = f"background-color:{_STATUS_BG[match[0]]};" if match and _STATUS_BG.get(match[0]) else ""
-        tip_attr    = f" data-tip='{_tip_attr(*match)}'" if match else ""
+        bg_attr     = f' style="background-color:{_STATUS_BG[match[0]]};"' if match and _STATUS_BG.get(match[0]) else ""
+        tip_attr_s  = f" data-tip='{_tip_attr(*match)}'" if match else ""
 
-        if is_title:
-            parts.append(f'<div class="pdv-title" style="{bg_style}"{tip_attr}>{inline_html}</div>')
-        elif is_heading:
-            parts.append(f'<div class="pdv-heading" style="{bg_style}"{tip_attr}>{inline_html}</div>')
+        if is_all_caps_title:
+            parts.append(f'<div class="pdv-title"{bg_attr}{tip_attr_s}>{inline_html}</div>')
+        elif is_bold_section or is_bold_heading:
+            parts.append(f'<div class="pdv-h2"{bg_attr}{tip_attr_s}>{inline_html}</div>')
         else:
-            parts.append(f'<p class="pdv-para" style="{bg_style}"{tip_attr}>{inline_html}</p>')
+            parts.append(f'<p class="pdv-para"{bg_attr}{tip_attr_s}>{inline_html}</p>')
 
     parts.append("</div>")
     return "\n".join(parts)
@@ -427,82 +686,27 @@ def generate_policy_report(
     file_type: str = None,
 ) -> str:
     agreement_meta = agreement_meta or {}
-    reqs      = policy_analysis.get("policy_requirements", [])
-    verdict   = policy_analysis.get("overall_verdict", "PARTIALLY_COMPLIANT")
-    rec       = policy_analysis.get("approval_recommendation", "CONDITIONAL_APPROVE")
-    score     = policy_analysis.get("compliance_score", 0)
-    summary   = policy_analysis.get("summary", "")
-    agmt_type = agreement_meta.get("agreement_type", "")
-
-    verdict_color = {
-        "COMPLIANT":           "#28a745",
-        "NON_COMPLIANT":       "#dc3545",
-        "PARTIALLY_COMPLIANT": "#fd7e14",
-    }.get(verdict, "#fd7e14")
-
-    rec_label = {
-        "APPROVE":             "Approve",
-        "REJECT":              "Reject",
-        "CONDITIONAL_APPROVE": "Conditional Approve",
-    }.get(rec, rec)
-
-    verdict_label = {
-        "COMPLIANT":           "Compliant",
-        "NON_COMPLIANT":       "Non-Compliant",
-        "PARTIALLY_COMPLIANT": "Partially Compliant",
-    }.get(verdict, verdict)
+    reqs = policy_analysis.get("policy_requirements", [])
 
     hl_map = _build_highlight_map(reqs)
-    lines  = [_MD_DIFF_CSS, _DOC_CSS]
-
-    # ── Header ─────────────────────────────────────────────────────────────────
-    label = policy_type or agmt_type
-    header_parts = ["<strong>Policy Compliance Report</strong>"]
-    if label:
-        header_parts.append(f'<span style="color:#6c757d;font-size:13px;">{_esc(label)}</span>')
-    header_parts.append(
-        f'<span style="color:{verdict_color};font-weight:700;">{verdict_label}</span>'
-        f"&nbsp;·&nbsp;"
-        f'<span style="font-weight:600;">Recommendation: {rec_label}</span>'
-        f"&nbsp;·&nbsp;"
-        f'<span style="color:{verdict_color};font-weight:700;">{score}%</span>'
-    )
-    lines.append(
-        '<div class="diff-group" data-type="unchanged">'
-        '<div class="diff-line normal">'
-        '<div class="line-content" style="padding:10px 8px;border-bottom:1px solid #e9ecef;">'
-        + " &nbsp;·&nbsp; ".join(header_parts)
-        + "</div></div></div>"
-    )
-
-    if summary:
-        lines.append(
-            '<div class="diff-group" data-type="unchanged">'
-            '<div class="diff-line normal">'
-            '<div class="line-content" style="font-size:13px;color:#495057;padding:8px;">'
-            f"{_esc(summary)}"
-            "</div></div></div>"
-        )
+    lines  = [_DOC_CSS]
 
     # ── Legend ─────────────────────────────────────────────────────────────────
     lines.append(
-        '<div class="diff-group" data-type="unchanged">'
-        '<div class="diff-line normal">'
-        '<div class="line-content" style="padding:5px 8px;font-size:12px;color:#6c757d;">'
-        '<span class="leg-sat">Satisfies</span>'
-        '<span class="leg-vio">Violates</span>'
-        '<span class="leg-rsk">Risky</span>'
-        '<span class="leg-na">Not Addressed (see below)</span>'
-        "&nbsp; Hover highlighted sections for details."
-        "</div></div></div>"
+        '<div class="pdv-legend">'
+        '<span class="leg-sat">&#x2714; Satisfies</span>'
+        '<span class="leg-vio">&#x2716; Violates</span>'
+        '<span class="leg-rsk">&#x26A0; Risky</span>'
+        '<span class="leg-na">&#x25CB; Not Addressed (see below)</span>'
+        '<span style="color:#9ca3af;font-size:11px;">— Hover highlighted text for details</span>'
+        '</div>'
     )
 
     # ── Document body ──────────────────────────────────────────────────────────
     if doc_bytes and file_type == "docx":
         doc_html = _docx_to_html(doc_bytes, hl_map)
     elif document_text and file_type in ("markdown", "txt", None):
-        # Check if it looks like Markdown (has | table rows or ** bold)
-        if "|" in document_text or "**" in document_text:
+        if "|" in document_text or "**" in document_text or document_text.lstrip().startswith("#"):
             doc_html = _markdown_to_html(document_text, hl_map)
         else:
             doc_html = _plain_text_to_html(document_text, hl_map)
@@ -511,30 +715,24 @@ def generate_policy_report(
     else:
         doc_html = "<p><em>No document content available.</em></p>"
 
-    lines.append(
-        '<div class="diff-group" data-type="unchanged">'
-        '<div class="diff-line normal">'
-        '<div class="line-content" style="padding:10px 8px;">'
-        + doc_html
-        + "</div></div></div>"
-    )
+    lines.append(doc_html)
 
     # ── NOT_ADDRESSED panel ────────────────────────────────────────────────────
     na_reqs = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
     if na_reqs:
         items = "".join(
-            f'<div class="na-item"><strong>{_esc(r.get("requirement",""))}</strong>'
+            f'<div class="na-item">'
+            f'<strong>{_esc(r.get("requirement",""))}</strong>'
             + (f' — {_esc(r.get("reason",""))}' if r.get("reason") else "")
-            + (f'<br><em style="font-size:12px;color:#4060a0;">{_esc(r.get("recommendation",""))}</em>' if r.get("recommendation") else "")
+            + (f'<br><em style="font-size:11px;color:#3b82f6;">{_esc(r.get("recommendation",""))}</em>'
+               if r.get("recommendation") else "")
             + "</div>"
             for r in na_reqs
         )
         lines.append(
-            '<div class="diff-group" data-type="unchanged">'
-            '<div class="diff-line normal">'
-            '<div class="line-content" style="padding:6px 8px;">'
-            f'<div class="na-panel"><div class="na-title">Not Addressed in Document ({len(na_reqs)})</div>{items}</div>'
-            "</div></div></div>"
+            f'<div class="na-panel">'
+            f'<div class="na-title">&#x25CB; Not Addressed in Document ({len(na_reqs)})</div>'
+            f'{items}</div>'
         )
 
     # ── Risk points ────────────────────────────────────────────────────────────
@@ -542,11 +740,9 @@ def generate_policy_report(
     if risk_points:
         items = "".join(f'<div class="risk-item">{_esc(rp)}</div>' for rp in risk_points)
         lines.append(
-            '<div class="diff-group" data-type="unchanged">'
-            '<div class="diff-line normal">'
-            '<div class="line-content" style="padding:6px 8px;">'
-            f'<div class="risk-panel"><div class="risk-title">Risk Points</div>{items}</div>'
-            "</div></div></div>"
+            f'<div class="risk-panel">'
+            f'<div class="risk-title">&#x26A0; Risk Points</div>'
+            f'{items}</div>'
         )
 
     # ── Conditions for approval ────────────────────────────────────────────────
@@ -554,14 +750,12 @@ def generate_policy_report(
     if conditions:
         items = "".join(f'<div class="cond-item">{_esc(c)}</div>' for c in conditions)
         lines.append(
-            '<div class="diff-group" data-type="unchanged">'
-            '<div class="diff-line normal">'
-            '<div class="line-content" style="padding:6px 8px;">'
-            f'<div class="cond-panel"><div class="cond-title">Conditions for Approval</div>{items}</div>'
-            "</div></div></div>"
+            f'<div class="cond-panel">'
+            f'<div class="cond-title">&#x2714; Conditions for Approval</div>'
+            f'{items}</div>'
         )
 
-    # ── Global tooltip div + JS ────────────────────────────────────────────────
+    # ── Global tooltip card + JS ───────────────────────────────────────────────
     lines.append(_TOOLTIP_JS)
 
     return "\n".join(lines)
