@@ -488,6 +488,337 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
     return "\n".join(parts)
 
 
+# ── PDF → highlighted HTML ─────────────────────────────────────────────────────
+
+def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
+    """
+    Comprehensive PDF → HTML mirror renderer.
+
+    Handles:
+    - Text blocks: exact font size / bold / italic / color per span
+    - Tables: detected via page.find_tables(), rendered as <table> preserving
+      rich per-cell span styling; empty columns collapsed automatically
+    - Form widgets: checkboxes, radio buttons, text fields rendered inline
+    - Reading order: tables and paragraphs interleaved by vertical position
+
+    Any PDF sent by the frontend will be reproduced faithfully with only
+    highlight background colours + tooltips added on top.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return "<p><em>PyMuPDF (fitz) not installed; cannot render PDF.</em></p>"
+
+    from collections import Counter
+
+    doc = fitz.open(stream=doc_bytes, filetype="pdf")
+
+    # ── Pass 1: dominant body font size ────────────────────────────────────────
+    all_sizes = []
+    for page in doc:
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    sz   = span.get("size", 0)
+                    text = span.get("text", "").strip()
+                    if text and sz > 0:
+                        all_sizes.append(round(sz, 1))
+
+    normal_size: float = Counter(all_sizes).most_common(1)[0][0] if all_sizes else 11.0
+
+    # ── Inner helpers ──────────────────────────────────────────────────────────
+
+    def _color_hex(color_int: int) -> str:
+        return (
+            f"#{(color_int >> 16) & 0xFF:02X}"
+            f"{(color_int >>  8) & 0xFF:02X}"
+            f"{ color_int        & 0xFF:02X}"
+        )
+
+    def _render_span(span: dict) -> str:
+        """Single span → styled inline HTML."""
+        raw = span.get("text", "")
+        if not raw:
+            return ""
+        chunk     = _esc(raw)
+        sz        = span.get("size", normal_size)
+        flags     = span.get("flags", 0)
+        is_bold   = bool(flags & 16)
+        is_italic = bool(flags & 2)
+        color     = _color_hex(span.get("color", 0))
+
+        span_css: list[str] = []
+        if abs(sz - normal_size) > 0.5:
+            span_css.append(f"font-size:{sz:.1f}pt")
+        if is_bold:
+            span_css.append("font-weight:700")
+        if color not in ("#000000", "#000001"):
+            span_css.append(f"color:{color}")
+        if span_css:
+            chunk = f'<span style="{";".join(span_css)}">{chunk}</span>'
+        if is_italic:
+            chunk = f"<em>{chunk}</em>"
+        return chunk
+
+    def _block_to_html(block: dict):
+        """
+        Returns (plain_text, html_string, first_span) for a text block,
+        or (None, None, None) if empty.
+        """
+        lines = block.get("lines", [])
+        plain_parts: list[str] = []
+        html_lines:  list[str] = []
+        first_span = None
+
+        for line in lines:
+            lp: list[str] = []
+            lh: list[str] = []
+            for span in line.get("spans", []):
+                raw = span.get("text", "")
+                if not raw:
+                    continue
+                if first_span is None and raw.strip():
+                    first_span = span
+                lp.append(raw)
+                lh.append(_render_span(span))
+            lp_text = "".join(lp).strip()
+            if lp_text:
+                plain_parts.append(lp_text)
+                html_lines.append("".join(lh))
+
+        plain = " ".join(plain_parts).strip()
+        html  = "<br>".join(html_lines).strip()
+        return (plain, html, first_span) if plain else (None, None, None)
+
+    def _container_style(first_span) -> str:
+        css = ["font-family:Arial,sans-serif"]
+        if first_span:
+            sz    = first_span.get("size", normal_size)
+            flags = first_span.get("flags", 0)
+            color = _color_hex(first_span.get("color", 0))
+            css.append(f"font-size:{sz:.1f}pt")
+            if flags & 16:
+                css.append("font-weight:700")
+            if color not in ("#000000", "#000001"):
+                css.append(f"color:{color}")
+        return ";".join(css)
+
+    def _para_html(plain: str, html: str, first_span) -> str:
+        base = _container_style(first_span)
+        match = _match_highlight(plain, highlight_map)
+        if match:
+            hl_bg = _STATUS_BG.get(match[0], "")
+            tip   = _tip_attr(*match)
+            style = f"{base};background-color:{hl_bg};" if hl_bg else base
+            return f'<p class="pdv-para" style="{style}" data-tip=\'{tip}\'>{html}</p>'
+        return f'<p class="pdv-para" style="{base}">{html}</p>'
+
+    def _center_in(bbox, container) -> bool:
+        """True if bbox centre falls within container rect."""
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        return (container[0] <= cx <= container[2] and
+                container[1] <= cy <= container[3])
+
+    def _spans_in_rect(page_dict: dict, rect: tuple) -> list:
+        """All spans whose centre lies within rect."""
+        result = []
+        for blk in page_dict["blocks"]:
+            if blk.get("type") != 0:
+                continue
+            for line in blk.get("lines", []):
+                for span in line.get("spans", []):
+                    sb = span.get("bbox", (0, 0, 0, 0))
+                    if _center_in(sb, rect):
+                        result.append(span)
+        return result
+
+    def _widget_html(widget) -> str:
+        """Render an AcroForm widget as inline HTML."""
+        ft  = widget.field_type_string or ""
+        val = str(widget.field_value or "")
+        off = val.lower() in ("off", "false", "no", "0", "")
+
+        if ft == "CheckBox":
+            sym = "☐" if off else "☑"
+            return f'<span style="font-size:13px;">{sym}</span>'
+        if ft == "RadioButton":
+            sym = "○" if off else "●"
+            return f'<span style="font-size:13px;">{sym}</span>'
+        if ft in ("Text", "Multiline"):
+            return (
+                f'<span style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
+                f'color:#222;border-bottom:1px solid #bbb;min-width:60px;'
+                f'display:inline-block;">{_esc(val)}</span>'
+            )
+        if ft in ("Listbox", "ComboBox"):
+            return (
+                f'<span style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
+                f'color:#222;border:1px solid #bbb;padding:0 4px;">{_esc(val)}</span>'
+            )
+        return _esc(val) if val else ""
+
+    def _render_table(tab, page_dict: dict, widgets_on_page: list) -> str:
+        """
+        Render one PyMuPDF Table as an HTML <table>.
+
+        - Collapses columns that are entirely empty across all rows.
+        - Per-cell rich HTML from span extraction within cell bbox.
+        - Widgets (checkboxes, radio, text fields) that land inside a cell
+          are appended after any text content.
+        - Highlight + tooltip applied at cell level.
+        """
+        rows_data = tab.extract()       # list[list[str|None]]
+        if not rows_data:
+            return ""
+
+        num_cols_raw = max((len(r) for r in rows_data if r), default=0)
+        if num_cols_raw == 0:
+            return ""
+
+        # Identify active (non-empty) column indices
+        active_cols: list[int] = []
+        for c in range(num_cols_raw):
+            if any((row[c] if c < len(row) else None) for row in rows_data):
+                active_cols.append(c)
+        if not active_cols:
+            return ""
+
+        tab_rows = tab.rows      # list of TableRow; .cells[c] → bbox or None
+
+        t_parts = ['<table class="pdv-table">']
+
+        for r_idx, row in enumerate(rows_data):
+            if not row:
+                continue
+            # Pad row to num_cols_raw
+            padded = list(row) + [""] * (num_cols_raw - len(row))
+
+            row_text = " | ".join(str(padded[c] or "") for c in active_cols).strip()
+            # Skip rows where every active cell is empty (PDF separator rows)
+            if not row_text.replace("|", "").strip():
+                continue
+
+            row_match = _match_highlight(row_text, highlight_map)
+            t_parts.append("<tr>")
+
+            for c_idx in active_cols:
+                cv = (padded[c_idx] or "").strip()
+                cell_match = row_match or (_match_highlight(cv, highlight_map) if cv else None)
+                hl_bg   = _STATUS_BG.get(cell_match[0]) if cell_match else None
+                tip_str = f" data-tip='{_tip_attr(*cell_match)}'" if cell_match else ""
+                bg_css  = f"background-color:{hl_bg};" if hl_bg else ""
+
+                # Rich HTML: use tab.rows[r_idx].cells[c_idx] for correct bbox
+                cell_inner = _esc(cv)
+                try:
+                    row_obj = tab_rows[r_idx] if r_idx < len(tab_rows) else None
+                    if row_obj and c_idx < len(row_obj.cells):
+                        cr = row_obj.cells[c_idx]
+                        if cr:
+                            crect = (cr[0], cr[1], cr[2], cr[3])
+                            cell_spans = _spans_in_rect(page_dict, crect)
+                            text_html  = "".join(_render_span(s) for s in cell_spans)
+
+                            # Widgets inside this cell
+                            wgt_html = ""
+                            for _, _, wgt, wbbox in widgets_on_page:
+                                if _center_in(wbbox, crect):
+                                    wgt_html += _widget_html(wgt)
+
+                            if text_html or wgt_html:
+                                sep = "&nbsp;" if text_html and wgt_html else ""
+                                cell_inner = text_html + sep + wgt_html
+                except Exception:
+                    pass
+
+                t_parts.append(
+                    f'<td style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
+                    f'{bg_css}vertical-align:top;border:1px solid #d1d5db;padding:5px 10px;"'
+                    f'{tip_str}>{cell_inner}</td>'
+                )
+
+            t_parts.append("</tr>")
+
+        t_parts.append("</table>")
+        return "\n".join(t_parts)
+
+    # ── Pass 2: render page-by-page ────────────────────────────────────────────
+    parts = ['<div class="pdv-wrap">']
+
+    for pg_num, page in enumerate(doc):
+        page_dict = page.get_text("dict")
+
+        # ── Collect AcroForm widgets on this page ─────────────────────────────
+        widgets_on_page: list = []   # [(y0, x0, widget, bbox_tuple)]
+        try:
+            for wgt in page.widgets():
+                wb = wgt.rect
+                if wb:
+                    bbox = (wb.x0, wb.y0, wb.x1, wb.y1)
+                    widgets_on_page.append((wb.y0, wb.x0, wgt, bbox))
+        except Exception:
+            pass
+
+        # ── Detect tables ─────────────────────────────────────────────────────
+        table_bboxes: list[tuple] = []   # bboxes of rendered tables
+        elements: list[tuple]     = []   # (y0, x0, html)
+
+        try:
+            finder = page.find_tables()
+            for tab in finder.tables:
+                tb       = tab.bbox
+                tab_bbox = (tb[0], tb[1], tb[2], tb[3])
+                t_html  = _render_table(tab, page_dict, widgets_on_page)
+                if t_html:
+                    table_bboxes.append(tab_bbox)
+                    elements.append((tab_bbox[1], tab_bbox[0], t_html))
+        except Exception as e:
+            logger.debug("PDF table detection skipped (page %d): %s", pg_num + 1, e)
+
+        # Widgets that are NOT inside any table → render standalone
+        widget_in_table: set = set()
+        for y0, x0, wgt, wbbox in widgets_on_page:
+            if any(_center_in(wbbox, tb) for tb in table_bboxes):
+                widget_in_table.add(id(wgt))
+
+        for y0, x0, wgt, wbbox in widgets_on_page:
+            if id(wgt) in widget_in_table:
+                continue
+            wh = _widget_html(wgt)
+            if wh:
+                elements.append((y0, x0, f'<p class="pdv-para">{wh}</p>'))
+
+        # ── Text blocks not covered by a table ────────────────────────────────
+        for block in page_dict["blocks"]:
+            if block.get("type") != 0:
+                continue
+            bb = block.get("bbox", (0, 0, 0, 0))
+            if any(_center_in(bb, tb) for tb in table_bboxes):
+                continue
+
+            plain, html, first_span = _block_to_html(block)
+            if plain:
+                elements.append((bb[1], bb[0], _para_html(plain, html, first_span)))
+
+        # ── Render in reading order (top-to-bottom, left-to-right) ────────────
+        elements.sort(key=lambda e: (e[0], e[1]))
+        for _, _, html in elements:
+            parts.append(html)
+
+        # Light page separator (except after last page)
+        if pg_num < len(doc) - 1:
+            parts.append(
+                '<hr style="border:none;border-top:2px dashed #e5e7eb;margin:20px 0;">'
+            )
+
+    doc.close()
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
 def _md_strip(text: str) -> str:
     """Strip Markdown syntax to get plain text for highlight matching."""
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
@@ -697,7 +1028,6 @@ def generate_policy_report(
         '<span class="leg-sat">&#x2714; Satisfies</span>'
         '<span class="leg-vio">&#x2716; Violates</span>'
         '<span class="leg-rsk">&#x26A0; Risky</span>'
-        '<span class="leg-na">&#x25CB; Not Addressed (see below)</span>'
         '<span style="color:#9ca3af;font-size:11px;">— Hover highlighted text for details</span>'
         '</div>'
     )
@@ -705,6 +1035,8 @@ def generate_policy_report(
     # ── Document body ──────────────────────────────────────────────────────────
     if doc_bytes and file_type == "docx":
         doc_html = _docx_to_html(doc_bytes, hl_map)
+    elif doc_bytes and file_type == "pdf":
+        doc_html = _pdf_to_html(doc_bytes, hl_map)
     elif document_text and file_type in ("markdown", "txt", None):
         if "|" in document_text or "**" in document_text or document_text.lstrip().startswith("#"):
             doc_html = _markdown_to_html(document_text, hl_map)
@@ -716,44 +1048,6 @@ def generate_policy_report(
         doc_html = "<p><em>No document content available.</em></p>"
 
     lines.append(doc_html)
-
-    # ── NOT_ADDRESSED panel ────────────────────────────────────────────────────
-    na_reqs = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
-    if na_reqs:
-        items = "".join(
-            f'<div class="na-item">'
-            f'<strong>{_esc(r.get("requirement",""))}</strong>'
-            + (f' — {_esc(r.get("reason",""))}' if r.get("reason") else "")
-            + (f'<br><em style="font-size:11px;color:#3b82f6;">{_esc(r.get("recommendation",""))}</em>'
-               if r.get("recommendation") else "")
-            + "</div>"
-            for r in na_reqs
-        )
-        lines.append(
-            f'<div class="na-panel">'
-            f'<div class="na-title">&#x25CB; Not Addressed in Document ({len(na_reqs)})</div>'
-            f'{items}</div>'
-        )
-
-    # ── Risk points ────────────────────────────────────────────────────────────
-    risk_points = policy_analysis.get("risk_points", [])
-    if risk_points:
-        items = "".join(f'<div class="risk-item">{_esc(rp)}</div>' for rp in risk_points)
-        lines.append(
-            f'<div class="risk-panel">'
-            f'<div class="risk-title">&#x26A0; Risk Points</div>'
-            f'{items}</div>'
-        )
-
-    # ── Conditions for approval ────────────────────────────────────────────────
-    conditions = policy_analysis.get("conditions", [])
-    if conditions:
-        items = "".join(f'<div class="cond-item">{_esc(c)}</div>' for c in conditions)
-        lines.append(
-            f'<div class="cond-panel">'
-            f'<div class="cond-title">&#x2714; Conditions for Approval</div>'
-            f'{items}</div>'
-        )
 
     # ── Global tooltip card + JS ───────────────────────────────────────────────
     lines.append(_TOOLTIP_JS)
@@ -843,6 +1137,86 @@ _LOAN_OVERVIEW_CSS = """\
 .lo-path-step-text { flex:1; line-height:1.5; color:#1a1a2e; }
 .lo-path-step-badge { font-size:10px; padding:2px 7px; border-radius:10px; font-weight:700;
   background:#e8f0fe; color:#1a3a8f; flex-shrink:0; margin-top:3px; }
+
+/* ══ Dashboard layout ══ */
+
+/* Header */
+.ds-hdr { background:#fff; border-radius:12px; padding:14px 20px; margin-bottom:14px;
+  box-shadow:0 1px 4px rgba(0,0,0,0.08); display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.ds-hdr-title-block { flex:1; min-width:180px; }
+.ds-hdr-policy { font-size:16px; font-weight:800; color:#1a1a2e; margin-bottom:3px; }
+.ds-hdr-meta { font-size:12px; color:#6c757d; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.ds-hdr-dot { color:#ced4da; }
+
+/* Stat chips */
+.ds-chips { display:flex; gap:6px; flex-shrink:0; flex-wrap:wrap; }
+.ds-chip { display:flex; flex-direction:column; align-items:center;
+  border-radius:8px; padding:8px 12px; min-width:50px; background:#f8f9fa; border-top:2px solid; }
+.ds-chip-n { font-size:20px; font-weight:800; line-height:1; }
+.ds-chip-l { font-size:8px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:#6c757d; margin-top:2px; }
+.ds-chip.total { border-top-color:#495057; } .ds-chip.total .ds-chip-n { color:#212529; }
+.ds-chip.pass  { border-top-color:#28a745; } .ds-chip.pass  .ds-chip-n { color:#28a745; }
+.ds-chip.fail  { border-top-color:#dc3545; } .ds-chip.fail  .ds-chip-n { color:#dc3545; }
+.ds-chip.risky { border-top-color:#fd7e14; } .ds-chip.risky .ds-chip-n { color:#fd7e14; }
+.ds-chip.na    { border-top-color:#0d6efd; } .ds-chip.na    .ds-chip-n { color:#0d6efd; }
+
+/* Main two-panel */
+.ds-main { display:grid; grid-template-columns:1.15fr 0.85fr; gap:14px; margin-bottom:14px; }
+
+/* Left panel — sectioned table */
+.ds-left { background:#fff; border-radius:12px; box-shadow:0 1px 4px rgba(0,0,0,0.08); overflow:hidden; }
+.ds-sec { border-bottom:1px solid #f0f0f0; }
+.ds-sec:last-child { border-bottom:none; }
+.ds-sec-hdr { display:flex; justify-content:space-between; align-items:center;
+  padding:8px 16px; font-size:10.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; }
+.ds-sec-hdr.na   { background:#eef2ff; color:#3730a3; border-left:3px solid #0d6efd; }
+.ds-sec-hdr.viol { background:#fff1f2; color:#9b1c1c; border-left:3px solid #dc3545; }
+.ds-sec-hdr.cond { background:#f0fdf4; color:#14532d; border-left:3px solid #28a745; }
+.ds-sec-hdr.risky{ background:#fffbeb; color:#92400e; border-left:3px solid #fd7e14; }
+.ds-sec-badge { font-size:11px; font-weight:800; padding:1px 7px; border-radius:10px; }
+.ds-sec-hdr.na   .ds-sec-badge { background:#e0e7ff; color:#3730a3; }
+.ds-sec-hdr.viol .ds-sec-badge { background:#fee2e2; color:#991b1b; }
+.ds-sec-hdr.cond .ds-sec-badge { background:#dcfce7; color:#14532d; }
+.ds-sec-hdr.risky .ds-sec-badge { background:#fef3c7; color:#92400e; }
+.ds-sec-empty { padding:8px 16px; font-size:12px; color:#adb5bd; font-style:italic; }
+.ds-item { display:flex; align-items:flex-start; gap:6px;
+  padding:7px 14px 7px 16px; border-bottom:1px solid #f8f8f8; }
+.ds-item:last-child { border-bottom:none; }
+.ds-item-dot { width:5px; height:5px; border-radius:50%; flex-shrink:0; margin-top:5px; }
+.ds-item-body { flex:1; min-width:0; }
+.ds-item-title { font-size:12px; font-weight:600; color:#1a1a2e; line-height:1.35; margin-bottom:1px; }
+.ds-item-sub { font-size:11px; color:#6c757d; line-height:1.35; }
+.ds-item-num { font-size:11px; color:#adb5bd; flex-shrink:0; margin-top:2px; }
+
+/* Right panel — score + category circles */
+.ds-right { background:#fff; border-radius:12px; box-shadow:0 1px 4px rgba(0,0,0,0.08);
+  padding:18px 14px; display:flex; flex-direction:column; align-items:center; gap:14px; }
+.ds-score-center { text-align:center; }
+.ds-score-verdict { font-size:12px; color:#6c757d; margin-top:6px; }
+.ds-score-rec { font-size:11px; color:#6c757d; margin-top:2px; }
+
+/* Category donut grid */
+.ds-cat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; width:100%; }
+.ds-cat-tile { background:#f8f9fa; border-radius:8px; padding:10px 8px;
+  display:flex; flex-direction:column; align-items:center; gap:4px; }
+.ds-cat-tile-name { font-size:10px; font-weight:700; color:#495057;
+  text-align:center; letter-spacing:.03em; line-height:1.3; }
+.ds-cat-tile-counts { font-size:10px; color:#adb5bd; }
+
+/* All requirements table */
+.ds-reqs { background:#fff; border-radius:12px; box-shadow:0 1px 4px rgba(0,0,0,0.08);
+  overflow:hidden; margin-bottom:14px; }
+.ds-reqs-hdr { font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+  color:#6c757d; padding:10px 14px; border-bottom:1px solid #f0f0f0; background:#fafbfc; }
+.ds-rt { width:100%; border-collapse:collapse; }
+.ds-rt th { background:#f8f9fa; font-size:10px; font-weight:700; letter-spacing:.05em;
+  text-transform:uppercase; color:#6c757d; padding:6px 12px; text-align:left; border-bottom:2px solid #e9ecef; }
+.ds-rt td { padding:5px 12px; border-bottom:1px solid #f4f4f4; vertical-align:top; font-size:12px; }
+.ds-rt tr:last-child td { border-bottom:none; }
+.ds-rt tr:hover td { background:#fafbff; }
+.ds-rt-num { color:#adb5bd; font-size:11px; }
+.ds-rt-req { font-weight:600; color:#1a1a2e; }
+.ds-rt-find { color:#6c757d; }
 </style>
 """
 
@@ -1534,6 +1908,25 @@ def build_policy_summary_json(
     }
 
 
+# ── Mini donut SVG helper ─────────────────────────────────────────────────────
+
+def _mini_donut(pct: int, color: str, size: int = 54) -> str:
+    """Return a small inline SVG donut showing pct% filled in color."""
+    r = 20
+    circ = 2 * math.pi * r
+    dash = circ * pct / 100
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 52 52">'
+        f'<circle cx="26" cy="26" r="{r}" fill="none" stroke="#e9ecef" stroke-width="5"/>'
+        f'<circle cx="26" cy="26" r="{r}" fill="none" stroke="{color}" stroke-width="5"'
+        f' stroke-dasharray="{dash:.2f} {circ:.2f}" stroke-linecap="round"'
+        f' transform="rotate(-90 26 26)"/>'
+        f'<text x="26" y="30" text-anchor="middle" font-size="11" font-weight="800"'
+        f' fill="{color}" font-family="Segoe UI,sans-serif">{pct}%</text>'
+        f'</svg>'
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════════
 #  POLICY SUMMARY — analytics scorecard
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -1568,6 +1961,9 @@ def generate_policy_summary(
     }.get(rec, rec)
     conditions = policy_analysis.get("conditions", [])
 
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+
     h = [_SUMMARY_CSS, _LOAN_OVERVIEW_CSS, '<div class="sr">']
 
     # ── Loan Overview (rendered only when loan_metrics are provided) ──────────
@@ -1575,157 +1971,221 @@ def generate_policy_summary(
     if loan_overview:
         h.append(loan_overview)
 
-    # ── Meta card ──────────────────────────────────────────────────────────────
-    agmt_type = agreement_meta.get("agreement_type", "")
-    agmt_det  = agreement_meta.get("agreement_details") or {}
-    parties   = agreement_meta.get("parties") or {}
-    if agmt_type or agmt_det or parties or policy_type:
-        h.append('<div class="sr-card">')
-        display_title = policy_type or agmt_type
-        if display_title:
-            h.append(f'<div style="font-size:18px;font-weight:800;color:#1a1a2e;margin-bottom:10px;">{_esc(display_title)}</div>')
-        pills = []
-        if agmt_det.get("agreement_date"):
-            pills.append(agmt_det["agreement_date"])
-        place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
-        if place:
-            pills.append(place)
-        landlord = (parties.get("landlord") or {}).get("name", "")
-        tenant   = (parties.get("tenant") or {}).get("company_name") or (parties.get("tenant") or {}).get("name", "")
-        if landlord:
-            pills.append(f"Party A: {landlord}")
-        if tenant:
-            pills.append(f"Party B: {tenant}")
-        if pills:
-            h.append('<div class="sr-meta">')
-            for p in pills:
-                h.append(f'<span class="sr-meta-pill">{_esc(p)}</span>')
-            h.append('</div>')
-        h.append('</div>')
+    # ── Header: title · date/location · verdict/rec · stat chips ─────────────
+    display_title = _esc(policy_type or agmt_type or "Policy Compliance Analysis")
+    meta_bits = []
+    if agmt_det.get("agreement_date"):
+        meta_bits.append(f'<span>{_esc(agmt_det["agreement_date"])}</span>')
+    place = ", ".join(v for v in [agmt_det.get("city"), agmt_det.get("state")] if v)
+    if place:
+        meta_bits.append(f'<span>{_esc(place)}</span>')
+    meta_html = ('<span class="ds-hdr-dot">·</span>'.join(meta_bits)) if meta_bits else ""
 
-    # ── Score circle + verdict ─────────────────────────────────────────────────
     circ = 251.33
     dash = round(circ * score / 100, 2)
-    h.append(f'''
-<div class="sr-header">
-  <svg width="110" height="110" viewBox="0 0 100 100" style="flex-shrink:0;">
-    <circle cx="50" cy="50" r="40" fill="none" stroke="#e9ecef" stroke-width="8"/>
-    <circle cx="50" cy="50" r="40" fill="none" stroke="{score_color}" stroke-width="8"
-            stroke-dasharray="{dash} {circ}" stroke-linecap="round"
-            transform="rotate(-90 50 50)"/>
-    <text x="50" y="46" text-anchor="middle" font-size="19" font-weight="800"
-          fill="{score_color}" font-family="Segoe UI,Roboto,Arial,sans-serif">{score}%</text>
-    <text x="50" y="62" text-anchor="middle" font-size="9" font-weight="600"
-          fill="#6c757d" font-family="Segoe UI,Roboto,Arial,sans-serif" letter-spacing="0.04em">SCORE</text>
-  </svg>
-  <div class="sr-header-text">
-    <div class="sr-header-title">Policy Compliance Analysis</div>
-    <div class="sr-header-sub">
-      Verdict:&nbsp;<span style="color:{score_color};font-weight:700;">{verdict_label}</span>
-      <span class="dot">·</span> Recommendation:&nbsp;<span style="font-weight:700;">{rec_label}</span>
-      <span class="dot">·</span> {total} requirement{"s" if total != 1 else ""} checked
+
+    h.append(f'''<div class="ds-hdr">
+  <div class="ds-hdr-title-block">
+    <div class="ds-hdr-policy">{display_title}</div>
+    <div class="ds-hdr-meta">
+      <span style="color:{score_color};font-weight:700;">{verdict_label}</span>
+      <span class="ds-hdr-dot">·</span>
+      <span>{rec_label}</span>
+      <span class="ds-hdr-dot">·</span>
+      <span>{total} requirement{"s" if total != 1 else ""}</span>
+      {"<span class='ds-hdr-dot'>·</span>" + meta_html if meta_html else ""}
     </div>
+  </div>
+  <div class="ds-chips">
+    <div class="ds-chip total"><div class="ds-chip-n">{total}</div><div class="ds-chip-l">Total</div></div>
+    <div class="ds-chip pass"><div class="ds-chip-n">{sat}</div><div class="ds-chip-l">Pass</div></div>
+    <div class="ds-chip fail"><div class="ds-chip-n">{viol}</div><div class="ds-chip-l">Fail</div></div>
+    <div class="ds-chip risky"><div class="ds-chip-n">{risky}</div><div class="ds-chip-l">Risky</div></div>
+    <div class="ds-chip na"><div class="ds-chip-n">{not_addr}</div><div class="ds-chip-l">N/A</div></div>
   </div>
 </div>''')
 
-    # ── Stats row ──────────────────────────────────────────────────────────────
-    h.append('<div class="sr-stats-row">')
-    for css, num, lbl in [
-        ("total", total, "Total"), ("match", sat, "Satisfies"),
-        ("viol", viol, "Violates"), ("part", risky, "Risky"), ("nf", not_addr, "Not Addressed"),
-    ]:
-        h.append(f'<div class="sr-stat-card {css}"><div class="sr-stat-num">{num}</div><div class="sr-stat-lbl">{lbl}</div></div>')
+    # ── Main two-panel ────────────────────────────────────────────────────────
+    h.append('<div class="ds-main">')
+
+    # ── LEFT: 4 sectioned lists ───────────────────────────────────────────────
+    na_reqs    = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
+    viol_reqs  = [r for r in reqs if r.get("status") == "VIOLATES"]
+    risky_reqs = [r for r in reqs if r.get("status") == "RISKY"]
+    risk_pts   = policy_analysis.get("risk_points", [])
+
+    h.append('<div class="ds-left">')
+
+    # Section 1 — Not Addressed
+    h.append(
+        f'<div class="ds-sec">'
+        f'<div class="ds-sec-hdr na">'
+        f'<span>Not Addressed</span>'
+        f'<span class="ds-sec-badge">{len(na_reqs)}</span>'
+        f'</div>'
+    )
+    if na_reqs:
+        for r in na_reqs:
+            h.append(
+                f'<div class="ds-item">'
+                f'<div class="ds-item-dot" style="background:#0d6efd;"></div>'
+                f'<div class="ds-item-body">'
+                f'<div class="ds-item-title">{_esc(r.get("requirement",""))}</div>'
+                f'<div class="ds-item-sub">{_esc(r.get("reason",""))}</div>'
+                f'</div></div>'
+            )
+    else:
+        h.append('<div class="ds-sec-empty">None</div>')
     h.append('</div>')
 
-    # ── NEW: Compliance by Category (Grouped Scorecard) ────────────────────────
-    grouped_html = _build_grouped_scorecard_html(reqs)
-    if grouped_html:
-        h.append(grouped_html)
+    # Section 2 — Actions Required (violations)
+    h.append(
+        f'<div class="ds-sec">'
+        f'<div class="ds-sec-hdr viol">'
+        f'<span>Actions Required</span>'
+        f'<span class="ds-sec-badge">{len(viol_reqs)}</span>'
+        f'</div>'
+    )
+    if viol_reqs:
+        for r in viol_reqs:
+            h.append(
+                f'<div class="ds-item">'
+                f'<div class="ds-item-dot" style="background:#dc3545;"></div>'
+                f'<div class="ds-item-body">'
+                f'<div class="ds-item-title">{_esc(r.get("requirement",""))}</div>'
+                f'<div class="ds-item-sub">{_esc(r.get("reason",""))}</div>'
+                f'</div></div>'
+            )
+    else:
+        h.append('<div class="ds-sec-empty">None</div>')
+    h.append('</div>')
 
-    # ── NEW: Risk Profile Radar Chart ────────────────────────────────────
-    radar_html = _build_risk_radar_html(reqs)
-    if radar_html:
-        h.append(radar_html)
+    # Section 3 — Conditions for Approval
+    h.append(
+        f'<div class="ds-sec">'
+        f'<div class="ds-sec-hdr cond">'
+        f'<span>Conditions for Approval</span>'
+        f'<span class="ds-sec-badge">{len(conditions)}</span>'
+        f'</div>'
+    )
+    if conditions:
+        for i, cond in enumerate(conditions, 1):
+            h.append(
+                f'<div class="ds-item">'
+                f'<div class="ds-item-num">{i}.</div>'
+                f'<div class="ds-item-body">'
+                f'<div class="ds-item-title">{_esc(cond)}</div>'
+                f'</div></div>'
+            )
+    else:
+        h.append('<div class="ds-sec-empty">No conditions.</div>')
+    h.append('</div>')
 
-    # ── Issues requiring attention ─────────────────────────────────────────────
-    flags = [r for r in reqs if r.get("status") in ("VIOLATES", "NOT_ADDRESSED", "RISKY")]
-    if flags:
-        badge_map = {
-            "VIOLATES":      ("badge-viol", "Violation"),
-            "NOT_ADDRESSED": ("badge-nf",   "Not Addressed"),
-            "RISKY":         ("badge-part", "Risky"),
-        }
-        h.append('<div class="sr-card"><div class="sr-card-title">Issues Requiring Attention</div>')
-        for flag in flags:
-            st = flag.get("status", "")
-            badge_cls, badge_lbl = badge_map.get(st, ("badge-opt", st))
-            css_extra = " nf" if st == "NOT_ADDRESSED" else ""
-            h.append(f'''
-<div class="sr-flag{css_extra}">
-  <div class="sr-flag-title">{_esc(flag.get("requirement",""))} &nbsp; <span class="badge {badge_cls}">{badge_lbl}</span></div>
-  <div class="sr-flag-reason">{_esc(flag.get("reason",""))}</div>
-</div>''')
+    # Section 4 — Risky Points (risky requirements + risk_points text list)
+    all_risky_count = len(risky_reqs) + len(risk_pts)
+    h.append(
+        f'<div class="ds-sec">'
+        f'<div class="ds-sec-hdr risky">'
+        f'<span>Risky Points</span>'
+        f'<span class="ds-sec-badge">{all_risky_count}</span>'
+        f'</div>'
+    )
+    if risky_reqs or risk_pts:
+        for r in risky_reqs:
+            h.append(
+                f'<div class="ds-item">'
+                f'<div class="ds-item-dot" style="background:#fd7e14;"></div>'
+                f'<div class="ds-item-body">'
+                f'<div class="ds-item-title">{_esc(r.get("requirement",""))}</div>'
+                f'<div class="ds-item-sub">{_esc(r.get("reason",""))}</div>'
+                f'</div></div>'
+            )
+        for rp in risk_pts:
+            h.append(
+                f'<div class="ds-item">'
+                f'<div class="ds-item-dot" style="background:#fd7e14;"></div>'
+                f'<div class="ds-item-body">'
+                f'<div class="ds-item-title">{_esc(rp)}</div>'
+                f'</div></div>'
+            )
+    else:
+        h.append('<div class="ds-sec-empty">None</div>')
+    h.append('</div>')
+
+    h.append('</div>')  # .ds-left
+
+    # ── RIGHT: big score donut + category circles ─────────────────────────────
+    h.append('<div class="ds-right">')
+
+    # Big score donut
+    h.append(
+        f'<div class="ds-score-center">'
+        f'<svg width="130" height="130" viewBox="0 0 100 100" style="display:block;margin:0 auto;">'
+        f'<circle cx="50" cy="50" r="40" fill="none" stroke="#e9ecef" stroke-width="7"/>'
+        f'<circle cx="50" cy="50" r="40" fill="none" stroke="{score_color}" stroke-width="7"'
+        f' stroke-dasharray="{dash} {circ}" stroke-linecap="round" transform="rotate(-90 50 50)"/>'
+        f'<text x="50" y="44" text-anchor="middle" font-size="20" font-weight="800"'
+        f' fill="{score_color}" font-family="Segoe UI,sans-serif">{score}%</text>'
+        f'<text x="50" y="57" text-anchor="middle" font-size="8" font-weight="600"'
+        f' fill="#6c757d" font-family="Segoe UI,sans-serif" letter-spacing="0.04em">COMPLIANCE</text>'
+        f'</svg>'
+        f'<div class="ds-score-verdict"><strong style="color:{score_color};">{verdict_label}</strong></div>'
+        f'<div class="ds-score-rec">{rec_label}</div>'
+        f'</div>'
+    )
+
+    # Category circles
+    groups = _group_requirements(reqs)
+    if groups:
+        h.append('<div class="ds-cat-grid">')
+        for cat, cat_reqs in groups.items():
+            cat_score = _category_score(cat_reqs)
+            color     = _score_color(cat_score)
+            sat_c  = sum(1 for r in cat_reqs if r.get("status") == "SATISFIES")
+            viol_c = sum(1 for r in cat_reqs if r.get("status") == "VIOLATES")
+            risk_c = sum(1 for r in cat_reqs if r.get("status") == "RISKY")
+            na_c   = sum(1 for r in cat_reqs if r.get("status") == "NOT_ADDRESSED")
+            count_str = f"{sat_c}✓ {viol_c}✗ {risk_c}⚠ {na_c}–".replace(" 0✓","").replace(" 0✗","").replace(" 0⚠","").replace(" 0–","").strip()
+            h.append(
+                f'<div class="ds-cat-tile">'
+                f'{_mini_donut(cat_score, color)}'
+                f'<div class="ds-cat-tile-name">{_esc(cat)}</div>'
+                f'<div class="ds-cat-tile-counts">{count_str}</div>'
+                f'</div>'
+            )
         h.append('</div>')
 
-    # ── NEW: Path to Approval ────────────────────────────────────────────
-    path_html = _build_path_to_approval_html(reqs, score, conditions)
-    if path_html:
-        h.append(path_html)
+    h.append('</div>')  # .ds-right
+    h.append('</div>')  # .ds-main
 
-    # ── All requirements table ─────────────────────────────────────────────────
+    # ── All requirements (dense table) ────────────────────────────────────────
     if reqs:
         badge_html = {
-            "SATISFIES":     '<span class="badge badge-match">Satisfies</span>',
-            "VIOLATES":      '<span class="badge badge-viol">Violates</span>',
-            "RISKY":         '<span class="badge badge-part">Risky</span>',
-            "NOT_ADDRESSED": '<span class="badge badge-nf">Not Addressed</span>',
+            "SATISFIES":     '<span class="badge badge-match" style="font-size:10px;padding:1px 7px;">Pass</span>',
+            "VIOLATES":      '<span class="badge badge-viol"  style="font-size:10px;padding:1px 7px;">Fail</span>',
+            "RISKY":         '<span class="badge badge-part"  style="font-size:10px;padding:1px 7px;">Risky</span>',
+            "NOT_ADDRESSED": '<span class="badge badge-nf"    style="font-size:10px;padding:1px 7px;">N/A</span>',
         }
-        h.append('<div class="sr-card"><div class="sr-card-title">All Policy Requirements</div>')
-        h.append('<table class="sr-table"><thead><tr><th>#</th><th>Requirement</th><th>Status</th><th>Finding</th></tr></thead><tbody>')
+        h.append('<div class="ds-reqs">')
+        h.append('<div class="ds-reqs-hdr">All Policy Requirements</div>')
+        h.append('<table class="ds-rt"><thead><tr>'
+                 '<th style="width:28px;">#</th>'
+                 '<th>Requirement</th>'
+                 '<th style="width:66px;">Status</th>'
+                 '<th>Finding</th>'
+                 '</tr></thead><tbody>')
         for i, req in enumerate(reqs, 1):
-            st = req.get("status", "NOT_ADDRESSED")
-            h.append(f'''<tr>
-  <td style="color:#adb5bd;font-size:12px;">{i}</td>
-  <td style="font-weight:600;font-size:13px;">{_esc(req.get("requirement",""))}</td>
-  <td>{badge_html.get(st, f'<span class="badge">{st}</span>')}</td>
-  <td style="font-size:12px;color:#555;">{_esc(req.get("reason",""))}</td>
-</tr>''')
+            st      = req.get("status", "NOT_ADDRESSED")
+            st_badge = badge_html.get(st) or f'<span class="badge">{st}</span>'
+            h.append(
+                f'<tr>'
+                f'<td class="ds-rt-num">{i}</td>'
+                f'<td class="ds-rt-req">{_esc(req.get("requirement",""))}</td>'
+                f'<td>{st_badge}</td>'
+                f'<td class="ds-rt-find">{_esc(req.get("reason",""))}</td>'
+                f'</tr>'
+            )
         h.append('</tbody></table></div>')
-
-    # ── Risk points ────────────────────────────────────────────────────────────
-    risk_points = policy_analysis.get("risk_points", [])
-    if risk_points:
-        h.append('<div class="sr-card"><div class="sr-card-title">Risk Points</div>')
-        h.append('<table class="sr-table"><thead><tr><th>#</th><th>Risk</th></tr></thead><tbody>')
-        for i, rp in enumerate(risk_points, 1):
-            h.append(f'<tr><td style="color:#adb5bd;font-size:12px;">{i}</td><td style="font-size:13px;color:#fd7e14;">{_esc(rp)}</td></tr>')
-        h.append('</tbody></table></div>')
-
-    # ── Conditions ────────────────────────────────────────────────────────────
-    conditions = policy_analysis.get("conditions", [])
-    if conditions:
-        h.append('<div class="sr-card"><div class="sr-card-title">Conditions for Approval</div>')
-        for i, cond in enumerate(conditions, 1):
-            h.append(f'<div class="sr-check-item"><span>{i}. {_esc(cond)}</span><span class="badge badge-req">Required</span></div>')
-        h.append('</div>')
-
-    # ── Jurisdiction ───────────────────────────────────────────────────────────
-    if jurisdiction_info:
-        juris  = jurisdiction_info.get("jurisdiction", "")
-        laws   = jurisdiction_info.get("applicable_laws", [])
-        checks = jurisdiction_info.get("checklist", [])
-        if juris or laws or checks:
-            h.append('<div class="sr-card"><div class="sr-card-title">Jurisdiction &amp; Compliance Checklist</div>')
-            if juris:
-                h.append(f'<span class="sr-meta-pill">{_esc(juris)}</span>')
-            if laws:
-                h.append(f'<div style="font-size:12px;color:#6c757d;margin:10px 0;"><strong>Applicable Laws:</strong> '
-                         + " &nbsp;·&nbsp; ".join(_esc(l) for l in laws) + '</div>')
-            for item in checks:
-                lbl_cls = "badge-req" if item.get("required") else "badge-opt"
-                lbl_txt = "Required"  if item.get("required") else "Optional"
-                h.append(f'<div class="sr-check-item"><span>{_esc(item.get("item",""))}</span><span class="badge {lbl_cls}">{lbl_txt}</span></div>')
-            h.append('</div>')
 
     h.append('</div>')  # .sr
     return "\n".join(h)
