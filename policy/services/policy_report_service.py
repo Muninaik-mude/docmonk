@@ -1069,7 +1069,7 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
         all_elements.sort(key=lambda e: (e[0], e[1]))
 
         page_parts = [
-            f'<div style="position:relative;width:{pw:.2f}pt;min-height:{ph:.2f}pt;'
+            f'<div class="pdv-page" style="position:relative;width:{pw:.2f}pt;min-height:{ph:.2f}pt;'
             f'background:white;margin:0 auto 32px;overflow:visible;'
             f'box-shadow:0 2px 12px rgba(0,0,0,0.12);">'
         ]
@@ -1082,10 +1082,42 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
 
     doc.close()
 
+    # JS: after the browser has laid out everything, measure the actual bottom
+    # of every absolutely-positioned child in each page container and grow the
+    # container's min-height to match.  This prevents content that renders taller
+    # in HTML than in the source PDF (tables, wrapped text) from visually
+    # overflowing into the next page.
+    _overflow_fix_js = """
+<script>
+(function(){
+  function fixPages(){
+    document.querySelectorAll('.pdv-page').forEach(function(pg){
+      var maxBottom = 0;
+      var children = pg.children;
+      for(var i = 0; i < children.length; i++){
+        var child = children[i];
+        var b = child.offsetTop + child.offsetHeight;
+        if(b > maxBottom) maxBottom = b;
+      }
+      // 24px breathing room so the last row isn't flush against the page edge
+      var needed = maxBottom + 24;
+      if(needed > pg.offsetHeight){
+        pg.style.minHeight = needed + 'px';
+      }
+    });
+  }
+  // Run immediately (DOM is already parsed at this point) and also after
+  // any images / fonts finish loading which can shift layout slightly.
+  fixPages();
+  window.addEventListener('load', fixPages);
+})();
+</script>"""
+
     return (
         '<div style="background:#f3f4f6;padding:24px 16px;">'
         + "\n".join(page_htmls)
-        + '</div>'
+        + _overflow_fix_js
+        + '\n</div>'
     )
 
 

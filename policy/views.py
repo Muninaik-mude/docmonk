@@ -1,10 +1,16 @@
 import base64
 import binascii
 import logging
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import cast
 
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -24,6 +30,100 @@ def _decode_base64_document(base64_string: str) -> bytes:
     if "," in base64_string and base64_string.index(",") < 200:
         base64_string = base64_string.split(",", 1)[1]
     return base64.b64decode(base64_string.strip())
+
+
+class PdfToHtmlView(APIView):
+    """
+    POST /v1/policy/render-pdf
+
+    Convert a PDF to HTML using pdf2htmlEX.
+    Accepts multipart file under "file" or base64 under "document_base64".
+    Returns the HTML response body directly (text/html).
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        upload = request.FILES.get("file")
+        doc_b64 = (request.data.get("document_base64") or "").strip()
+
+        if not upload and not doc_b64:
+            return Response(
+                {"status": "error", "message": "Provide file or document_base64"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if upload:
+            doc_bytes = upload.read()
+            doc_name = upload.name or "document.pdf"
+        else:
+            try:
+                doc_bytes = _decode_base64_document(doc_b64)
+                doc_name = "document.pdf"
+            except (binascii.Error, ValueError) as e:
+                return Response(
+                    {"status": "error", "message": f"Invalid base64 document: {e}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if len(doc_bytes) > _MAX_FILE_SIZE_BYTES:
+            msg = f"File size exceeds {_MAX_FILE_SIZE_MB} MB limit"
+            return Response({"status": "error", "message": msg}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+
+        file_type = pdf_service.detect_file_type(doc_name, doc_bytes)
+        if file_type != "pdf":
+            return Response(
+                {"status": "error", "message": f"Unsupported file type: {file_type}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        exe = shutil.which("pdf2htmlEX")
+        if not exe:
+            return Response(
+                {"status": "error", "message": "pdf2htmlEX not installed on server"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="pdf2html_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            pdf_path = tmp_path / "input.pdf"
+            out_dir = tmp_path / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_html = out_dir / "output.html"
+            pdf_path.write_bytes(doc_bytes)
+
+            cmd = [
+                exe,
+                "--dest-dir", str(out_dir),
+                "--embed", "cfi",
+                "--optimize-text", "1",
+                "--correct-text-visibility", "1",
+                "--process-outline", "0",
+                "--printing", "0",
+                "--fit-width", "0",
+                "--fit-height", "0",
+                "--zoom", "1.0",
+                str(pdf_path),
+                str(out_html),
+            ]
+
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                return Response(
+                    {"status": "error", "message": "pdf2htmlEX timed out"},
+                    status=status.HTTP_504_GATEWAY_TIMEOUT,
+                )
+
+            if proc.returncode != 0 or not out_html.exists():
+                detail = (proc.stderr or proc.stdout or "unknown error").strip()
+                return Response(
+                    {"status": "error", "message": f"pdf2htmlEX failed: {detail}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            html = out_html.read_text(encoding="utf-8", errors="replace")
+            return HttpResponse(html, content_type="text/html")
 
 
 class PolicyAnalyzerView(APIView):
