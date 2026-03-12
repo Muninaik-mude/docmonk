@@ -3,4 +3,4 @@ healthcheckPath    = "/health"
 healthcheckTimeout = 30
 restartPolicyType       = "on_failure"
 restartPolicyMaxRetries = 10
-startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py"
+startCommand = "python scripts/wait_for_db.py && python manage.py migrate --noinput && python manage.py collectstatic --noinput && PYTHONUNBUFFERED=1 gunicorn config.wsgi:application --config gunicorn.conf.py"
