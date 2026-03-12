@@ -118,23 +118,35 @@ _DOC_CSS = """
   border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
 }
 
-/* ── Panels (NOT_ADDRESSED / Risk / Conditions) ── */
-.na-panel {
-  border-left: 4px solid #3b82f6; border-radius: 8px;
-  background: #eff6ff; padding: 14px 18px; margin-top: 18px;
-  box-shadow: 0 1px 4px rgba(59,130,246,0.08);
+/* ── Legend anchor links ── */
+.pdv-legend a { text-decoration:none; color:inherit; }
+.pdv-legend a:hover > span { filter:brightness(0.93); }
+
+/* ── Panels (all 4 statuses) ── */
+
+/* Shared panel scroll-offset so headings aren't hidden under sticky bars */
+.vio-panel, .risk-panel, .na-panel, .sat-panel {
+  scroll-margin-top: 12px;
 }
-.na-title {
-  font-weight: 700; font-size: 13px; color: #1e40af;
+
+/* VIOLATES — red */
+.vio-panel {
+  border-left: 4px solid #dc2626; border-radius: 8px;
+  background: #fef2f2; padding: 14px 18px; margin-top: 18px;
+  box-shadow: 0 1px 4px rgba(220,38,38,0.08);
+}
+.vio-title {
+  font-weight: 700; font-size: 13px; color: #991b1b;
   margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
 }
-.na-item {
-  font-size: 13px; color: #1e3a8a; padding: 5px 0 5px 16px; position: relative;
-  border-bottom: 1px solid rgba(59,130,246,0.12);
+.vio-item {
+  font-size: 13px; color: #7f1d1d; padding: 5px 0 5px 22px; position: relative;
+  border-bottom: 1px solid rgba(220,38,38,0.12);
 }
-.na-item:last-child { border-bottom: none; }
-.na-item::before { content:"·"; position:absolute; left:3px; color:#3b82f6; font-size:18px; line-height:1; top:4px; }
+.vio-item:last-child { border-bottom: none; }
+.vio-item::before { content:"✗"; position:absolute; left:1px; font-size:11px; top:6px; color:#dc2626; font-weight:700; }
 
+/* RISKY — amber */
 .risk-panel {
   border-left: 4px solid #f59e0b; border-radius: 8px;
   background: #fffbeb; padding: 14px 18px; margin-top: 14px;
@@ -151,6 +163,41 @@ _DOC_CSS = """
 .risk-item:last-child { border-bottom: none; }
 .risk-item::before { content:"⚠"; position:absolute; left:0; font-size:12px; top:5px; }
 
+/* NOT ADDRESSED — blue */
+.na-panel {
+  border-left: 4px solid #3b82f6; border-radius: 8px;
+  background: #eff6ff; padding: 14px 18px; margin-top: 14px;
+  box-shadow: 0 1px 4px rgba(59,130,246,0.08);
+}
+.na-title {
+  font-weight: 700; font-size: 13px; color: #1e40af;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.na-item {
+  font-size: 13px; color: #1e3a8a; padding: 5px 0 5px 16px; position: relative;
+  border-bottom: 1px solid rgba(59,130,246,0.12);
+}
+.na-item:last-child { border-bottom: none; }
+.na-item::before { content:"·"; position:absolute; left:3px; color:#3b82f6; font-size:18px; line-height:1; top:4px; }
+
+/* SATISFIES — green */
+.sat-panel {
+  border-left: 4px solid #16a34a; border-radius: 8px;
+  background: #f0fdf4; padding: 14px 18px; margin-top: 14px;
+  box-shadow: 0 1px 4px rgba(22,163,74,0.08);
+}
+.sat-title {
+  font-weight: 700; font-size: 13px; color: #15803d;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.sat-item {
+  font-size: 13px; color: #14532d; padding: 5px 0 5px 20px; position: relative;
+  border-bottom: 1px solid rgba(22,163,74,0.12);
+}
+.sat-item:last-child { border-bottom: none; }
+.sat-item::before { content:"✓"; position:absolute; left:1px; font-size:11px; top:6px; color:#16a34a; font-weight:700; }
+
+/* CONDITIONS — teal */
 .cond-panel {
   border-left: 4px solid #10b981; border-radius: 8px;
   background: #ecfdf5; padding: 14px 18px; margin-top: 14px;
@@ -166,6 +213,9 @@ _DOC_CSS = """
 }
 .cond-item:last-child { border-bottom: none; }
 .cond-item::before { content:"›"; position:absolute; left:2px; font-weight:900; color:#10b981; }
+
+/* Empty-state text inside any panel */
+.panel-empty { font-size:13px; color:#9ca3af; font-style:italic; padding:4px 0; }
 </style>
 """
 
@@ -268,15 +318,27 @@ def _tip_attr(status: str, requirement: str, reason: str) -> str:
 
 # ── DOCX → highlighted HTML ────────────────────────────────────────────────────
 
+# Word 2010+ namespace for w14:checkbox content controls
+_W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+
+
 def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
     """
     Convert DOCX to HTML applying exact run-level font/color/size/alignment from
     the source file — a true mirror image of the original document.
     Overlays highlight background + tooltip only on policy-matched text.
+
+    Fully preserves:
+    - w14:checkbox content control SDTs  (modern Word 2010+ checkboxes)
+    - Legacy FORMCHECKBOX / FORMRADIO field codes
+    - Inline SDTs (text fields, date pickers) inside paragraphs
+    - Body-level SDTs wrapping paragraphs or tables
+    - Table cells containing any of the above
     """
     try:
         from docx import Document as DocxDocument
         from docx.text.paragraph import Paragraph as DocxPara
+        from docx.text.run import Run as DocxRun
         from docx.table import Table as DocxTable
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.oxml.ns import qn
@@ -288,6 +350,8 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
         WD_ALIGN_PARAGRAPH.RIGHT:   "right",
         WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
     }
+
+    # ── Style helpers ─────────────────────────────────────────────────────────
 
     def _run_rgb(run):
         """Return '#RRGGBB' from run font color, or None."""
@@ -327,13 +391,104 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
             break
         return ";".join(css)
 
-    def _runs_html(para):
+    def _cell_bg(cell):
+        """Return '#RRGGBB' cell shading from w:shd, or None."""
+        try:
+            tc   = cell._tc
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is not None:
+                shd  = tcPr.find(qn("w:shd"))
+                if shd is not None:
+                    fill = shd.get(qn("w:fill"))
+                    if fill and len(fill) == 6 and fill.upper() not in ("AUTO",):
+                        return f"#{fill}"
+        except Exception:
+            pass
+        return None
+
+    def _cell_text_style(cell):
+        """Return inline CSS for a cell's dominant text style (font/color/bold)."""
+        css = ["font-family:Arial,sans-serif;font-size:10pt"]
+        for para in cell.paragraphs:
+            for run in para.runs:
+                if not run.text.strip():
+                    continue
+                rgb = _run_rgb(run)
+                if rgb:
+                    css.append(f"color:{rgb}")
+                if run.bold:
+                    css.append("font-weight:700")
+                fn = run.font.name
+                if fn:
+                    css[0] = f"font-family:'{fn}',Arial,sans-serif;font-size:10pt"
+                break
+            break
+        return ";".join(css)
+
+    # ── Checkbox / form-field detection ──────────────────────────────────────
+
+    def _sdt_checkbox_state(sdt_elem):
         """
-        Convert runs to HTML. The paragraph container already carries the
-        dominant style, so here we only wrap runs that deviate (different
-        color, size, bold toggle, italic).
+        Detect a w14:checkbox content control (Word 2010+).
+        Returns True/False for checked state, or None if not a checkbox SDT.
         """
-        # Detect paragraph-level dominant color and bold from first real run
+        sdtPr = sdt_elem.find(qn("w:sdtPr"))
+        if sdtPr is None:
+            return None
+        cb = sdtPr.find(f"{{{_W14_NS}}}checkbox")
+        if cb is None:
+            return None
+        checked_el = cb.find(f"{{{_W14_NS}}}checked")
+        if checked_el is None:
+            return False
+        val = checked_el.get(f"{{{_W14_NS}}}val", "0")
+        return val not in ("0", "false")
+
+    def _legacy_ff_checkbox_state(r_elem):
+        """
+        Detect a legacy FORMCHECKBOX / FORMRADIO field code embedded in a w:r.
+        The run must contain w:fldChar fldCharType='begin' with w:ffData/w:checkBox.
+        Returns True/False for checked state, or None if not a checkbox run.
+        """
+        fld = r_elem.find(qn("w:fldChar"))
+        if fld is None:
+            return None
+        if fld.get(qn("w:fldCharType")) != "begin":
+            return None
+        ffData = fld.find(qn("w:ffData"))
+        if ffData is None:
+            return None
+        checkBox = ffData.find(qn("w:checkBox"))
+        if checkBox is None:
+            return None
+        checked_el = checkBox.find(qn("w:checked"))
+        if checked_el is None:
+            return False
+        val = checked_el.get(qn("w:val"), "1")
+        return val not in ("0", "false")
+
+    def _checkbox_html(checked: bool, size_pt=None) -> str:
+        """Render a disabled HTML checkbox preserving its checked/unchecked state."""
+        sz  = f"{size_pt:.0f}px" if size_pt else "13px"
+        chk = "checked" if checked else ""
+        return (
+            f'<input type="checkbox" {chk} disabled '
+            f'style="width:{sz};height:{sz};vertical-align:middle;'
+            f'margin:0 4px 0 1px;accent-color:#1F4E79;cursor:default;">'
+        )
+
+    # ── Run-level HTML (paragraph content) ───────────────────────────────────
+
+    def _runs_html(para) -> str:
+        """
+        Convert paragraph children to HTML, handling:
+        - Normal runs (bold/italic/underline/color/size deviations)
+        - Inline w:sdt checkbox content controls
+        - Legacy FORMCHECKBOX / FORMRADIO field codes
+        - Inline hyperlinks
+        - Non-checkbox inline SDTs (text fields, date pickers) → plain text
+        """
+        # Dominant style from first real text run (paragraph-level baseline)
         dom_rgb  = None
         dom_bold = False
         dom_sz   = None
@@ -341,23 +496,77 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
             if r.text.strip():
                 dom_rgb  = _run_rgb(r)
                 dom_bold = bool(r.bold)
-                sz = r.font.size
-                dom_sz = sz.pt if sz else None
+                sz       = r.font.size
+                dom_sz   = sz.pt if sz else None
                 break
 
-        out = []
-        for run in para.runs:
+        out      = []
+        in_fld   = False   # True while consuming a FORMCHECKBOX/FORMRADIO field
+        fld_chk  = None    # checked state of the current legacy field
+
+        for child in para._p:
+            ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+            # ── Inline SDT (w14:checkbox or text/date content control) ────────
+            if ctag == "sdt":
+                checked = _sdt_checkbox_state(child)
+                if checked is not None:
+                    out.append(_checkbox_html(checked, dom_sz))
+                else:
+                    # Non-checkbox SDT: extract raw text from sdtContent
+                    sdtContent = child.find(qn("w:sdtContent"))
+                    if sdtContent is not None:
+                        for t_el in sdtContent.findall(f".//{qn('w:t')}"):
+                            if t_el.text:
+                                out.append(_esc(t_el.text))
+                continue
+
+            # ── Hyperlink: recurse into its child runs ────────────────────────
+            if ctag == "hyperlink":
+                for r_elem in child.findall(qn("w:r")):
+                    run = DocxRun(r_elem, para)
+                    if run.text:
+                        chunk = _esc(run.text)
+                        if run.underline:
+                            chunk = f'<u style="color:#0563C1;">{chunk}</u>'
+                        out.append(chunk)
+                continue
+
+            # ── Only process w:r from here ────────────────────────────────────
+            if ctag != "r":
+                continue
+
+            # ── Legacy FORMCHECKBOX/FORMRADIO begin ───────────────────────────
+            ff_state = _legacy_ff_checkbox_state(child)
+            if ff_state is not None:
+                in_fld  = True
+                fld_chk = ff_state
+                continue
+
+            # ── Legacy field end → emit checkbox ─────────────────────────────
+            fld_el = child.find(qn("w:fldChar"))
+            if fld_el is not None:
+                if fld_el.get(qn("w:fldCharType")) == "end" and in_fld:
+                    in_fld = False
+                    out.append(_checkbox_html(fld_chk, dom_sz))
+                    fld_chk = None
+                    continue
+
+            if in_fld:
+                continue   # skip instrText / w:fldChar separate runs inside field
+
+            # ── Normal run ────────────────────────────────────────────────────
+            run = DocxRun(child, para)
             text = run.text
             if not text:
                 continue
             chunk = _esc(text)
 
-            # Collect per-run deviations
             span_css = []
-            run_rgb = _run_rgb(run)
+            run_rgb  = _run_rgb(run)
             if run_rgb and run_rgb != dom_rgb:
                 span_css.append(f"color:{run_rgb}")
-            sz = run.font.size
+            sz     = run.font.size
             run_sz = sz.pt if sz else None
             if run_sz and run_sz != dom_sz:
                 span_css.append(f"font-size:{run_sz:.1f}pt")
@@ -377,113 +586,130 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
 
         return "".join(out) if out else _esc(para.text)
 
-    def _cell_bg(cell):
-        """Return '#RRGGBB' cell shading from w:shd, or None."""
-        try:
-            tc   = cell._tc
-            tcPr = tc.find(qn("w:tcPr"))
-            if tcPr is not None:
-                shd  = tcPr.find(qn("w:shd"))
-                if shd is not None:
-                    fill = shd.get(qn("w:fill"))
-                    if fill and len(fill) == 6 and fill.upper() not in ("AUTO",):
-                        return f"#{fill}"
-        except Exception:
-            pass
-        return None
+    # ── Element renderers ─────────────────────────────────────────────────────
 
-    def _cell_text_style(cell):
-        """Return inline CSS for a cell's text (font/color/bold from first run)."""
-        css = ["font-family:Arial,sans-serif;font-size:10pt"]
+    def _has_inline_checkboxes(p_elem) -> bool:
+        """True if the paragraph element contains any inline checkbox SDTs."""
+        for child in p_elem:
+            ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if ctag == "sdt" and _sdt_checkbox_state(child) is not None:
+                return True
+            # Legacy FORMCHECKBOX begin
+            if ctag == "r":
+                if _legacy_ff_checkbox_state(child) is not None:
+                    return True
+        return False
+
+    def _render_paragraph(p_elem) -> str | None:
+        """Render a w:p element to an HTML <p> string, or None if empty."""
+        para = DocxPara(p_elem, doc)
+        text = para.text.strip()
+
+        # Skip truly empty paragraphs unless they carry inline form controls
+        if not text and not _has_inline_checkboxes(p_elem):
+            return None
+
+        base_style = _para_inline_style(para)
+        inner_html = _runs_html(para)
+        if not inner_html.strip():
+            return None
+
+        match = _match_highlight(text, highlight_map)
+        if match:
+            hl_bg = _STATUS_BG.get(match[0], "")
+            tip   = _tip_attr(*match)
+            style = f"{base_style};background-color:{hl_bg};" if hl_bg else base_style
+            return f'<p class="pdv-para" style="{style}" data-tip=\'{tip}\'>{inner_html}</p>'
+        return f'<p class="pdv-para" style="{base_style}">{inner_html}</p>'
+
+    def _cell_content_html(cell) -> str:
+        """
+        Render a table cell's full content using _runs_html so that checkboxes
+        and other inline controls inside cells are preserved.
+        Falls back to escaped plain text if all paragraphs are truly empty.
+        """
+        rendered = []
         for para in cell.paragraphs:
-            for run in para.runs:
-                if not run.text.strip():
-                    continue
-                rgb = _run_rgb(run)
-                if rgb:
-                    css.append(f"color:{rgb}")
-                if run.bold:
-                    css.append("font-weight:700")
-                fn = run.font.name
-                if fn:
-                    css[0] = f"font-family:'{fn}',Arial,sans-serif;font-size:10pt"
-                break
-            break
-        return ";".join(css)
+            inner = _runs_html(para)
+            if inner.strip():
+                rendered.append(inner)
+        return "<br>".join(rendered) if rendered else _esc(cell.text)
+
+    def _render_table(tbl_elem) -> list:
+        """Render a w:tbl element, returning a list of HTML strings."""
+        table  = DocxTable(tbl_elem, doc)
+        rows_h = ['<table class="pdv-table">']
+
+        for row in table.rows:
+            # Deduplicate merged cells by plain text key
+            seen_cells: list = []
+            seen_set:   set  = set()
+            for cell in row.cells:
+                cv = cell.text.strip()
+                if cv not in seen_set:
+                    seen_cells.append(cell)
+                    seen_set.add(cv)
+
+            if not any(c.text.strip() for c in seen_cells):
+                continue
+
+            # Determine highlight for the row / individual cells
+            row_text = " | ".join(c.text.strip() for c in seen_cells)
+            match    = _match_highlight(row_text, highlight_map)
+            if not match:
+                for cell in seen_cells:
+                    match = _match_highlight(cell.text.strip(), highlight_map)
+                    if match:
+                        break
+
+            hl_bg   = _STATUS_BG.get(match[0]) if match else None
+            tip_str = f" data-tip='{_tip_attr(*match)}'" if match else ""
+
+            rows_h.append("<tr>")
+            for cell in seen_cells:
+                text_style   = _cell_text_style(cell)
+                bg           = hl_bg if hl_bg else (_cell_bg(cell) or None)
+                bg_css       = f"background-color:{bg};" if bg else ""
+                cell_content = _cell_content_html(cell)
+                rows_h.append(
+                    f'<td style="{text_style};{bg_css}vertical-align:top;'
+                    f'border:1px solid #d1d5db;padding:5px 10px;"{tip_str}>'
+                    f'{cell_content}</td>'
+                )
+            rows_h.append("</tr>")
+
+        rows_h.append("</table>")
+        return rows_h
+
+    def _render_children(children) -> list:
+        """
+        Dispatch a sequence of body-level (or sdtContent-level) child elements
+        to their respective renderers.  Handles p, tbl, and sdt recursively.
+        """
+        parts: list = []
+        for child in children:
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+            if tag == "p":
+                html = _render_paragraph(child)
+                if html:
+                    parts.append(html)
+
+            elif tag == "tbl":
+                parts.extend(_render_table(child))
+
+            elif tag == "sdt":
+                # Body-level SDT: recurse into its content (may contain p / tbl / nested sdt)
+                sdtContent = child.find(qn("w:sdtContent"))
+                if sdtContent is not None:
+                    parts.extend(_render_children(sdtContent))
+
+        return parts
 
     # ── Build HTML ────────────────────────────────────────────────────────────
     doc   = DocxDocument(io.BytesIO(doc_bytes))
     parts = ['<div class="pdv-wrap">']
-
-    for child in doc.element.body:
-        raw_tag = child.tag
-        tag     = raw_tag.split("}")[-1] if "}" in raw_tag else raw_tag
-
-        # ── Paragraph ────────────────────────────────────────────────────────
-        if tag == "p":
-            para = DocxPara(child, doc)
-            text = para.text.strip()
-            if not text:
-                continue
-
-            base_style = _para_inline_style(para)
-            inner_html = _runs_html(para)
-
-            match = _match_highlight(text, highlight_map)
-            if match:
-                hl_bg = _STATUS_BG.get(match[0], "")
-                tip   = _tip_attr(*match)
-                style = f"{base_style};background-color:{hl_bg};" if hl_bg else base_style
-                parts.append(f'<p class="pdv-para" style="{style}" data-tip=\'{tip}\'>{inner_html}</p>')
-            else:
-                parts.append(f'<p class="pdv-para" style="{base_style}">{inner_html}</p>')
-
-        # ── Table ─────────────────────────────────────────────────────────────
-        elif tag == "tbl":
-            table = DocxTable(child, doc)
-            parts.append('<table class="pdv-table">')
-
-            for row in table.rows:
-                # Deduplicate merged cells
-                seen_cells = []
-                seen_set   = set()
-                for cell in row.cells:
-                    cv = cell.text.strip()
-                    if cv not in seen_set:
-                        seen_cells.append(cell)
-                        seen_set.add(cv)
-
-                if not any(c.text.strip() for c in seen_cells):
-                    continue
-
-                # Determine highlight
-                row_text = " | ".join(c.text.strip() for c in seen_cells)
-                match    = _match_highlight(row_text, highlight_map)
-                if not match:
-                    for cell in seen_cells:
-                        match = _match_highlight(cell.text.strip(), highlight_map)
-                        if match:
-                            break
-
-                hl_bg   = _STATUS_BG.get(match[0]) if match else None
-                tip_str = f" data-tip='{_tip_attr(*match)}'" if match else ""
-
-                parts.append("<tr>")
-                for cell in seen_cells:
-                    cv         = cell.text.strip()
-                    text_style = _cell_text_style(cell)
-                    # Background: highlight wins over original DOCX cell shading
-                    bg         = hl_bg if hl_bg else (_cell_bg(cell) or None)
-                    bg_css     = f"background-color:{bg};" if bg else ""
-                    parts.append(
-                        f'<td style="{text_style};{bg_css}vertical-align:top;'
-                        f'border:1px solid #d1d5db;padding:5px 10px;"{tip_str}>'
-                        f'{_esc(cv)}</td>'
-                    )
-                parts.append("</tr>")
-
-            parts.append("</table>")
-
+    parts.extend(_render_children(doc.element.body))
     parts.append("</div>")
     return "\n".join(parts)
 
@@ -1066,13 +1292,23 @@ def generate_policy_report(
     hl_map = _build_highlight_map(reqs)
     lines  = [_DOC_CSS]
 
-    # ── Legend ─────────────────────────────────────────────────────────────────
+    # ── Count each status for the legend badges ───────────────────────────────
+    sat_reqs   = [r for r in reqs if r.get("status") == "SATISFIES"]
+    vio_reqs   = [r for r in reqs if r.get("status") == "VIOLATES"]
+    risky_reqs = [r for r in reqs if r.get("status") == "RISKY"]
+    na_reqs    = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
+    risk_pts   = policy_analysis.get("risk_points", [])
+
+    risky_total = len(risky_reqs) + len(risk_pts)
+
+    # ── Legend — clickable badges that jump to the matching bottom panel ───────
     lines.append(
         '<div class="pdv-legend">'
-        '<span class="leg-sat">&#x2714; Satisfies</span>'
-        '<span class="leg-vio">&#x2716; Violates</span>'
-        '<span class="leg-rsk">&#x26A0; Risky</span>'
-        '<span style="color:#9ca3af;font-size:11px;">— Hover highlighted text for details</span>'
+        f'<a href="#sec-sat"><span class="leg-sat">&#x2714; Satisfies ({len(sat_reqs)})</span></a>'
+        f'<a href="#sec-vio"><span class="leg-vio">&#x2716; Violates ({len(vio_reqs)})</span></a>'
+        f'<a href="#sec-rsk"><span class="leg-rsk">&#x26A0; Risky ({risky_total})</span></a>'
+        f'<a href="#sec-na"><span class="leg-na">&#x25CB; Not Addressed ({len(na_reqs)})</span></a>'
+        '<span style="color:#9ca3af;font-size:11px;">— Click a badge to jump to section &middot; Hover highlighted text for details</span>'
         '</div>'
     )
 
@@ -1092,6 +1328,62 @@ def generate_policy_report(
         doc_html = "<p><em>No document content available.</em></p>"
 
     lines.append(doc_html)
+
+    # ── Bottom summary panels — all 4 statuses ────────────────────────────────
+
+    # 1. VIOLATES (most critical first)
+    lines.append(f'<div class="vio-panel" id="sec-vio">')
+    lines.append(f'<div class="vio-title">&#x2716; Violations Found ({len(vio_reqs)})</div>')
+    if vio_reqs:
+        for r in vio_reqs:
+            req_text = _esc(r.get("requirement", ""))
+            reason   = _esc(r.get("reason", ""))
+            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
+            lines.append(f'<div class="vio-item">{body}</div>')
+    else:
+        lines.append('<div class="panel-empty">No violations found.</div>')
+    lines.append('</div>')
+
+    # 2. RISKY
+    lines.append(f'<div class="risk-panel" id="sec-rsk">')
+    lines.append(f'<div class="risk-title">&#x26A0; Risk Points ({risky_total})</div>')
+    if risky_reqs or risk_pts:
+        for r in risky_reqs:
+            req_text = _esc(r.get("requirement", ""))
+            reason   = _esc(r.get("reason", ""))
+            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
+            lines.append(f'<div class="risk-item">{body}</div>')
+        for pt in risk_pts:
+            lines.append(f'<div class="risk-item">{_esc(str(pt))}</div>')
+    else:
+        lines.append('<div class="panel-empty">No risk points identified.</div>')
+    lines.append('</div>')
+
+    # 3. NOT ADDRESSED
+    lines.append(f'<div class="na-panel" id="sec-na">')
+    lines.append(f'<div class="na-title">&#x25CB; Not Addressed in Document ({len(na_reqs)})</div>')
+    if na_reqs:
+        for r in na_reqs:
+            req_text = _esc(r.get("requirement", ""))
+            reason   = _esc(r.get("reason", "") or r.get("recommendation", ""))
+            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
+            lines.append(f'<div class="na-item">{body}</div>')
+    else:
+        lines.append('<div class="panel-empty">All requirements are addressed.</div>')
+    lines.append('</div>')
+
+    # 4. SATISFIES
+    lines.append(f'<div class="sat-panel" id="sec-sat">')
+    lines.append(f'<div class="sat-title">&#x2714; Requirements Satisfied ({len(sat_reqs)})</div>')
+    if sat_reqs:
+        for r in sat_reqs:
+            req_text = _esc(r.get("requirement", ""))
+            reason   = _esc(r.get("reason", ""))
+            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
+            lines.append(f'<div class="sat-item">{body}</div>')
+    else:
+        lines.append('<div class="panel-empty">No satisfied requirements found.</div>')
+    lines.append('</div>')
 
     # ── Global tooltip card + JS ───────────────────────────────────────────────
     lines.append(_TOOLTIP_JS)
