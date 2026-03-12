@@ -5,20 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# OS deps + pdf2htmlEX AppImage (Debian packages no longer ship pdf2htmlEX)
+# OS deps for pdf2htmlEX + fonts for closer visual fidelity
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
+    pdf2htmlex \
     poppler-utils \
     fontconfig \
     fonts-dejavu-core \
     fonts-liberation \
- && curl -L -o /tmp/pdf2htmlEX.AppImage \
-    https://github.com/pdf2htmlEX/pdf2htmlEX/releases/download/v0.18.8.rc1/pdf2htmlEX-0.18.8.rc1-master-20200630-Ubuntu-bionic-x86_64.AppImage \
- && chmod +x /tmp/pdf2htmlEX.AppImage \
- && /tmp/pdf2htmlEX.AppImage --appimage-extract \
- && mv squashfs-root/usr/bin/pdf2htmlEX /usr/local/bin/pdf2htmlEX \
- && rm -rf /tmp/pdf2htmlEX.AppImage squashfs-root \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
