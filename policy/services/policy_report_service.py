@@ -118,10 +118,6 @@ _DOC_CSS = """
   border-radius:20px; font-weight:600; font-size:11px; letter-spacing:.02em;
 }
 
-/* ── Legend anchor links ── */
-.pdv-legend a { text-decoration:none; color:inherit; }
-.pdv-legend a:hover > span { filter:brightness(0.93); }
-
 /* ── Panels (all 4 statuses) ── */
 
 /* Shared panel scroll-offset so headings aren't hidden under sticky bars */
@@ -1301,14 +1297,14 @@ def generate_policy_report(
 
     risky_total = len(risky_reqs) + len(risk_pts)
 
-    # ── Legend — clickable badges that jump to the matching bottom panel ───────
+    # ── Legend — badges (non-clickable) ───────────────────────────────────────
     lines.append(
         '<div class="pdv-legend">'
-        f'<a href="#sec-sat"><span class="leg-sat">&#x2714; Satisfies ({len(sat_reqs)})</span></a>'
-        f'<a href="#sec-vio"><span class="leg-vio">&#x2716; Violates ({len(vio_reqs)})</span></a>'
-        f'<a href="#sec-rsk"><span class="leg-rsk">&#x26A0; Risky ({risky_total})</span></a>'
-        f'<a href="#sec-na"><span class="leg-na">&#x25CB; Not Addressed ({len(na_reqs)})</span></a>'
-        '<span style="color:#9ca3af;font-size:11px;">— Click a badge to jump to section &middot; Hover highlighted text for details</span>'
+        f'<span class="leg-sat">&#x2714; Satisfies ({len(sat_reqs)})</span>'
+        f'<span class="leg-vio">&#x2716; Violates ({len(vio_reqs)})</span>'
+        f'<span class="leg-rsk">&#x26A0; Risky ({risky_total})</span>'
+        f'<span class="leg-na">&#x25CB; Not Addressed ({len(na_reqs)})</span>'
+        '<span style="color:#9ca3af;font-size:11px;">— Hover highlighted text for details</span>'
         '</div>'
     )
 
