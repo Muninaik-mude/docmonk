@@ -100,7 +100,7 @@ def analyze_document_against_policy(
     ]
 
     try:
-        response_text = _call_ai(messages, max_tokens=8000, temperature=0.1)
+        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42, pin_to_first=True)
         result = _safe_json_parse(response_text)
 
         # Normalize / validate fields

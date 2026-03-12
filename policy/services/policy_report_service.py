@@ -492,43 +492,41 @@ def _docx_to_html(doc_bytes: bytes, highlight_map: list) -> str:
 
 def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
     """
-    Comprehensive PDF → HTML mirror renderer.
+    PDF → HTML with absolute positioning for pixel-perfect layout fidelity.
 
-    Handles:
-    - Text blocks: exact font size / bold / italic / color per span
-    - Tables: detected via page.find_tables(), rendered as <table> preserving
-      rich per-cell span styling; empty columns collapsed automatically
-    - Form widgets: checkboxes, radio buttons, text fields rendered inline
-    - Reading order: tables and paragraphs interleaved by vertical position
+    Each PDF page becomes a position:relative container sized exactly to the
+    page dimensions (in points).  Every text block, image, and table is placed
+    with position:absolute at its exact PDF coordinates so nothing reflows.
 
-    Any PDF sent by the frontend will be reproduced faithfully with only
-    highlight background colours + tooltips added on top.
+    Highlights use two complementary mechanisms:
+      1. page.search_for() → precise span-level overlay divs at exact text coords.
+      2. _match_highlight() fallback → background-color on the parent block div
+         when search_for() cannot locate the text (e.g. ligatures / encoding).
     """
     try:
         import fitz
     except ImportError:
         return "<p><em>PyMuPDF (fitz) not installed; cannot render PDF.</em></p>"
 
+    import base64 as _b64
     from collections import Counter
 
     doc = fitz.open(stream=doc_bytes, filetype="pdf")
 
-    # ── Pass 1: dominant body font size ────────────────────────────────────────
-    all_sizes = []
-    for page in doc:
-        for block in page.get_text("dict")["blocks"]:
-            if block.get("type") != 0:
+    # ── Pass 1: dominant body font size (used as fallback for spans) ───────────
+    all_sizes: list[float] = []
+    for _pg in doc:
+        for blk in _pg.get_text("dict")["blocks"]:
+            if blk.get("type") != 0:
                 continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    sz   = span.get("size", 0)
-                    text = span.get("text", "").strip()
-                    if text and sz > 0:
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    sz = sp.get("size", 0)
+                    if sp.get("text", "").strip() and sz > 0:
                         all_sizes.append(round(sz, 1))
-
     normal_size: float = Counter(all_sizes).most_common(1)[0][0] if all_sizes else 11.0
 
-    # ── Inner helpers ──────────────────────────────────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _color_hex(color_int: int) -> str:
         return (
@@ -538,7 +536,7 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
         )
 
     def _render_span(span: dict) -> str:
-        """Single span → styled inline HTML."""
+        """Single PDF span → inline HTML with exact font/bold/italic/color."""
         raw = span.get("text", "")
         if not raw:
             return ""
@@ -548,275 +546,321 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
         is_bold   = bool(flags & 16)
         is_italic = bool(flags & 2)
         color     = _color_hex(span.get("color", 0))
+        font_name = span.get("font", "")
 
-        span_css: list[str] = []
-        if abs(sz - normal_size) > 0.5:
-            span_css.append(f"font-size:{sz:.1f}pt")
+        css: list[str] = [f"font-size:{sz:.1f}pt"]
         if is_bold:
-            span_css.append("font-weight:700")
+            css.append("font-weight:700")
         if color not in ("#000000", "#000001"):
-            span_css.append(f"color:{color}")
-        if span_css:
-            chunk = f'<span style="{";".join(span_css)}">{chunk}</span>'
+            css.append(f"color:{color}")
+        if font_name:
+            css.append(f"font-family:'{font_name}',Arial,sans-serif")
+        else:
+            css.append("font-family:Arial,sans-serif")
+
+        chunk = f'<span style="{";".join(css)}">{chunk}</span>'
         if is_italic:
             chunk = f"<em>{chunk}</em>"
         return chunk
 
-    def _block_to_html(block: dict):
-        """
-        Returns (plain_text, html_string, first_span) for a text block,
-        or (None, None, None) if empty.
-        """
-        lines = block.get("lines", [])
-        plain_parts: list[str] = []
-        html_lines:  list[str] = []
-        first_span = None
+    def _block_dominant_css(block: dict) -> str:
+        """CSS string for the block container based on first real span."""
+        for ln in block.get("lines", []):
+            for sp in ln.get("spans", []):
+                if sp.get("text", "").strip():
+                    sz    = sp.get("size", normal_size)
+                    flags = sp.get("flags", 0)
+                    color = _color_hex(sp.get("color", 0))
+                    fn    = sp.get("font", "")
+                    css   = [f"font-size:{sz:.1f}pt"]
+                    if flags & 16:
+                        css.append("font-weight:700")
+                    if color not in ("#000000", "#000001"):
+                        css.append(f"color:{color}")
+                    css.append(
+                        f"font-family:'{fn}',Arial,sans-serif" if fn
+                        else "font-family:Arial,sans-serif"
+                    )
+                    return ";".join(css)
+        return f"font-size:{normal_size:.1f}pt;font-family:Arial,sans-serif"
 
-        for line in lines:
-            lp: list[str] = []
-            lh: list[str] = []
-            for span in line.get("spans", []):
-                raw = span.get("text", "")
-                if not raw:
-                    continue
-                if first_span is None and raw.strip():
-                    first_span = span
-                lp.append(raw)
-                lh.append(_render_span(span))
-            lp_text = "".join(lp).strip()
-            if lp_text:
-                plain_parts.append(lp_text)
-                html_lines.append("".join(lh))
+    def _inside(cx: float, cy: float, bbox: tuple) -> bool:
+        """True if point (cx, cy) lies inside bbox (x0,y0,x1,y1)."""
+        return bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]
 
-        plain = " ".join(plain_parts).strip()
-        html  = "<br>".join(html_lines).strip()
-        return (plain, html, first_span) if plain else (None, None, None)
+    def _block_inside_any(bb: tuple, table_bboxes: list) -> bool:
+        cx = (bb[0] + bb[2]) / 2
+        cy = (bb[1] + bb[3]) / 2
+        return any(_inside(cx, cy, tb) for tb in table_bboxes)
 
-    def _container_style(first_span) -> str:
-        css = ["font-family:Arial,sans-serif"]
-        if first_span:
-            sz    = first_span.get("size", normal_size)
-            flags = first_span.get("flags", 0)
-            color = _color_hex(first_span.get("color", 0))
-            css.append(f"font-size:{sz:.1f}pt")
-            if flags & 16:
-                css.append("font-weight:700")
-            if color not in ("#000000", "#000001"):
-                css.append(f"color:{color}")
-        return ";".join(css)
-
-    def _para_html(plain: str, html: str, first_span) -> str:
-        base = _container_style(first_span)
-        match = _match_highlight(plain, highlight_map)
-        if match:
-            hl_bg = _STATUS_BG.get(match[0], "")
-            tip   = _tip_attr(*match)
-            style = f"{base};background-color:{hl_bg};" if hl_bg else base
-            return f'<p class="pdv-para" style="{style}" data-tip=\'{tip}\'>{html}</p>'
-        return f'<p class="pdv-para" style="{base}">{html}</p>'
-
-    def _center_in(bbox, container) -> bool:
-        """True if bbox centre falls within container rect."""
-        cx = (bbox[0] + bbox[2]) / 2
-        cy = (bbox[1] + bbox[3]) / 2
-        return (container[0] <= cx <= container[2] and
-                container[1] <= cy <= container[3])
-
-    def _spans_in_rect(page_dict: dict, rect: tuple) -> list:
-        """All spans whose centre lies within rect."""
-        result = []
-        for blk in page_dict["blocks"]:
-            if blk.get("type") != 0:
-                continue
-            for line in blk.get("lines", []):
-                for span in line.get("spans", []):
-                    sb = span.get("bbox", (0, 0, 0, 0))
-                    if _center_in(sb, rect):
-                        result.append(span)
-        return result
-
-    def _widget_html(widget) -> str:
-        """Render an AcroForm widget as inline HTML."""
-        ft  = widget.field_type_string or ""
-        val = str(widget.field_value or "")
-        off = val.lower() in ("off", "false", "no", "0", "")
-
-        if ft == "CheckBox":
-            sym = "☐" if off else "☑"
-            return f'<span style="font-size:13px;">{sym}</span>'
-        if ft == "RadioButton":
-            sym = "○" if off else "●"
-            return f'<span style="font-size:13px;">{sym}</span>'
-        if ft in ("Text", "Multiline"):
-            return (
-                f'<span style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
-                f'color:#222;border-bottom:1px solid #bbb;min-width:60px;'
-                f'display:inline-block;">{_esc(val)}</span>'
-            )
-        if ft in ("Listbox", "ComboBox"):
-            return (
-                f'<span style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
-                f'color:#222;border:1px solid #bbb;padding:0 4px;">{_esc(val)}</span>'
-            )
-        return _esc(val) if val else ""
-
-    def _render_table(tab, page_dict: dict, widgets_on_page: list) -> str:
-        """
-        Render one PyMuPDF Table as an HTML <table>.
-
-        - Collapses columns that are entirely empty across all rows.
-        - Per-cell rich HTML from span extraction within cell bbox.
-        - Widgets (checkboxes, radio, text fields) that land inside a cell
-          are appended after any text content.
-        - Highlight + tooltip applied at cell level.
-        """
-        rows_data = tab.extract()       # list[list[str|None]]
-        if not rows_data:
-            return ""
-
-        num_cols_raw = max((len(r) for r in rows_data if r), default=0)
-        if num_cols_raw == 0:
-            return ""
-
-        # Identify active (non-empty) column indices
-        active_cols: list[int] = []
-        for c in range(num_cols_raw):
-            if any((row[c] if c < len(row) else None) for row in rows_data):
-                active_cols.append(c)
-        if not active_cols:
-            return ""
-
-        tab_rows = tab.rows      # list of TableRow; .cells[c] → bbox or None
-
-        t_parts = ['<table class="pdv-table">']
-
-        for r_idx, row in enumerate(rows_data):
-            if not row:
-                continue
-            # Pad row to num_cols_raw
-            padded = list(row) + [""] * (num_cols_raw - len(row))
-
-            row_text = " | ".join(str(padded[c] or "") for c in active_cols).strip()
-            # Skip rows where every active cell is empty (PDF separator rows)
-            if not row_text.replace("|", "").strip():
-                continue
-
-            row_match = _match_highlight(row_text, highlight_map)
-            t_parts.append("<tr>")
-
-            for c_idx in active_cols:
-                cv = (padded[c_idx] or "").strip()
-                cell_match = row_match or (_match_highlight(cv, highlight_map) if cv else None)
-                hl_bg   = _STATUS_BG.get(cell_match[0]) if cell_match else None
-                tip_str = f" data-tip='{_tip_attr(*cell_match)}'" if cell_match else ""
-                bg_css  = f"background-color:{hl_bg};" if hl_bg else ""
-
-                # Rich HTML: use tab.rows[r_idx].cells[c_idx] for correct bbox
-                cell_inner = _esc(cv)
-                try:
-                    row_obj = tab_rows[r_idx] if r_idx < len(tab_rows) else None
-                    if row_obj and c_idx < len(row_obj.cells):
-                        cr = row_obj.cells[c_idx]
-                        if cr:
-                            crect = (cr[0], cr[1], cr[2], cr[3])
-                            cell_spans = _spans_in_rect(page_dict, crect)
-                            text_html  = "".join(_render_span(s) for s in cell_spans)
-
-                            # Widgets inside this cell
-                            wgt_html = ""
-                            for _, _, wgt, wbbox in widgets_on_page:
-                                if _center_in(wbbox, crect):
-                                    wgt_html += _widget_html(wgt)
-
-                            if text_html or wgt_html:
-                                sep = "&nbsp;" if text_html and wgt_html else ""
-                                cell_inner = text_html + sep + wgt_html
-                except Exception:
-                    pass
-
-                t_parts.append(
-                    f'<td style="font-family:Arial,sans-serif;font-size:{normal_size:.1f}pt;'
-                    f'{bg_css}vertical-align:top;border:1px solid #d1d5db;padding:5px 10px;"'
-                    f'{tip_str}>{cell_inner}</td>'
-                )
-
-            t_parts.append("</tr>")
-
-        t_parts.append("</table>")
-        return "\n".join(t_parts)
-
-    # ── Pass 2: render page-by-page ────────────────────────────────────────────
-    parts = ['<div class="pdv-wrap">']
+    # ── Pass 2: page-by-page rendering ────────────────────────────────────────
+    page_htmls: list[str] = []
 
     for pg_num, page in enumerate(doc):
+        pw: float = page.rect.width   # points
+        ph: float = page.rect.height  # points
         page_dict = page.get_text("dict")
 
-        # ── Collect AcroForm widgets on this page ─────────────────────────────
-        widgets_on_page: list = []   # [(y0, x0, widget, bbox_tuple)]
-        try:
-            for wgt in page.widgets():
-                wb = wgt.rect
-                if wb:
-                    bbox = (wb.x0, wb.y0, wb.x1, wb.y1)
-                    widgets_on_page.append((wb.y0, wb.x0, wgt, bbox))
-        except Exception:
-            pass
+        # ── 2a. Highlight overlays via search_for() ───────────────────────────
+        # One overlay div per rect returned by search_for for each matched text.
+        # These are rendered last (on top of everything else).
+        overlay_parts: list[str] = []
+        found_texts: set[str] = set()   # track which hl texts landed on this page
 
-        # ── Detect tables ─────────────────────────────────────────────────────
-        table_bboxes: list[tuple] = []   # bboxes of rendered tables
-        elements: list[tuple]     = []   # (y0, x0, html)
+        for hl_text, status, requirement, reason in highlight_map:
+            if not hl_text or len(hl_text.strip()) < 4:
+                continue
+            hl_bg = _STATUS_BG.get(status)
+            if not hl_bg:
+                continue
+            tip = _tip_attr(status, requirement, reason)
+
+            # Try full text first, then a shorter prefix (handles long excerpts)
+            candidates = [hl_text]
+            if len(hl_text) > 100:
+                # Take up to 100 chars, cut at last space so we don't split a word
+                short = hl_text[:100].rsplit(" ", 1)[0]
+                if len(short) >= 10:
+                    candidates.append(short)
+
+            for candidate in candidates:
+                try:
+                    rects = page.search_for(candidate)
+                except Exception:
+                    rects = []
+                for r in rects:
+                    found_texts.add(hl_text)
+                    rw = r.x1 - r.x0
+                    rh = r.y1 - r.y0
+                    overlay_parts.append(
+                        f'<div style="position:absolute;left:{r.x0:.2f}pt;top:{r.y0:.2f}pt;'
+                        f'width:{rw:.2f}pt;height:{rh:.2f}pt;'
+                        f'background-color:{hl_bg};opacity:0.5;'
+                        f'pointer-events:all;cursor:help;border-radius:2px;z-index:10;" '
+                        f'data-tip=\'{tip}\'></div>'
+                    )
+                if rects:
+                    break  # found on this page with this candidate — stop trying shorter
+
+        # ── 2b. Detect tables ─────────────────────────────────────────────────
+        table_bboxes: list[tuple] = []
+        table_elements: list[tuple] = []   # (y0, x0, html)
+
+        def _normalize_rows(raw_rows: list) -> list:
+            """
+            Convert PyMuPDF tab.extract() output to clean (label, value) pairs.
+
+            PyMuPDF often:
+            - Returns 4-6 phantom empty columns around the real 2 columns
+            - Splits wrapped cell text across consecutive rows
+            - Places the same logical column in different column indices across rows
+
+            Strategy:
+            1. Drop entirely-empty rows.
+            2. Merge single-cell "continuation" rows into the previous row's
+               matching column (handles line-wrapped label text like
+               "Estimated Credit Score (Co-\nBorrower)").
+            3. From each row take first-non-empty cell as label and
+               last-non-empty cell (if different) as value → always 2 columns.
+            """
+            # Step 1 — drop empty rows
+            non_empty = [
+                row for row in raw_rows
+                if any(v is not None and str(v).strip() for v in row)
+            ]
+            if not non_empty:
+                return []
+
+            # Step 2 — merge continuation rows
+            merged: list[list] = []
+            for row in non_empty:
+                filled = [(i, str(v).strip()) for i, v in enumerate(row)
+                          if v is not None and str(v).strip()]
+                if len(filled) == 1 and merged:
+                    # Single non-empty cell: append to same column of previous row
+                    col_idx, cell_text = filled[0]
+                    prev = merged[-1]
+                    if col_idx < len(prev) and prev[col_idx] is not None:
+                        prev_text = str(prev[col_idx]).rstrip()
+                        # Remove trailing hyphen from line-wrapped word
+                        if prev_text.endswith("-"):
+                            prev[col_idx] = prev_text[:-1] + cell_text
+                        else:
+                            prev[col_idx] = prev_text + " " + cell_text
+                        continue   # absorbed — don't add as new row
+                merged.append(list(row))
+
+            # Step 3 — extract (label, value) pairs
+            pairs: list[tuple[str, str]] = []
+            for row in merged:
+                filled = [(i, str(v).strip()) for i, v in enumerate(row)
+                          if v is not None and str(v).strip()]
+                if not filled:
+                    continue
+                label = filled[0][1]
+                value = filled[-1][1] if len(filled) > 1 else ""
+                pairs.append((label, value))
+            return pairs
 
         try:
             finder = page.find_tables()
             for tab in finder.tables:
-                tb       = tab.bbox
-                tab_bbox = (tb[0], tb[1], tb[2], tb[3])
-                t_html  = _render_table(tab, page_dict, widgets_on_page)
-                if t_html:
-                    table_bboxes.append(tab_bbox)
-                    elements.append((tab_bbox[1], tab_bbox[0], t_html))
-        except Exception as e:
-            logger.debug("PDF table detection skipped (page %d): %s", pg_num + 1, e)
+                tb = tab.bbox   # (x0, y0, x1, y1)
+                table_bboxes.append(tb)
 
-        # Widgets that are NOT inside any table → render standalone
-        widget_in_table: set = set()
-        for y0, x0, wgt, wbbox in widgets_on_page:
-            if any(_center_in(wbbox, tb) for tb in table_bboxes):
-                widget_in_table.add(id(wgt))
+                pairs = _normalize_rows(tab.extract())
+                if not pairs:
+                    continue
 
-        for y0, x0, wgt, wbbox in widgets_on_page:
-            if id(wgt) in widget_in_table:
-                continue
-            wh = _widget_html(wgt)
-            if wh:
-                elements.append((y0, x0, f'<p class="pdv-para">{wh}</p>'))
+                tw = tb[2] - tb[0]
+                t_parts = [
+                    f'<table style="border-collapse:collapse;width:{tw:.2f}pt;'
+                    f'font-size:{normal_size:.1f}pt;font-family:Arial,sans-serif;">'
+                ]
+                for label, value in pairs:
+                    row_text   = f"{label} | {value}" if value else label
+                    row_match  = _match_highlight(row_text, highlight_map)
+                    cell_match = row_match or _match_highlight(label, highlight_map) or (
+                        _match_highlight(value, highlight_map) if value else None
+                    )
+                    hl_bg  = _STATUS_BG.get(cell_match[0]) if cell_match else None
+                    tip_s  = f" data-tip='{_tip_attr(*cell_match)}'" if cell_match else ""
+                    bg_css = f"background-color:{hl_bg};" if hl_bg else ""
+                    lw = tw * 0.38   # label column ≈ 38% width (matches original PDF)
+                    t_parts.append(
+                        f'<tr>'
+                        f'<td style="{bg_css}border:1px solid #d1d5db;padding:4px 8px;'
+                        f'vertical-align:top;font-weight:600;width:{lw:.1f}pt;"'
+                        f'{tip_s}>{_esc(label)}</td>'
+                        f'<td style="{bg_css}border:1px solid #d1d5db;padding:4px 8px;'
+                        f'vertical-align:top;"{tip_s}>{_esc(value)}</td>'
+                        f'</tr>'
+                    )
+                t_parts.append("</table>")
 
-        # ── Text blocks not covered by a table ────────────────────────────────
+                table_elements.append((
+                    tb[1], tb[0],
+                    f'<div style="position:absolute;left:{tb[0]:.2f}pt;top:{tb[1]:.2f}pt;'
+                    f'width:{tw:.2f}pt;">' + "\n".join(t_parts) + '</div>'
+                ))
+        except Exception as exc:
+            logger.debug("PDF table detection skipped (page %d): %s", pg_num + 1, exc)
+
+        # ── 2c. Embedded images ───────────────────────────────────────────────
+        image_elements: list[tuple] = []   # (y0, x0, html)
+        try:
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                rects_list = page.get_image_rects(xref)
+                if not rects_list:
+                    continue
+                ir = rects_list[0]
+                try:
+                    base_img = doc.extract_image(xref)
+                    ext      = base_img.get("ext", "png")
+                    img_b64  = _b64.b64encode(base_img["image"]).decode()
+                    iw = ir.x1 - ir.x0
+                    ih = ir.y1 - ir.y0
+                    image_elements.append((
+                        ir.y0, ir.x0,
+                        f'<img src="data:image/{ext};base64,{img_b64}" '
+                        f'style="position:absolute;left:{ir.x0:.2f}pt;top:{ir.y0:.2f}pt;'
+                        f'width:{iw:.2f}pt;height:{ih:.2f}pt;display:block;" alt="">'
+                    ))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── 2d. Text blocks (skip blocks inside a detected table) ─────────────
+        text_elements: list[tuple] = []   # (y0, x0, html)
+
         for block in page_dict["blocks"]:
             if block.get("type") != 0:
                 continue
             bb = block.get("bbox", (0, 0, 0, 0))
-            if any(_center_in(bb, tb) for tb in table_bboxes):
+            if _block_inside_any(bb, table_bboxes):
                 continue
 
-            plain, html, first_span = _block_to_html(block)
-            if plain:
-                elements.append((bb[1], bb[0], _para_html(plain, html, first_span)))
+            bx0, by0, bx1, by1 = bb
+            bw = bx1 - bx0
+            bh = by1 - by0
 
-        # ── Render in reading order (top-to-bottom, left-to-right) ────────────
-        elements.sort(key=lambda e: (e[0], e[1]))
-        for _, _, html in elements:
-            parts.append(html)
+            lines_html:  list[str] = []
+            plain_parts: list[str] = []
+            for ln in block.get("lines", []):
+                lh: list[str] = []
+                lp: list[str] = []
+                for sp in ln.get("spans", []):
+                    raw = sp.get("text", "")
+                    if raw:
+                        lh.append(_render_span(sp))
+                        lp.append(raw)
+                if lp:
+                    lines_html.append("".join(lh))
+                    plain_parts.append("".join(lp).strip())
 
-        # Light page separator (except after last page)
-        if pg_num < len(doc) - 1:
-            parts.append(
-                '<hr style="border:none;border-top:2px dashed #e5e7eb;margin:20px 0;">'
-            )
+            if not lines_html:
+                continue
+
+            block_plain = " ".join(plain_parts).strip()
+            # Join PDF lines with a space so the browser reflows text naturally
+            # within the block's exact width.  Using <br> would force line breaks
+            # at the PDF's exact split points, but HTML font metrics are slightly
+            # different — any line that is even 1px wider than its PDF width would
+            # wrap to an extra line, adding unwanted height and causing overlap with
+            # the element positioned below this block.
+            inner_html  = " ".join(lines_html)
+            dom_css     = _block_dominant_css(block)
+
+            # Fallback highlight: only apply background if search_for() did NOT
+            # already place an overlay for this text on this page.
+            match  = _match_highlight(block_plain, highlight_map)
+            bg_css = ""
+            tip    = ""
+            if match and match[0] in _STATUS_BG and _STATUS_BG[match[0]]:
+                # Check whether the matched hl_text was already handled by search_for
+                already_overlaid = any(
+                    hl_text in found_texts
+                    for hl_text, st, _, _ in highlight_map
+                    if st == match[0]
+                )
+                if not already_overlaid:
+                    bg_css = f"background-color:{_STATUS_BG[match[0]]};"
+                    tip    = f" data-tip='{_tip_attr(*match)}'"
+
+            text_elements.append((
+                by0, bx0,
+                f'<div style="position:absolute;left:{bx0:.2f}pt;top:{by0:.2f}pt;'
+                f'width:{bw:.2f}pt;{dom_css};{bg_css}'
+                f'line-height:1.4;overflow:hidden;"'
+                f'{tip}>{inner_html}</div>'
+            ))
+
+        # ── 2e. Assemble page ─────────────────────────────────────────────────
+        # Stacking order: images first, then tables, then text, overlays on top.
+        all_elements = image_elements + table_elements + text_elements
+        all_elements.sort(key=lambda e: (e[0], e[1]))
+
+        page_parts = [
+            f'<div style="position:relative;width:{pw:.2f}pt;min-height:{ph:.2f}pt;'
+            f'background:white;margin:0 auto 32px;overflow:visible;'
+            f'box-shadow:0 2px 12px rgba(0,0,0,0.12);">'
+        ]
+        for _, _, html in all_elements:
+            page_parts.append(html)
+        page_parts.extend(overlay_parts)   # highlight overlays on top
+        page_parts.append('</div>')
+
+        page_htmls.append("\n".join(page_parts))
 
     doc.close()
-    parts.append("</div>")
-    return "\n".join(parts)
+
+    return (
+        '<div style="background:#f3f4f6;padding:24px 16px;">'
+        + "\n".join(page_htmls)
+        + '</div>'
+    )
 
 
 def _md_strip(text: str) -> str:

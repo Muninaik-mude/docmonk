@@ -154,12 +154,18 @@ def _call_ai(
     *,
     max_tokens: int = 1500,
     temperature: float = 0.1,
+    seed: int | None = None,
+    pin_to_first: bool = False,
 ) -> str:
     """
     Non-streaming AI call using round-robin provider selection.
 
     messages: pre-built list of {role, content} dicts (system + user, optionally
               with assistant history turns for multi-turn conversations).
+
+    pin_to_first: when True, always use pool[0] — no round-robin, no rotation to
+                  other providers. Use for calls that must be deterministic across
+                  multiple invocations (e.g. policy analysis scoring).
 
     Strategy:
       • Pick a start offset via global round-robin counter so parallel calls
@@ -170,21 +176,25 @@ def _call_ai(
       • Raises RuntimeError after _MAX_RETRIES full sweeps all hit rate limits.
     """
     pool, n, start = _validated_pool()
+    start = 0 if pin_to_first else start
+    providers_to_try = [pool[0]] if pin_to_first else None  # None = use full pool rotation
 
     for attempt in range(_MAX_RETRIES + 1):
-        for offset in range(n):
-            provider = pool[(start + offset) % n]
+        for offset in range(1 if pin_to_first else n):
+            provider = providers_to_try[0] if pin_to_first else pool[(start + offset) % n]
 
             if not _is_provider_available(provider["name"]):
                 logger.debug("Skipping %s — in cooldown", provider["name"])
                 continue
 
             try:
+                extra = {"seed": seed} if seed is not None else {}
                 resp = provider["client"].chat.completions.create(
                     messages=messages,
                     model=provider["model"],
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    **extra,
                 )
                 content = resp.choices[0].message.content
                 return content.strip() if content is not None else ""
