@@ -261,13 +261,24 @@ def _match_highlight(text: str, highlight_map: list):
     if not text or len(text.strip()) < 4:
         return None
     t = text.lower().strip()
+    t_words = set(re.findall(r'\w{4,}', t))  # compute once
     for hl_text, st, req, reason in highlight_map:
-        if t in hl_text:
+        # Substring check: allow only when the candidate is an EXACT match of the
+        # relevant_text (e.g. "Borrower Signature |" = the whole relevant_text) OR
+        # when the candidate has ≥3 meaningful words.
+        # This prevents short label-only strings like "Employer Name |" (2 words, no
+        # value) from partially matching "Employer Name | Standing Rock Tribal Casino".
+        if t in hl_text and (t == hl_text or len(t_words) >= 3):
             return (st, req, reason)
-        # Word-overlap fallback: ≥60% of meaningful words in common
-        t_words = set(re.findall(r'\w{4,}', t))
+        # Word-overlap fallback: require ≥3 distinct words in the candidate AND ≥3
+        # words in common, so that 2-word overlaps like {"purchase","loan"} from an
+        # unrelated option ("○ Land Purchase Loan") don't trigger a false match.
         h_words = set(re.findall(r'\w{4,}', hl_text))
-        if t_words and h_words and len(t_words & h_words) / len(t_words) >= 0.60:
+        if (
+            len(t_words) >= 3 and h_words
+            and len(t_words & h_words) >= 3
+            and len(t_words & h_words) / len(t_words) >= 0.60
+        ):
             return (st, req, reason)
     return None
 
