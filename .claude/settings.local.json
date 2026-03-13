@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "Bash(do cp:*)"
+      "Bash(do cp:*)",
+      "Bash(ls E:/*.pdf)"
     ]
   }
 }
