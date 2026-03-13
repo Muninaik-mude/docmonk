@@ -162,9 +162,7 @@ class JobStatusView(APIView):
         if job.status == JobStatus.COMPLETED:
             try:
                 md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-                md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
                 response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
-                response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
             except Exception as e:
                 logger.error("GET report generation failed for job %s: %s", job.id, e)
                 response_data["report_error"] = f"Report could not be generated: {e}"
@@ -300,10 +298,8 @@ class JobResumeView(APIView):
 
             try:
                 md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-                md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
                 response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
-                response_data["summary_md_base64"] = base64.b64encode(md_summary.encode()).decode()
-                logger.info("Resume markdown report + summary generated for job %s", job.id)
+                logger.info("Resume markdown report generated for job %s", job.id)
             except Exception as e:
                 logger.error("Resume report generation failed: %s", e)
                 response_data["report_error"] = f"Report could not be generated: {e}"

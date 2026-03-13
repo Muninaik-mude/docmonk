@@ -1293,9 +1293,7 @@ def generate_policy_report(
     vio_reqs   = [r for r in reqs if r.get("status") == "VIOLATES"]
     risky_reqs = [r for r in reqs if r.get("status") == "RISKY"]
     na_reqs    = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
-    risk_pts   = policy_analysis.get("risk_points", [])
-
-    risky_total = len(risky_reqs) + len(risk_pts)
+    risky_total = len(risky_reqs)
 
     # ── Legend — badges (non-clickable) ───────────────────────────────────────
     lines.append(
@@ -1343,14 +1341,12 @@ def generate_policy_report(
     # 2. RISKY
     lines.append(f'<div class="risk-panel" id="sec-rsk">')
     lines.append(f'<div class="risk-title">&#x26A0; Risk Points ({risky_total})</div>')
-    if risky_reqs or risk_pts:
+    if risky_reqs:
         for r in risky_reqs:
             req_text = _esc(r.get("requirement", ""))
             reason   = _esc(r.get("reason", ""))
             body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
             lines.append(f'<div class="risk-item">{body}</div>')
-        for pt in risk_pts:
-            lines.append(f'<div class="risk-item">{_esc(str(pt))}</div>')
     else:
         lines.append('<div class="panel-empty">No risk points identified.</div>')
     lines.append('</div>')
