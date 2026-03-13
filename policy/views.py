@@ -178,6 +178,15 @@ class PolicyAnalyzerView(APIView):
                 doc_bytes=doc_bytes,
                 file_type=file_type,
             )
+            summary_json = policy_report_service.build_policy_summary_json(
+                policy_analysis,
+                policy_type=policy_type,
+                jurisdiction_info={},
+                agreement_meta=agreement_meta,
+            )
+            # Merge structured summary fields into policy_analysis so the
+            # frontend receives a single, unified analysis object.
+            policy_analysis.update(summary_json)
             response_data["report_md_base64"]  = base64.b64encode(md_report.encode()).decode()
             response_data["policy_analysis"]   = policy_analysis
             logger.info("Policy job %s: report generated", job.job_id)
