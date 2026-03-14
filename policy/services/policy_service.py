@@ -44,7 +44,7 @@ Respond in this EXACT JSON format:
 {{
     "overall_verdict": "COMPLIANT" or "NON_COMPLIANT" or "PARTIALLY_COMPLIANT",
     "compliance_score": <integer 0-100 reflecting percentage of requirements satisfied>,
-    "summary": "2-3 sentence executive summary of the analysis outcome",
+    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~NON_COMPLIANT}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare.",
     "policy_requirements": [
         {{
             "requirement": "The specific policy requirement being checked",
