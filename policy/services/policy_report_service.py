@@ -40,6 +40,20 @@ _TOOLTIP_JS = """
     if(y+h>vh-10) y=e.clientY-h-14;
     tip.style.left=x+'px'; tip.style.top=y+'px';
   }
+  function scrollLeftToReq(reqId){
+    var target = document.getElementById(reqId);
+    if(!target) return;
+    var lp = document.querySelector('.report-left');
+    if(!lp) return;
+    // Scroll left panel so the item is near top (with a little breathing room)
+    lp.scrollTo({ top: target.offsetTop - 20, behavior: 'smooth' });
+    // Flash animation
+    target.classList.remove('req-flash');
+    void target.offsetWidth; // force reflow so re-adding fires animation
+    target.classList.add('req-flash');
+    target.addEventListener('animationend', function(){ target.classList.remove('req-flash'); }, {once:true});
+  }
+
   document.querySelectorAll('[data-tip]').forEach(function(el){
     el.addEventListener('mouseenter',function(e){
       clearTimeout(fadeOut);
@@ -53,9 +67,112 @@ _TOOLTIP_JS = """
       tip.style.opacity='0';
       fadeOut=setTimeout(function(){ tip.style.display='none'; },150);
     });
+    el.addEventListener('click',function(){
+      // Read req-id from the hidden anchor embedded in the tooltip HTML
+      var anchor = tip.querySelector('.req-anchor');
+      if(anchor){ scrollLeftToReq(anchor.getAttribute('data-req-id')); }
+    });
   });
 })();
 </script>
+"""
+
+_SPLIT_LAYOUT_CSS = """
+<style>
+/* ── Split report layout ── */
+.report-split {
+  display: flex;
+  align-items: flex-start;
+  min-height: 100vh;
+}
+.report-left {
+  width: 420px;
+  min-width: 360px;
+  max-width: 420px;
+  flex-shrink: 0;
+  padding: 0 14px 20px 0;
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
+  overflow-y: auto;
+}
+.report-right {
+  flex: 1;
+  min-width: 0;
+  padding: 0 0 20px 18px;
+  border-left: 1px solid #e5e7eb;
+}
+/* Tighten horizontal panel padding in left sidebar */
+.report-left .vio-panel,
+.report-left .risk-panel,
+.report-left .na-panel,
+.report-left .sat-panel {
+  padding-left: 10px;
+  padding-right: 8px;
+}
+/* ── Requirement item — new card layout ── */
+.report-left .vio-item,
+.report-left .risk-item,
+.report-left .na-item,
+.report-left .sat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 4px 8px 16px;
+  font-size: 14px;
+}
+/* Hide default ::before icons — replaced by status color on left border */
+.report-left .vio-item::before,
+.report-left .risk-item::before,
+.report-left .na-item::before,
+.report-left .sat-item::before { display: none; }
+/* Rule reference — top label, colored per status */
+.item-rule-ref {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  line-height: 1.3;
+  margin-bottom: 1px;
+}
+.vio-ref  { color: #dc2626; }
+.risk-ref { color: #d97706; }
+.na-ref   { color: #2563eb; }
+.sat-ref  { color: #16a34a; }
+/* Requirement text */
+.item-req {
+  font-size: 14px;
+  font-weight: 600;
+  color: #111827;
+  line-height: 1.4;
+}
+/* Relevant text from the loan document */
+.item-rt {
+  font-size: 13px;
+  color: #6b7280;
+  font-style: italic;
+  line-height: 1.4;
+  border-left: 2px solid #e5e7eb;
+  padding-left: 6px;
+  margin-top: 2px;
+}
+/* Panel top-margins on the left side */
+.report-left .vio-panel { margin-top: 10px; }
+.report-left .risk-panel,
+.report-left .na-panel,
+.report-left .sat-panel  { margin-top: 8px; }
+/* Clickable highlighted text in right panel */
+[data-tip] { cursor: pointer; }
+/* Flash animation when scrolled to from the right panel */
+@keyframes req-flash {
+  0%   { background: #fef08a; }
+  60%  { background: #fef08a; }
+  100% { background: inherit; }
+}
+.req-flash {
+  animation: req-flash 1.4s ease-out forwards;
+  border-radius: 4px;
+}
+</style>
 """
 
 _DOC_CSS = """
@@ -244,32 +361,32 @@ def _para_runs_to_html(para) -> str:
 
 
 def _build_highlight_map(requirements: list) -> list:
-    """Returns [(relevant_text_lower, status, requirement, reason)] sorted by priority."""
+    """Returns [(relevant_text_lower, status, requirement, reason, rule_reference, req_idx)] sorted by priority."""
     result = []
-    for req in requirements:
+    for idx, req in enumerate(requirements):
         st = req.get("status", "NOT_ADDRESSED")
         rt = (req.get("relevant_text") or "").strip()
         if not rt or st == "NOT_ADDRESSED":
             continue
-        result.append((rt.lower(), st, req.get("requirement", ""), req.get("reason", "")))
+        result.append((rt.lower(), st, req.get("requirement", ""), req.get("reason", ""), req.get("rule_reference", ""), idx))
     result.sort(key=lambda x: _STATUS_PRIORITY.get(x[1], 99))
     return result
 
 
 def _match_highlight(text: str, highlight_map: list):
-    """Return (status, requirement, reason) if text matches any highlight, else None."""
+    """Return (status, requirement, reason, rule_reference, req_idx) if text matches any highlight, else None."""
     if not text or len(text.strip()) < 4:
         return None
     t = text.lower().strip()
     t_words = set(re.findall(r'\w{4,}', t))  # compute once
-    for hl_text, st, req, reason in highlight_map:
+    for hl_text, st, req, reason, rule_ref, req_idx in highlight_map:
         # Substring check: allow only when the candidate is an EXACT match of the
         # relevant_text (e.g. "Borrower Signature |" = the whole relevant_text) OR
         # when the candidate has ≥3 meaningful words.
         # This prevents short label-only strings like "Employer Name |" (2 words, no
         # value) from partially matching "Employer Name | Standing Rock Tribal Casino".
         if t in hl_text and (t == hl_text or len(t_words) >= 3):
-            return (st, req, reason)
+            return (st, req, reason, rule_ref, req_idx)
         # Word-overlap fallback: require ≥3 distinct words in the candidate AND ≥3
         # words in common, so that 2-word overlaps like {"purchase","loan"} from an
         # unrelated option ("○ Land Purchase Loan") don't trigger a false match.
@@ -279,11 +396,11 @@ def _match_highlight(text: str, highlight_map: list):
             and len(t_words & h_words) >= 3
             and len(t_words & h_words) / len(t_words) >= 0.60
         ):
-            return (st, req, reason)
+            return (st, req, reason, rule_ref, req_idx)
     return None
 
 
-def _tip_attr(status: str, requirement: str, reason: str) -> str:
+def _tip_attr(status: str, requirement: str, reason: str, rule_reference: str = "", req_idx: int = -1) -> str:
     """Build the data-tip HTML string — a rich card rendered in tooltip innerHTML."""
     badge_map = {
         "SATISFIES": ("&#x2714;", "#059669", "#d1fae5", "#065f46", "Satisfies"),
@@ -295,8 +412,12 @@ def _tip_attr(status: str, requirement: str, reason: str) -> str:
     )
     req_s    = _esc(requirement)
     reason_s = _esc(reason)
+    rr_s     = _esc(rule_reference or "")
     # Card: colored header bar + body
+    # Hidden anchor so click JS can locate the left-panel item
+    anchor = f'<span class="req-anchor" data-req-id="req-{req_idx}" style="display:none"></span>' if req_idx >= 0 else ''
     tip_html = (
+        anchor +
         # Header strip
         f'<div style="background:{bg};border-bottom:3px solid {accent};'
         f'padding:9px 13px;display:flex;align-items:center;gap:8px;">'
@@ -309,6 +430,11 @@ def _tip_attr(status: str, requirement: str, reason: str) -> str:
         # Body
         f'<div style="padding:10px 13px;">'
     )
+    if rr_s:
+        tip_html += (
+            f'<div style="font-size:10px;font-weight:700;letter-spacing:.04em;'
+            f'text-transform:uppercase;color:{accent};margin-bottom:5px;">{rr_s}</div>'
+        )
     if req_s:
         tip_html += (
             f'<div style="font-weight:700;font-size:12px;color:#111827;'
@@ -927,13 +1053,13 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
         overlay_parts: list[str] = []
         found_texts:   set[str]  = set()
 
-        for hl_text, status, requirement, reason in highlight_map:
+        for hl_text, status, requirement, reason, rule_ref, req_idx in highlight_map:
             if not hl_text or len(hl_text.strip()) < 4:
                 continue
             hl_bg = _STATUS_BG.get(status)
             if not hl_bg:
                 continue
-            tip = _tip_attr(status, requirement, reason)
+            tip = _tip_attr(status, requirement, reason, rule_ref, req_idx)
 
             candidates = [hl_text]
             if len(hl_text) > 100:
@@ -1575,7 +1701,7 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
                 if match and match[0] in _STATUS_BG and _STATUS_BG[match[0]]:
                     already_overlaid = any(
                         hl_text in found_texts
-                        for hl_text, st, _, _ in highlight_map
+                        for hl_text, st, _, _, _, _ in highlight_map
                         if st == match[0]
                     )
                     if not already_overlaid:
@@ -1853,27 +1979,16 @@ def generate_policy_report(
     reqs = policy_analysis.get("policy_requirements", [])
 
     hl_map = _build_highlight_map(reqs)
-    lines  = [_DOC_CSS]
+    lines  = [_DOC_CSS, _SPLIT_LAYOUT_CSS]
 
-    # ── Count each status for the legend badges ───────────────────────────────
-    sat_reqs   = [r for r in reqs if r.get("status") == "SATISFIES"]
-    vio_reqs   = [r for r in reqs if r.get("status") == "VIOLATES"]
-    risky_reqs = [r for r in reqs if r.get("status") == "RISKY"]
-    na_reqs    = [r for r in reqs if r.get("status") == "NOT_ADDRESSED"]
+    # ── Count each status — keep original index for left-panel IDs ───────────
+    sat_reqs   = [(i, r) for i, r in enumerate(reqs) if r.get("status") == "SATISFIES"]
+    vio_reqs   = [(i, r) for i, r in enumerate(reqs) if r.get("status") == "VIOLATES"]
+    risky_reqs = [(i, r) for i, r in enumerate(reqs) if r.get("status") == "RISKY"]
+    na_reqs    = [(i, r) for i, r in enumerate(reqs) if r.get("status") == "NOT_ADDRESSED"]
     risky_total = len(risky_reqs)
 
-    # ── Legend — badges (non-clickable) ───────────────────────────────────────
-    lines.append(
-        '<div class="pdv-legend">'
-        f'<span class="leg-sat">&#x2714; Satisfies ({len(sat_reqs)})</span>'
-        f'<span class="leg-vio">&#x2716; Violates ({len(vio_reqs)})</span>'
-        f'<span class="leg-rsk">&#x26A0; Risky ({risky_total})</span>'
-        f'<span class="leg-na">&#x25CB; Not Addressed ({len(na_reqs)})</span>'
-        '<span style="color:#9ca3af;font-size:11px;">— Hover highlighted text for details</span>'
-        '</div>'
-    )
-
-    # ── Document body ──────────────────────────────────────────────────────────
+    # ── Build document body ───────────────────────────────────────────────────
     if doc_bytes and file_type == "docx":
         doc_html = _docx_to_html(doc_bytes, hl_map)
     elif doc_bytes and file_type == "pdf":
@@ -1888,61 +2003,87 @@ def generate_policy_report(
     else:
         doc_html = "<p><em>No document content available.</em></p>"
 
-    lines.append(doc_html)
+    # ── Helper: build a structured left-panel item ────────────────────────────
+    def _item_html(orig_idx: int, r: dict, item_cls: str, ref_cls: str) -> str:
+        rr      = _esc((r.get("rule_reference") or "").strip())
+        req     = _esc(r.get("requirement", ""))
+        rt      = _esc((r.get("relevant_text") or "").strip())
+        reason  = _esc(r.get("reason", "") or r.get("recommendation", ""))
+        parts   = [f'<div class="{item_cls}" id="req-{orig_idx}">']
+        if rr:
+            parts.append(f'<div class="item-rule-ref {ref_cls}">{rr}</div>')
+        parts.append(f'<div class="item-req">{req}</div>')
+        if rt:
+            parts.append(f'<div class="item-rt">{rt}</div>')
+        elif reason:
+            parts.append(f'<div class="item-rt">{reason}</div>')
+        parts.append('</div>')
+        return "".join(parts)
 
-    # ── Bottom summary panels — all 4 statuses ────────────────────────────────
+    # ── Open split layout ─────────────────────────────────────────────────────
+    lines.append('<div class="report-split">')
+
+    # ══ LEFT: legend + requirement panels ════════════════════════════════════
+    lines.append('<div class="report-left">')
+
+    # Legend
+    lines.append(
+        '<div class="pdv-legend">'
+        f'<span class="leg-sat">&#x2714; Satisfies ({len(sat_reqs)})</span>'
+        f'<span class="leg-vio">&#x2716; Violates ({len(vio_reqs)})</span>'
+        f'<span class="leg-rsk">&#x26A0; Risky ({len(risky_reqs)})</span>'
+        f'<span class="leg-na">&#x25CB; Not Addressed ({len(na_reqs)})</span>'
+        '</div>'
+    )
 
     # 1. VIOLATES (most critical first)
-    lines.append(f'<div class="vio-panel" id="sec-vio">')
-    lines.append(f'<div class="vio-title">&#x2716; Violations Found ({len(vio_reqs)})</div>')
+    lines.append('<div class="vio-panel" id="sec-vio">')
+    lines.append('<div class="vio-title">&#x2716; Violations Found</div>')
     if vio_reqs:
-        for r in vio_reqs:
-            req_text = _esc(r.get("requirement", ""))
-            reason   = _esc(r.get("reason", ""))
-            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
-            lines.append(f'<div class="vio-item">{body}</div>')
+        for orig_idx, r in vio_reqs:
+            lines.append(_item_html(orig_idx, r, "vio-item", "vio-ref"))
     else:
         lines.append('<div class="panel-empty">No violations found.</div>')
     lines.append('</div>')
 
     # 2. RISKY
-    lines.append(f'<div class="risk-panel" id="sec-rsk">')
-    lines.append(f'<div class="risk-title">&#x26A0; Risk Points ({risky_total})</div>')
+    lines.append('<div class="risk-panel" id="sec-rsk">')
+    lines.append('<div class="risk-title">&#x26A0; Risk Points</div>')
     if risky_reqs:
-        for r in risky_reqs:
-            req_text = _esc(r.get("requirement", ""))
-            reason   = _esc(r.get("reason", ""))
-            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
-            lines.append(f'<div class="risk-item">{body}</div>')
+        for orig_idx, r in risky_reqs:
+            lines.append(_item_html(orig_idx, r, "risk-item", "risk-ref"))
     else:
         lines.append('<div class="panel-empty">No risk points identified.</div>')
     lines.append('</div>')
 
     # 3. NOT ADDRESSED
-    lines.append(f'<div class="na-panel" id="sec-na">')
-    lines.append(f'<div class="na-title">&#x25CB; Not Addressed in Document ({len(na_reqs)})</div>')
+    lines.append('<div class="na-panel" id="sec-na">')
+    lines.append('<div class="na-title">&#x25CB; Not Addressed</div>')
     if na_reqs:
-        for r in na_reqs:
-            req_text = _esc(r.get("requirement", ""))
-            reason   = _esc(r.get("reason", "") or r.get("recommendation", ""))
-            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
-            lines.append(f'<div class="na-item">{body}</div>')
+        for orig_idx, r in na_reqs:
+            lines.append(_item_html(orig_idx, r, "na-item", "na-ref"))
     else:
         lines.append('<div class="panel-empty">All requirements are addressed.</div>')
     lines.append('</div>')
 
     # 4. SATISFIES
-    lines.append(f'<div class="sat-panel" id="sec-sat">')
-    lines.append(f'<div class="sat-title">&#x2714; Requirements Satisfied ({len(sat_reqs)})</div>')
+    lines.append('<div class="sat-panel" id="sec-sat">')
+    lines.append('<div class="sat-title">&#x2714; Satisfied</div>')
     if sat_reqs:
-        for r in sat_reqs:
-            req_text = _esc(r.get("requirement", ""))
-            reason   = _esc(r.get("reason", ""))
-            body     = f"<strong>{req_text}</strong>" + (f" — {reason}" if reason else "")
-            lines.append(f'<div class="sat-item">{body}</div>')
+        for orig_idx, r in sat_reqs:
+            lines.append(_item_html(orig_idx, r, "sat-item", "sat-ref"))
     else:
         lines.append('<div class="panel-empty">No satisfied requirements found.</div>')
     lines.append('</div>')
+
+    lines.append('</div>')  # close report-left
+
+    # ══ RIGHT: document body ══════════════════════════════════════════════════
+    lines.append('<div class="report-right">')
+    lines.append(doc_html)
+    lines.append('</div>')  # close report-right
+
+    lines.append('</div>')  # close report-split
 
     # ── Global tooltip card + JS ───────────────────────────────────────────────
     lines.append(_TOOLTIP_JS)
@@ -2423,7 +2564,7 @@ def _make_highlight_json(match) -> dict | None:
     """Convert a _match_highlight() result to a serialisable dict, or None."""
     if not match:
         return None
-    status, requirement, reason = match
+    status, requirement, reason, rule_reference, req_idx = match
     bg_map = {
         "SATISFIES": {"bg_color": "#d4edda", "text_color": "#155724"},
         "VIOLATES":  {"bg_color": "#fde8e8", "text_color": "#7b0d14"},
@@ -2437,6 +2578,8 @@ def _make_highlight_json(match) -> dict | None:
         "text_color":    colors["text_color"],
         "requirement":   requirement,
         "reason":        reason,
+        "rule_reference": rule_reference,
+        "req_idx":       req_idx,
     }
 
 
