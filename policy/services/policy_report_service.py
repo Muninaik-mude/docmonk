@@ -40,7 +40,7 @@ _TOOLTIP_JS = """
     if(y+h>vh-10) y=e.clientY-h-14;
     tip.style.left=x+'px'; tip.style.top=y+'px';
   }
-  function scrollLeftToReq(reqId){
+  window.scrollLeftToReq = function scrollLeftToReq(reqId){
     var target = document.getElementById(reqId);
     if(!target) return;
     var lp = document.querySelector('.report-left');
@@ -2012,11 +2012,6 @@ def generate_policy_report(
         parts   = [f'<div class="{item_cls}" id="req-{orig_idx}">']
         if rr:
             parts.append(f'<div class="item-rule-ref {ref_cls}">{rr}</div>')
-        parts.append(f'<div class="item-req">{req}</div>')
-        if rt:
-            parts.append(f'<div class="item-rt">{rt}</div>')
-        elif reason:
-            parts.append(f'<div class="item-rt">{reason}</div>')
         parts.append('</div>')
         return "".join(parts)
 
@@ -2081,6 +2076,32 @@ def generate_policy_report(
     # ══ RIGHT: document body ══════════════════════════════════════════════════
     lines.append('<div class="report-right">')
     lines.append(doc_html)
+
+    # ── Not Addressed section at bottom of right panel ────────────────────────
+    if na_reqs:
+        lines.append(
+            '<div style="margin:32px 16px 24px;border:1.5px solid #bfdbfe;border-radius:10px;overflow:hidden;">'
+            '<div style="background:#eff6ff;padding:10px 16px;border-bottom:1px solid #bfdbfe;'
+            'font-size:13px;font-weight:700;color:#1d4ed8;letter-spacing:.02em;">'
+            '&#x25CB;&nbsp; Not Addressed in Document</div>'
+            '<div style="display:flex;flex-direction:column;gap:0;">'
+        )
+        for i, (orig_idx, r) in enumerate(na_reqs):
+            rr     = _esc((r.get("rule_reference") or "").strip())
+            req    = _esc(r.get("requirement", ""))
+            reason = _esc(r.get("reason", "") or r.get("recommendation", ""))
+            border = "border-top:1px solid #dbeafe;" if i > 0 else ""
+            lines.append(
+                f'<div style="padding:12px 16px;{border}cursor:pointer;transition:background .15s;" '
+                f'onclick="scrollLeftToReq(\'req-{orig_idx}\')" '
+                f'onmouseenter="this.style.background=\'#dbeafe\'" onmouseleave="this.style.background=\'\'">'
+                + (f'<div style="font-size:11px;font-weight:700;color:#2563eb;margin-bottom:4px;">{rr}</div>' if rr else "")
+                + f'<div style="font-size:13px;font-weight:600;color:#111827;line-height:1.4;">{req}</div>'
+                + (f'<div style="font-size:12px;color:#6b7280;font-style:italic;margin-top:4px;line-height:1.4;">{reason}</div>' if reason else "")
+                + '</div>'
+            )
+        lines.append('</div></div>')
+
     lines.append('</div>')  # close report-right
 
     lines.append('</div>')  # close report-split
