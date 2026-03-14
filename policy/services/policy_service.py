@@ -51,6 +51,7 @@ Respond in this EXACT JSON format:
             "status": "SATISFIES" or "VIOLATES" or "RISKY" or "NOT_ADDRESSED",
             "reason": "Specific finding citing exact text from both documents where possible",
             "relevant_text": "Verbatim sentence(s) from the subject document relevant to this requirement, or null if nothing found",
+            "rule_reference": "Exact section or rule name from the POLICY DOCUMENT this requirement originates from (e.g. 'Section 3.2 — LTV Requirements', 'Rule 5: Maximum Loan Amount', 'Article IV — Eligibility Criteria'). Use the heading or numbering as it appears in the policy text. Never fabricate — if the policy has no section heading, use the closest descriptive phrase from the policy.",
             "recommendation": "Concrete, actionable fix — e.g. 'Reduce loan amount to $100,000 or below to meet the policy cap' — null if status is SATISFIES"
         }}
     ],

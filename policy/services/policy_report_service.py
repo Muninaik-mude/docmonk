@@ -2746,6 +2746,7 @@ def build_policy_summary_json(
             "reason":       r.get("reason", ""),
             "recommendation": r.get("recommendation", ""),
             "relevant_text":  r.get("relevant_text"),
+            "rule_reference": r.get("rule_reference"),
         }
         for r in reqs if r.get("status") in ("VIOLATES", "NOT_ADDRESSED", "RISKY")
     ]
