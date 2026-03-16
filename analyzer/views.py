@@ -412,9 +412,13 @@ class ClauseAnalyzerView(APIView):
 
         try:
             md_report  = report_service.generate_markdown_report(analysis_summary, **report_kwargs)
-            md_summary = report_service.generate_markdown_summary(analysis_summary, **report_kwargs)
-            response_data["report_md_base64"]   = base64.b64encode(md_report.encode()).decode()
-            response_data["summary_md_base64"]  = base64.b64encode(md_summary.encode()).decode()
+            summary_json = report_service.build_json_summary(
+                analysis_summary,
+                jurisdiction_info=jurisdiction_info,
+                agreement_meta=agreement_meta,
+            )
+            response_data["report_md_base64"] = base64.b64encode(md_report.encode()).decode()
+            response_data["summary_json"]     = summary_json
             logger.info("Markdown report generated for job %s", job.id)
         except Exception as e:
             logger.error("Markdown report generation failed: %s", e)

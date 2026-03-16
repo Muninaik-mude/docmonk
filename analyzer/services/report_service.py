@@ -1023,3 +1023,143 @@ def generate_markdown_summary(
 
     h.append('</div>')  # .sr
     return "\n".join(h)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+#  JSON SUMMARY — structured data for frontend (replaces HTML summary_md_base64)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def build_json_summary(
+    analysis_summary: list,
+    *,
+    jurisdiction_info: dict = None,
+    agreement_meta: dict = None,
+) -> dict:
+    """
+    Return all summary data as a structured dict suitable for JSON serialization.
+
+    Mirrors every section of generate_markdown_summary so the frontend can build
+    a rich UI without parsing HTML.  Returned as ``summary_json`` in the API response.
+    """
+    jurisdiction_info = jurisdiction_info or {}
+    agreement_meta    = agreement_meta    or {}
+
+    # ── Counts ────────────────────────────────────────────────────────────────
+    match_count     = sum(1 for c in analysis_summary if c["result"] == "MATCH")
+    violation_count = sum(1 for c in analysis_summary if c["result"] == "VIOLATION")
+    partial_count   = sum(1 for c in analysis_summary if c["result"] == "PARTIALLY_SATISFIED")
+    not_found_count = sum(1 for c in analysis_summary if c["result"] == "NOT_FOUND")
+    total           = len(analysis_summary)
+    compliance_score = round((match_count / total) * 100) if total else 0
+
+    if compliance_score >= 80:
+        score_status = "Compliant"
+    elif compliance_score >= 50:
+        score_status = "Needs Attention"
+    else:
+        score_status = "Critical"
+
+    # ── Agreement meta ────────────────────────────────────────────────────────
+    agmt_type = agreement_meta.get("agreement_type", "")
+    agmt_det  = agreement_meta.get("agreement_details") or {}
+    parties   = agreement_meta.get("parties") or {}
+    landlord  = (parties.get("landlord") or {})
+    tenant    = (parties.get("tenant")   or {})
+
+    agreement = {
+        "type":    agmt_type,
+        "date":    agmt_det.get("agreement_date", ""),
+        "city":    agmt_det.get("city", ""),
+        "state":   agmt_det.get("state", ""),
+        "party_a": landlord.get("name", ""),
+        "party_b": tenant.get("company_name") or tenant.get("name", ""),
+    }
+
+    # ── Critical issues — IDs only (frontend resolves full detail from clauses[]) ──
+    critical_issue_ids = [
+        e.get("clause_id", "")
+        for e in analysis_summary
+        if e["result"] in ("VIOLATION", "NOT_FOUND")
+    ]
+
+    # ── All clauses (full detail) ─────────────────────────────────────────────
+    clauses = []
+    for i, entry in enumerate(analysis_summary, 1):
+        cat, risk_level = _get_risk_info(entry.get("clause_title", ""))
+        clauses.append({
+            "index":               i,
+            "clause_id":           entry.get("clause_id", ""),
+            "clause_title":        entry["clause_title"],
+            "clause_value":        entry.get("clause_value", ""),
+            "category":            cat,
+            "risk_level":          risk_level,
+            "result":              entry["result"],
+            "reason":              entry.get("reason", ""),
+            "relevant_text":       entry.get("relevant_text"),
+            "ai_added_text":       entry.get("ai_added_text"),
+            "parties_obligated":   entry.get("parties_obligated", []),
+            "missing_values":      entry.get("missing_values", []),
+            "binding_strength":    entry.get("binding_strength", "VAGUE"),
+            "key_dates_durations": entry.get("key_dates_durations", []),
+        })
+
+    # ── Risk category breakdown ───────────────────────────────────────────────
+    cat_stats: dict = {}
+    for entry in analysis_summary:
+        cat, risk_level = _get_risk_info(entry.get("clause_title", ""))
+        if cat not in cat_stats:
+            cat_stats[cat] = {"risk_level": risk_level, "total": 0, "compliant": 0, "issues": 0}
+        cat_stats[cat]["total"] += 1
+        if entry["result"] == "MATCH":
+            cat_stats[cat]["compliant"] += 1
+        else:
+            cat_stats[cat]["issues"] += 1
+
+    category_breakdown = []
+    for cat in CATEGORY_ORDER:
+        if cat not in cat_stats:
+            continue
+        s = cat_stats[cat]
+        pass_rate = round((s["compliant"] / s["total"]) * 100) if s["total"] else 0
+        category_breakdown.append({
+            "name":       cat,
+            "risk_level": s["risk_level"],
+            "total":      s["total"],
+            "compliant":  s["compliant"],
+            "issues":     s["issues"],
+            "pass_rate":  pass_rate,
+        })
+
+    # ── Jurisdiction ──────────────────────────────────────────────────────────
+    jurisdiction = {
+        "jurisdiction":    jurisdiction_info.get("jurisdiction", ""),
+        "agreement_type":  jurisdiction_info.get("agreement_type", ""),
+        "applicable_laws": jurisdiction_info.get("applicable_laws", []),
+        "checklist":       jurisdiction_info.get("checklist", []),
+    }
+
+    # ── Timeline ──────────────────────────────────────────────────────────────
+    timeline = [
+        {"clause_title": entry["clause_title"], "item": dt}
+        for entry in analysis_summary
+        for dt in entry.get("key_dates_durations", [])
+        if dt
+    ]
+
+    return {
+        "compliance_score":   compliance_score,
+        "score_status":       score_status,
+        "stats": {
+            "total":       total,
+            "match":       match_count,
+            "violation":   violation_count,
+            "partial":     partial_count,
+            "not_found":   not_found_count,
+        },
+        "agreement":          agreement,
+        "critical_issue_ids": critical_issue_ids,
+        "clauses":            clauses,
+        "category_breakdown": category_breakdown,
+        "jurisdiction":       jurisdiction,
+        "timeline":           timeline,
+    }
