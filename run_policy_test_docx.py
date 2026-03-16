@@ -12,8 +12,8 @@ import urllib.request
 import fitz  # pip install pymupdf
 
 # ── Configure these paths ──────────────────────────────────────────────────────
-DOCX_PATH       = r"E:/loan_application_YCLF_2026_0051.docx"   # <-- your DOCX file
-POLICY_PDF_PATH = r"E:/sample-housing-lending-policies.pdf" # policy PDF
+DOCX_PATH       = r"E:/sample_loan_applications/loan_application_YCLF_2026_0051.docx"
+POLICY_PDF_PATH = r"E:/sample-housing-lending-policies.pdf"
 API_URL         = "http://localhost:8000/v1/policy/analyze"
 OUT_DIR         = pathlib.Path("E:/policy_analysis_reports")
 # ──────────────────────────────────────────────────────────────────────────────

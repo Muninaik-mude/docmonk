@@ -1,14 +1,14 @@
 """
 Policy analysis AI service.
 
-Uses the shared multi-provider pool from analyzer.services.groq_service.
-The pool (groq_1, groq_2, cerebras_1, cerebras_2) is initialized once and
-shared across both the clause analyzer and policy analyzer.
+Uses a dedicated single-provider OpenAI-compatible client configured via
+POLICY_AI_API_KEY / POLICY_AI_MODEL / POLICY_AI_BASE_URL environment variables.
+Fully decoupled from the clause-analyzer provider pool.
 """
 import json
 import logging
 
-from analyzer.services.groq_service import _call_ai, _safe_json_parse
+from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_parse as _safe_json_parse
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ def analyze_document_against_policy(
     ]
 
     try:
-        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42, pin_to_first=True)
+        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
         result = _safe_json_parse(response_text)
 
         # Normalize / validate fields

@@ -175,6 +175,12 @@ CEREBRAS_KEY_2 = os.getenv('CEREBRAS_KEY_2')
 GROQ_MODEL      = os.getenv('GROQ_MODEL',      'llama-3.3-70b-versatile')
 CEREBRAS_MODEL  = os.getenv('CEREBRAS_MODEL',  'gpt-oss-120b')
 
+# Policy AI — dedicated single OpenAI-compatible provider
+# Change key, model, or provider base URL without touching any code.
+POLICY_AI_API_KEY  = os.getenv('POLICY_AI_API_KEY',  '')
+POLICY_AI_MODEL    = os.getenv('POLICY_AI_MODEL',    'gpt-4o')
+POLICY_AI_BASE_URL = os.getenv('POLICY_AI_BASE_URL', 'https://api.openai.com/v1')
+
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = Path(os.getenv('ANNOTATED_PDF_DIR', str(BASE_DIR / 'annotated_pdfs')))
 try:
