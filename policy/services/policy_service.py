@@ -176,74 +176,66 @@ def analyze_document_against_policy(
 
 # ── Rules-based document analysis ─────────────────────────────────────────────
 
-_RULES_ANALYSIS_SYSTEM_PROMPT = """\
-You are a strict compliance analyst. You receive a set of pre-extracted POLICY RULES \
-and a SUBJECT DOCUMENT.
+_RULES_ANALYSIS_SYSTEM_PROMPT = """You are a strict compliance analyst. You receive a list of pre-extracted POLICY RULES and a SUBJECT DOCUMENT.
 
-Your job is to evaluate the subject document against every rule provided.
-- You MUST include one result entry for EACH rule in the input — do not skip any.
-- Evaluate only what is present in the subject document; do not infer or assume.
-- Cite exact text from both the rule and the subject document where possible.
+Your job is to:
+1. First, identify what TYPE of subject document this is (e.g. loan application, rental agreement, employment contract, etc.) and what specific loan product or agreement type it covers (e.g. Home Purchase Loan, Rehab Loan, Construction Loan, Land Purchase Loan, Homeowner Improvement Loan, etc.).
+2. For each provided rule, determine if it is CHECKABLE against this specific document type and loan product:
+   - CHECKABLE: the rule can be verified from the content the applicant/submitter provides in this document for this loan product type.
+   - NOT APPLICABLE: the rule explicitly targets a different loan product type than what this document covers, OR the rule belongs to internal processes, staff procedures, committee approvals, governance, post-execution operations, or organizational structure that would never appear in an applicant's submission.
+3. Only evaluate CHECKABLE rules. Completely skip NOT APPLICABLE rules — do not include them in the output at all.
+4. Provide an overall recommendation based only on CHECKABLE rules.
 
-You must respond ONLY with valid JSON. No markdown, no extra text."""
+You must respond ONLY with valid JSON, no extra text or markdown formatting."""
 
-_RULES_ANALYSIS_USER_TEMPLATE = """\
-POLICY TYPE: {policy_type}
+_RULES_ANALYSIS_USER_TEMPLATE = """POLICY TYPE: {policy_type}
 
-RULES TO CHECK ({rule_count} rules):
+POLICY RULES TO CHECK ({rule_count} rules):
 {rules_text}
 
 SUBJECT DOCUMENT TO ANALYZE:
 {document_text}
 
-Evaluate the SUBJECT DOCUMENT against EVERY rule listed above.
-You must produce exactly {rule_count} entries in policy_requirements — one per rule.
+Analyze the SUBJECT DOCUMENT against the provided POLICY RULES.
 
 Respond in this EXACT JSON format:
 {{
     "overall_verdict": "COMPLIANT" or "NON_COMPLIANT" or "PARTIALLY_COMPLIANT",
-    "compliance_score": <integer 0-100 reflecting percentage of rules with SATISFIES status>,
-    "summary": "2-3 sentence executive summary. Wrap BOTH key terms AND their actual values \
-in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. \
-Use {{{{-term}}}} for negatives (violations, exceedances, failures), \
-{{{{+term}}}} for positives (compliant values, satisfied requirements), \
-{{{{~term}}}} for neutral labels (verdict labels, policy names). \
-Every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST \
-be wrapped — never leave a number or percentage bare.",
+    "compliance_score": <integer 0-100 reflecting percentage of CHECKABLE requirements satisfied>,
+    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~NON_COMPLIANT}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare.",
     "policy_requirements": [
         {{
             "rule_id": "same rule_id from the input rule",
-            "requirement": "The rule description (copy from input rule description)",
+            "requirement": "The rule description — copy verbatim from the input rule description",
             "status": "SATISFIES" or "VIOLATES" or "RISKY" or "NOT_ADDRESSED",
-            "reason": "Specific finding citing exact text from both the rule and subject document",
-            "relevant_text": "Verbatim sentence(s) from the subject document relevant to this \
-rule, or null if nothing found",
-            "rule_reference": "Same rule_reference from the input rule",
-            "source_document": "Same source_document from the input rule",
-            "recommendation": "Concrete actionable fix — null if status is SATISFIES"
+            "reason": "Specific finding citing exact text from both the rule and subject document where possible",
+            "relevant_text": "Verbatim sentence(s) from the subject document relevant to this requirement, or null if nothing found",
+            "rule_reference": "same rule_reference from the input rule",
+            "source_document": "same source_document from the input rule",
+            "recommendation": "Concrete, actionable fix — e.g. 'Reduce loan amount to $100,000 or below to meet the policy cap' — null if status is SATISFIES"
         }}
     ],
     "risk_points": ["Specific risk with brief explanation — only for RISKY or NOT_ADDRESSED items"],
     "approval_recommendation": "APPROVE" or "CONDITIONAL_APPROVE" or "REJECT",
-    "conditions": ["Exact corrective action per VIOLATES item — empty list if no violations"]
+    "conditions": ["Exact corrective action required — one entry per VIOLATES item — empty list if no violations"]
 }}
 
-Status classification:
-- SATISFIES: subject document fully meets this rule — all values, thresholds, and conditions present and compliant
-- VIOLATES: subject document directly contradicts or breaches this rule
-- RISKY: partially addressed but has gaps, vague language, or borderline values
-- NOT_ADDRESSED: requirement is entirely absent from the subject document
+Status classification rules (only for CHECKABLE rules):
+- SATISFIES: The subject document fully meets this rule — all values, thresholds, and conditions are present and compliant
+- VIOLATES: The subject document directly contradicts or breaches this rule (e.g. exceeds allowed LTV ratio, missing mandatory clause, prohibited term present)
+- RISKY: The subject document partially addresses the requirement but has gaps, vague language, or borderline values that create exposure
+- NOT_ADDRESSED: The rule requirement is entirely absent from the subject document but should be present
 
-Compliance score: count(SATISFIES) / total_rules × 100 (rounded to nearest integer)
+Compliance score: count of SATISFIES ÷ total CHECKABLE rules × 100 (rounded to nearest integer)
 Overall verdict:
 - COMPLIANT: compliance_score >= 70 and no VIOLATES
 - NON_COMPLIANT: compliance_score < 60
-- PARTIALLY_COMPLIANT: otherwise
+- PARTIALLY_COMPLIANT: otherwise (60–69, or score >= 70 with VIOLATES present)
 
-Approval recommendation:
-- APPROVE: compliance_score >= 70 AND no VIOLATES
-- REJECT: compliance_score < 60
-- CONDITIONAL_APPROVE: all other cases — populate "conditions" with one fix per VIOLATES item
+Approval recommendation — THREE possible values:
+- APPROVE: compliance_score >= 70 AND no VIOLATES (RISKY items are warnings only, do not block approval)
+- CONDITIONAL_APPROVE: compliance_score >= 60 but below 70, OR score >= 70 with VIOLATES present — populate "conditions" with one concrete corrective action per violation
+- REJECT: compliance_score < 60 — document has too many unmet or violated requirements to be conditionally approved
 """
 
 
@@ -308,6 +300,16 @@ def analyze_document_against_rules(
         if not isinstance(result.get("conditions"), list):
             result["conditions"] = []
 
+        _VALID_STATUSES = {"SATISFIES", "VIOLATES", "RISKY", "NOT_ADDRESSED"}
+
+        # Drop any result with a non-standard status (e.g. NOT_APPLICABLE, N/A).
+        # The prompt instructs the AI to omit these entirely, but some models
+        # stubbornly include them with a custom status — filter them out here.
+        result["policy_requirements"] = [
+            r for r in result["policy_requirements"]
+            if r.get("status") in _VALID_STATUSES
+        ]
+
         reqs = result["policy_requirements"]
 
         # Back-fill source_document from the input rules if AI omitted it
@@ -317,7 +319,7 @@ def analyze_document_against_rules(
             if rid in rule_map and not req.get("source_document"):
                 req["source_document"] = rule_map[rid].get("source_document", "")
 
-        # Recalculate compliance score from actual results (source of truth)
+        # Recalculate compliance score from applicable results only (source of truth)
         sat = sum(1 for r in reqs if r.get("status") == "SATISFIES")
         score = round(sat / len(reqs) * 100) if reqs else 0
         result["compliance_score"] = score
