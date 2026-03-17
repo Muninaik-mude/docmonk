@@ -51,7 +51,7 @@ def call_ai(
     messages: list,
     *,
     max_tokens: int = 8000,
-    temperature: float = 0,
+    temperature: float = 0.1,
     seed: int | None = 42,
 ) -> str:
     """
