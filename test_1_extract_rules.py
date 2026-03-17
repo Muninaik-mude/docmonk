@@ -11,7 +11,7 @@ import json, pathlib, subprocess, sys, os, time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Configure ──────────────────────────────────────────────────────────────────
-POLICY_PDF  = r"E:/cpcdc-commercial-lending-program-loan-policy.pdf"
+POLICY_PDF  = r"E:/sample-housing-lending-policies.pdf"
 POLICY_TYPE = "Housing Lending Policy"
 OUT_DIR     = pathlib.Path("E:/policy_analysis_reports/extract_rules_test")
 # ──────────────────────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ import fitz
 from policy.services.policy_rule_service import extract_rules_from_policy
 from policy.services.policy_report_service import generate_rule_extraction_report
 
-rules_json_path   = OUT_DIR / "rules_cpcdc.json"
+rules_json_path   = OUT_DIR / "rules.json"
 preview_html_path = OUT_DIR / "rule_document_preview.html"
 
 policy_bytes    = pathlib.Path(POLICY_PDF).read_bytes()

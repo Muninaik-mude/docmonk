@@ -8,7 +8,7 @@ Fully decoupled from the clause-analyzer provider pool.
 import json
 import logging
 
-from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_parse as _safe_json_parse
+from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_parse as _safe_json_parse, PolicyRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +354,8 @@ def analyze_document_against_rules(
     except json.JSONDecodeError:
         logger.exception("Failed to parse AI JSON response for rules-based analysis")
         return _policy_fallback_result("AI response could not be parsed")
+    except PolicyRateLimitError:
+        raise
     except Exception as e:
         logger.exception("AI call failed for rules-based analysis")
         return _policy_fallback_result(f"AI analysis failed: {type(e).__name__}")

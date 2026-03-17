@@ -21,6 +21,12 @@ from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError
 
 logger = logging.getLogger(__name__)
 
+
+class PolicyRateLimitError(Exception):
+    """Raised when the AI provider returns a 429 rate-limit response."""
+    pass
+
+
 # ── Client — created once, reused for all calls ────────────────────────────────
 
 _client_lock = threading.Lock()
@@ -73,7 +79,7 @@ def call_ai(
         )
         return (resp.choices[0].message.content or "").strip()
     except RateLimitError as exc:
-        raise RuntimeError(f"Policy AI rate-limited: {exc}") from exc
+        raise PolicyRateLimitError(f"Policy AI rate-limited: {exc}") from exc
     except APIStatusError as exc:
         raise RuntimeError(f"Policy AI HTTP {exc.status_code}: {exc.message}") from exc
     except APIConnectionError as exc:

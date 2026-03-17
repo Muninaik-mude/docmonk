@@ -9,7 +9,7 @@ and eliminating variance in rule counts between runs.
 import json
 import logging
 
-from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_parse as _safe_json_parse
+from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_parse as _safe_json_parse, PolicyRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +366,8 @@ def extract_rules_from_policy(
     except json.JSONDecodeError:
         logger.exception("Failed to parse AI JSON response for rule extraction")
         return _extraction_fallback("AI response could not be parsed as JSON")
+    except PolicyRateLimitError:
+        raise
     except Exception as e:
         logger.exception("AI call failed for rule extraction")
         return _extraction_fallback(f"AI extraction failed: {type(e).__name__}: {e}")

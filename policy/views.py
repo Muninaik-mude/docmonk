@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 from .models import PolicyAnalysisJob, PolicyRuleExtractionJob
 from .serializers import PolicyAnalyzerSerializer, PolicyRuleExtractSerializer
 from .services import policy_service, policy_report_service, policy_rule_service
+from .services.policy_ai_service import PolicyRateLimitError
 from analyzer.services import pdf_service, r2_service
 
 logger = logging.getLogger(__name__)
@@ -165,9 +166,19 @@ class PolicyRuleExtractView(APIView):
             "Policy extraction job %s: extracting rules (policy_type=%r, ~%d chars)",
             job.job_id, policy_type, len(full_text),
         )
-        extraction_result = policy_rule_service.extract_rules_from_policy(
-            full_text, policy_type, doc_filename
-        )
+        try:
+            extraction_result = policy_rule_service.extract_rules_from_policy(
+                full_text, policy_type, doc_filename
+            )
+        except PolicyRateLimitError:
+            job.status = "failed"
+            job.error_message = "AI rate limit exceeded"
+            job.save(update_fields=["status", "error_message", "updated_at"])
+            return Response(
+                {"status": "error", "job_id": str(job.job_id), "message": "AI rate limit exceeded. Please retry after a moment."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": "60"},
+            )
         rules = extraction_result.get("rules", [])
         logger.info(
             "Policy extraction job %s: extracted %d rules",
@@ -303,21 +314,31 @@ class PolicyAnalyzerView(APIView):
         job.save(update_fields=["full_text", "updated_at"])
 
         # ── Step 3: AI analysis — rules path (preferred) or policy_text (legacy) ─
-        if rules:
-            logger.info(
-                "Policy job %s: running rules-based analysis (%d rules, policy_type=%r)",
-                job.job_id, len(rules), policy_type,
-            )
-            policy_analysis = policy_service.analyze_document_against_rules(
-                full_text, policy_type, rules
-            )
-        else:
-            logger.info(
-                "Policy job %s: running policy-text analysis (policy_type=%r)",
-                job.job_id, policy_type,
-            )
-            policy_analysis = policy_service.analyze_document_against_policy(
-                full_text, policy_type, policy_text
+        try:
+            if rules:
+                logger.info(
+                    "Policy job %s: running rules-based analysis (%d rules, policy_type=%r)",
+                    job.job_id, len(rules), policy_type,
+                )
+                policy_analysis = policy_service.analyze_document_against_rules(
+                    full_text, policy_type, rules
+                )
+            else:
+                logger.info(
+                    "Policy job %s: running policy-text analysis (policy_type=%r)",
+                    job.job_id, policy_type,
+                )
+                policy_analysis = policy_service.analyze_document_against_policy(
+                    full_text, policy_type, policy_text
+                )
+        except PolicyRateLimitError:
+            job.status = "failed"
+            job.error_message = "AI rate limit exceeded"
+            job.save(update_fields=["status", "error_message", "updated_at"])
+            return Response(
+                {"status": "error", "job_id": str(job.job_id), "message": "AI rate limit exceeded. Please retry after a moment."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": "60"},
             )
 
         logger.info(
