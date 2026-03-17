@@ -12,6 +12,11 @@ from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_par
 
 logger = logging.getLogger(__name__)
 
+# Hard cap to avoid overflowing the model's context window.
+# 80,000 chars ≈ 20,000 tokens at ~4 chars/token.
+_MAX_DOC_CHARS    = 80_000
+_MAX_POLICY_CHARS = 80_000
+
 
 # ── Policy-based document analysis ────────────────────────────────────────────
 
@@ -90,6 +95,19 @@ def analyze_document_against_policy(
     Returns dict with: overall_verdict, compliance_score, summary,
     policy_requirements, risk_points, approval_recommendation, conditions.
     """
+    if len(document_text) > _MAX_DOC_CHARS:
+        logger.warning(
+            "Policy analysis: document_text truncated from %d to %d chars",
+            len(document_text), _MAX_DOC_CHARS,
+        )
+        document_text = document_text[:_MAX_DOC_CHARS]
+    if len(policy_text) > _MAX_POLICY_CHARS:
+        logger.warning(
+            "Policy analysis: policy_text truncated from %d to %d chars",
+            len(policy_text), _MAX_POLICY_CHARS,
+        )
+        policy_text = policy_text[:_MAX_POLICY_CHARS]
+
     user_content = _POLICY_USER_TEMPLATE.format(
         policy_type=policy_type or "General Policy",
         policy_text=policy_text,
@@ -153,6 +171,189 @@ def analyze_document_against_policy(
         return _policy_fallback_result("AI response could not be parsed")
     except Exception as e:
         logger.exception("AI call failed for policy analysis")
+        return _policy_fallback_result(f"AI analysis failed: {type(e).__name__}")
+
+
+# ── Rules-based document analysis ─────────────────────────────────────────────
+
+_RULES_ANALYSIS_SYSTEM_PROMPT = """\
+You are a strict compliance analyst. You receive a set of pre-extracted POLICY RULES \
+and a SUBJECT DOCUMENT.
+
+Your job is to evaluate the subject document against every rule provided.
+- You MUST include one result entry for EACH rule in the input — do not skip any.
+- Evaluate only what is present in the subject document; do not infer or assume.
+- Cite exact text from both the rule and the subject document where possible.
+
+You must respond ONLY with valid JSON. No markdown, no extra text."""
+
+_RULES_ANALYSIS_USER_TEMPLATE = """\
+POLICY TYPE: {policy_type}
+
+RULES TO CHECK ({rule_count} rules):
+{rules_text}
+
+SUBJECT DOCUMENT TO ANALYZE:
+{document_text}
+
+Evaluate the SUBJECT DOCUMENT against EVERY rule listed above.
+You must produce exactly {rule_count} entries in policy_requirements — one per rule.
+
+Respond in this EXACT JSON format:
+{{
+    "overall_verdict": "COMPLIANT" or "NON_COMPLIANT" or "PARTIALLY_COMPLIANT",
+    "compliance_score": <integer 0-100 reflecting percentage of rules with SATISFIES status>,
+    "summary": "2-3 sentence executive summary. Wrap BOTH key terms AND their actual values \
+in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. \
+Use {{{{-term}}}} for negatives (violations, exceedances, failures), \
+{{{{+term}}}} for positives (compliant values, satisfied requirements), \
+{{{{~term}}}} for neutral labels (verdict labels, policy names). \
+Every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST \
+be wrapped — never leave a number or percentage bare.",
+    "policy_requirements": [
+        {{
+            "rule_id": "same rule_id from the input rule",
+            "requirement": "The rule description (copy from input rule description)",
+            "status": "SATISFIES" or "VIOLATES" or "RISKY" or "NOT_ADDRESSED",
+            "reason": "Specific finding citing exact text from both the rule and subject document",
+            "relevant_text": "Verbatim sentence(s) from the subject document relevant to this \
+rule, or null if nothing found",
+            "rule_reference": "Same rule_reference from the input rule",
+            "source_document": "Same source_document from the input rule",
+            "recommendation": "Concrete actionable fix — null if status is SATISFIES"
+        }}
+    ],
+    "risk_points": ["Specific risk with brief explanation — only for RISKY or NOT_ADDRESSED items"],
+    "approval_recommendation": "APPROVE" or "CONDITIONAL_APPROVE" or "REJECT",
+    "conditions": ["Exact corrective action per VIOLATES item — empty list if no violations"]
+}}
+
+Status classification:
+- SATISFIES: subject document fully meets this rule — all values, thresholds, and conditions present and compliant
+- VIOLATES: subject document directly contradicts or breaches this rule
+- RISKY: partially addressed but has gaps, vague language, or borderline values
+- NOT_ADDRESSED: requirement is entirely absent from the subject document
+
+Compliance score: count(SATISFIES) / total_rules × 100 (rounded to nearest integer)
+Overall verdict:
+- COMPLIANT: compliance_score >= 70 and no VIOLATES
+- NON_COMPLIANT: compliance_score < 60
+- PARTIALLY_COMPLIANT: otherwise
+
+Approval recommendation:
+- APPROVE: compliance_score >= 70 AND no VIOLATES
+- REJECT: compliance_score < 60
+- CONDITIONAL_APPROVE: all other cases — populate "conditions" with one fix per VIOLATES item
+"""
+
+
+def _format_rules_for_prompt(rules: list) -> str:
+    """Serialise rule objects into a compact, readable block for the analysis prompt."""
+    lines = []
+    for i, rule in enumerate(rules, 1):
+        lines.append(
+            f"[{i}] rule_id: {rule.get('rule_id', '')}\n"
+            f"    Reference : {rule.get('rule_reference', '')}\n"
+            f"    Category  : {rule.get('category', '')}\n"
+            f"    Type      : {rule.get('requirement_type', 'mandatory')}\n"
+            f"    Source    : {rule.get('source_document', '')}\n"
+            f"    Rule      : {rule.get('description', '')}"
+        )
+    return "\n\n".join(lines)
+
+
+def analyze_document_against_rules(
+    document_text: str,
+    policy_type: str,
+    rules: list,
+) -> dict:
+    """
+    Analyze a subject document against a list of pre-extracted rule objects.
+
+    Accepts the structured rules returned by policy_rule_service.extract_rules_from_policy().
+    Returns the same shape as analyze_document_against_policy() — the caller can use
+    either function interchangeably.
+    """
+    if not rules:
+        return _policy_fallback_result("No rules provided for analysis")
+
+    if len(document_text) > _MAX_DOC_CHARS:
+        logger.warning(
+            "Rules-based analysis: document_text truncated from %d to %d chars",
+            len(document_text), _MAX_DOC_CHARS,
+        )
+        document_text = document_text[:_MAX_DOC_CHARS]
+
+    rules_text = _format_rules_for_prompt(rules)
+    user_content = _RULES_ANALYSIS_USER_TEMPLATE.format(
+        policy_type=policy_type or "General Policy",
+        rule_count=len(rules),
+        rules_text=rules_text,
+        document_text=document_text,
+    )
+    messages = [
+        {"role": "system", "content": _RULES_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
+
+    try:
+        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
+        result = _safe_json_parse(response_text)
+
+        # Normalise fields
+        if not isinstance(result.get("policy_requirements"), list):
+            result["policy_requirements"] = []
+        if not isinstance(result.get("risk_points"), list):
+            result["risk_points"] = []
+        if not isinstance(result.get("conditions"), list):
+            result["conditions"] = []
+
+        reqs = result["policy_requirements"]
+
+        # Back-fill source_document from the input rules if AI omitted it
+        rule_map = {r.get("rule_id"): r for r in rules}
+        for req in reqs:
+            rid = req.get("rule_id") or ""
+            if rid in rule_map and not req.get("source_document"):
+                req["source_document"] = rule_map[rid].get("source_document", "")
+
+        # Recalculate compliance score from actual results (source of truth)
+        sat = sum(1 for r in reqs if r.get("status") == "SATISFIES")
+        score = round(sat / len(reqs) * 100) if reqs else 0
+        result["compliance_score"] = score
+
+        # Derive overall_verdict
+        has_violations = any(r.get("status") == "VIOLATES" for r in reqs)
+        if score >= 70 and not has_violations:
+            result["overall_verdict"] = "COMPLIANT"
+        elif score < 60:
+            result["overall_verdict"] = "NON_COMPLIANT"
+        else:
+            result["overall_verdict"] = "PARTIALLY_COMPLIANT"
+
+        # Derive approval_recommendation
+        if score >= 70 and not has_violations:
+            result["approval_recommendation"] = "APPROVE"
+            result["conditions"] = []
+        elif score < 60:
+            result["approval_recommendation"] = "REJECT"
+            result["conditions"] = []
+        else:
+            result["approval_recommendation"] = "CONDITIONAL_APPROVE"
+            if not result["conditions"]:
+                result["conditions"] = [
+                    r["recommendation"]
+                    for r in reqs
+                    if r.get("status") == "VIOLATES" and r.get("recommendation")
+                ]
+
+        return result
+
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse AI JSON response for rules-based analysis")
+        return _policy_fallback_result("AI response could not be parsed")
+    except Exception as e:
+        logger.exception("AI call failed for rules-based analysis")
         return _policy_fallback_result(f"AI analysis failed: {type(e).__name__}")
 
 

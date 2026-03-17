@@ -7,16 +7,27 @@ from analyzer.services.report_service import _SUMMARY_CSS
 
 logger = logging.getLogger(__name__)
 
-# Status → background colour
+# Status → background colour (analysis report)
 _STATUS_BG = {
     "SATISFIES":     "#d4edda",
     "VIOLATES":      "#fde8e8",
     "RISKY":         "#fff3cd",
     "NOT_ADDRESSED": None,
+    # Rule-extraction preview — maps requirement_type display values
+    "MANDATORY":     "#fde8e8",
+    "CONDITIONAL":   "#fff3cd",
+    "INFORMATIONAL": "#d1fae5",
 }
 
 # Priority when multiple requirements overlap the same text
 _STATUS_PRIORITY = {"VIOLATES": 0, "RISKY": 1, "SATISFIES": 2, "NOT_ADDRESSED": 3}
+
+# requirement_type → display status key (used by rule extraction highlight map)
+_REQTYPE_TO_DISPLAY = {
+    "mandatory":     "MANDATORY",
+    "conditional":   "CONDITIONAL",
+    "informational": "INFORMATIONAL",
+}
 
 # ── Global-tooltip JS (mouse-following, animated card, always stays in viewport) ─
 _TOOLTIP_JS = """
@@ -154,6 +165,15 @@ _SPLIT_LAYOUT_CSS = """
   border-left: 2px solid #e5e7eb;
   padding-left: 6px;
   margin-top: 2px;
+}
+/* Source document attribution (multi-doc analysis) */
+.item-src-doc {
+  font-size: 10px;
+  color: #9ca3af;
+  font-weight: 600;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  margin-top: 1px;
 }
 /* Panel top-margins on the left side */
 .report-left .vio-panel { margin-top: 10px; }
@@ -403,9 +423,13 @@ def _match_highlight(text: str, highlight_map: list):
 def _tip_attr(status: str, requirement: str, reason: str, rule_reference: str = "", req_idx: int = -1) -> str:
     """Build the data-tip HTML string — a rich card rendered in tooltip innerHTML."""
     badge_map = {
-        "SATISFIES": ("&#x2714;", "#059669", "#d1fae5", "#065f46", "Satisfies"),
-        "VIOLATES":  ("&#x2716;", "#dc2626", "#fee2e2", "#991b1b", "Violates"),
-        "RISKY":     ("&#x26A0;", "#d97706", "#fef3c7", "#92400e", "Risky"),
+        "SATISFIES":     ("&#x2714;", "#059669", "#d1fae5", "#065f46", "Satisfies"),
+        "VIOLATES":      ("&#x2716;", "#dc2626", "#fee2e2", "#991b1b", "Violates"),
+        "RISKY":         ("&#x26A0;", "#d97706", "#fef3c7", "#92400e", "Risky"),
+        # Rule-extraction preview
+        "MANDATORY":     ("&#x2731;", "#dc2626", "#fee2e2", "#991b1b", "Mandatory Rule"),
+        "CONDITIONAL":   ("&#x26A0;", "#d97706", "#fef3c7", "#92400e", "Conditional Rule"),
+        "INFORMATIONAL": ("&#x2139;", "#2563eb", "#dbeafe", "#1e40af", "Informational"),
     }
     icon, accent, bg, text_dark, label = badge_map.get(
         status, ("&#x2022;", "#6b7280", "#f3f4f6", "#374151", status.replace("_", " ").title())
@@ -2006,12 +2030,12 @@ def generate_policy_report(
     # ── Helper: build a structured left-panel item ────────────────────────────
     def _item_html(orig_idx: int, r: dict, item_cls: str, ref_cls: str) -> str:
         rr      = _esc((r.get("rule_reference") or "").strip())
-        req     = _esc(r.get("requirement", ""))
-        rt      = _esc((r.get("relevant_text") or "").strip())
-        reason  = _esc(r.get("reason", "") or r.get("recommendation", ""))
+        src_doc = _esc((r.get("source_document") or "").strip())
         parts   = [f'<div class="{item_cls}" id="req-{orig_idx}">']
         if rr:
             parts.append(f'<div class="item-rule-ref {ref_cls}">{rr}</div>')
+        if src_doc:
+            parts.append(f'<div class="item-src-doc">&#x1F4C4; {src_doc}</div>')
         parts.append('</div>')
         return "".join(parts)
 
@@ -2107,6 +2131,169 @@ def generate_policy_report(
     lines.append('</div>')  # close report-split
 
     # ── Global tooltip card + JS ───────────────────────────────────────────────
+    lines.append(_TOOLTIP_JS)
+
+    return "\n".join(lines)
+
+
+# ── Rule-extraction preview report ────────────────────────────────────────────
+
+def _build_rule_highlight_map(rules: list) -> list:
+    """
+    Build a highlight map from extracted rule objects using source_excerpt as
+    the text to match in the policy document.
+
+    Returns the same 6-tuple format as _build_highlight_map so all existing
+    document renderers (_docx_to_html, _pdf_to_html, etc.) work unchanged:
+        (excerpt_lower, display_status, title, description_snippet, rule_reference, idx)
+    """
+    priority = {"MANDATORY": 0, "CONDITIONAL": 1, "INFORMATIONAL": 2}
+    result = []
+    for idx, rule in enumerate(rules):
+        excerpt = (rule.get("source_excerpt") or "").strip()
+        if not excerpt:
+            continue
+        req_type = (rule.get("requirement_type") or "mandatory").lower()
+        display_status = _REQTYPE_TO_DISPLAY.get(req_type, "MANDATORY")
+        title = rule.get("title") or rule.get("rule_id") or ""
+        desc_snippet = (rule.get("description") or "")[:140]
+        result.append((
+            excerpt.lower(),
+            display_status,
+            title,
+            desc_snippet,
+            rule.get("rule_reference") or "",
+            idx,
+        ))
+    result.sort(key=lambda x: priority.get(x[1], 99))
+    return result
+
+
+def generate_rule_extraction_report(
+    rules: list,
+    *,
+    policy_type: str = "",
+    doc_bytes: bytes = None,
+    document_text: str = None,
+    file_type: str = None,
+    document_filename: str = "",
+) -> str:
+    """
+    Generate an interactive HTML preview for the rule-extraction result.
+
+    Left panel  — extracted rules grouped by category, each showing its
+                  rule_reference, title, and requirement_type badge.
+    Right panel — the policy document rendered with source_excerpt passages
+                  highlighted (mandatory=red, conditional=yellow, informational=green).
+
+    Clicking a highlight scrolls the left panel to the matching rule card.
+    """
+    hl_map = _build_rule_highlight_map(rules)
+    lines  = [_DOC_CSS, _SPLIT_LAYOUT_CSS]
+
+    # ── Build document body (reuse existing renderers) ────────────────────────
+    if doc_bytes and file_type == "docx":
+        doc_html = _docx_to_html(doc_bytes, hl_map)
+    elif doc_bytes and file_type == "pdf":
+        doc_html = _pdf_to_html(doc_bytes, hl_map)
+    elif document_text and file_type in ("markdown", "txt", None):
+        if "|" in document_text or "**" in document_text or document_text.lstrip().startswith("#"):
+            doc_html = _markdown_to_html(document_text, hl_map)
+        else:
+            doc_html = _plain_text_to_html(document_text, hl_map)
+    elif document_text:
+        doc_html = _plain_text_to_html(document_text, hl_map)
+    else:
+        doc_html = "<p><em>No document content available.</em></p>"
+
+    # ── Counts by requirement_type ────────────────────────────────────────────
+    mandatory_count    = sum(1 for r in rules if (r.get("requirement_type") or "mandatory") == "mandatory")
+    conditional_count  = sum(1 for r in rules if r.get("requirement_type") == "conditional")
+    info_count         = sum(1 for r in rules if r.get("requirement_type") == "informational")
+
+    # ── Group rules by category ───────────────────────────────────────────────
+    categories: dict[str, list] = {}
+    for idx, rule in enumerate(rules):
+        cat = (rule.get("category") or "general").strip().title()
+        categories.setdefault(cat, []).append((idx, rule))
+
+    # Badge styles per display_status
+    _badge = {
+        "MANDATORY":     ("#dc2626", "#fee2e2", "Mandatory"),
+        "CONDITIONAL":   ("#d97706", "#fef3c7", "Conditional"),
+        "INFORMATIONAL": ("#2563eb", "#dbeafe", "Info"),
+    }
+
+    lines.append('<div class="report-split">')
+
+    # ══ LEFT PANEL ════════════════════════════════════════════════════════════
+    lines.append('<div class="report-left">')
+
+    # Legend
+    lines.append(
+        '<div class="pdv-legend">'
+        f'<span class="leg-vio">&#x2731; Mandatory ({mandatory_count})</span>'
+        f'<span class="leg-rsk">&#x26A0; Conditional ({conditional_count})</span>'
+        f'<span class="leg-sat">&#x2139; Info ({info_count})</span>'
+        '</div>'
+    )
+
+    # Header
+    lines.append(
+        '<div style="padding:10px 10px 4px;font-size:13px;font-weight:700;color:#374151;">'
+        f'&#x1F4CB;&nbsp;{len(rules)} Rules Extracted'
+        f'<div style="font-size:11px;font-weight:400;color:#6b7280;margin-top:2px;">'
+        f'{_esc(policy_type or document_filename or "Policy Document")}</div>'
+        '</div>'
+    )
+
+    # Rules grouped by category
+    for cat_name, cat_rules in sorted(categories.items()):
+        lines.append(
+            '<div style="margin-top:10px;">'
+            f'<div style="font-size:11px;font-weight:700;letter-spacing:.05em;'
+            f'text-transform:uppercase;color:#6b7280;padding:4px 10px 2px;'
+            f'border-bottom:1px solid #e5e7eb;margin-bottom:2px;">'
+            f'{_esc(cat_name)}</div>'
+        )
+        for idx, rule in cat_rules:
+            req_type       = (rule.get("requirement_type") or "mandatory").lower()
+            display_status = _REQTYPE_TO_DISPLAY.get(req_type, "MANDATORY")
+            bc, bg, label  = _badge.get(display_status, ("#dc2626", "#fee2e2", "Mandatory"))
+            rr    = _esc((rule.get("rule_reference") or "").strip())
+            title = _esc((rule.get("title") or rule.get("rule_id") or "").strip())
+
+            lines.append(
+                f'<div style="display:flex;flex-direction:column;gap:3px;'
+                f'padding:8px 8px 8px 14px;border-left:3px solid {bc};'
+                f'margin:2px 4px 2px 0;border-radius:0 4px 4px 0;" id="req-{idx}">'
+            )
+            if rr:
+                lines.append(
+                    f'<div style="font-size:11px;font-weight:700;color:{bc};'
+                    f'letter-spacing:.02em;line-height:1.3;">{rr}</div>'
+                )
+            if title:
+                lines.append(
+                    f'<div style="font-size:13px;font-weight:600;color:#111827;'
+                    f'line-height:1.4;">{title}</div>'
+                )
+            lines.append(
+                f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+                f'padding:1px 8px;border-radius:10px;background:{bg};color:{bc};'
+                f'width:fit-content;">{label}</span>'
+                '</div>'
+            )
+        lines.append('</div>')  # close category group
+
+    lines.append('</div>')  # close report-left
+
+    # ══ RIGHT PANEL ═══════════════════════════════════════════════════════════
+    lines.append('<div class="report-right">')
+    lines.append(doc_html)
+    lines.append('</div>')  # close report-right
+
+    lines.append('</div>')  # close report-split
     lines.append(_TOOLTIP_JS)
 
     return "\n".join(lines)
