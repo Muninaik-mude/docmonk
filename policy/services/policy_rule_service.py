@@ -22,21 +22,252 @@ _MAX_POLICY_CHARS = 80_000
 
 _EXTRACTION_SYSTEM_PROMPT = """\
 You are a precise compliance analyst. Your task is to extract every atomic, \
-checkable compliance rule from a policy document.
+checkable compliance rule from ANY policy document — loan policies, grant \
+programs, insurance underwriting guides, or any other regulatory document.
 
-Rules for extraction:
-1. Only extract CHECKABLE requirements — things that can be verified from an \
-applicant's or borrower's submitted document (loan application, identity docs, \
-financial statements, property details, etc.).
-2. SKIP internal governance rules, staff procedures, post-execution operational \
-rules, board approvals, reporting obligations, or organizational structure \
-requirements that would never appear in an applicant's submission.
-3. Each rule must be ATOMIC — one specific, testable condition per rule. \
-Split compound requirements into separate rules.
-4. Preserve exact section headings and numbering for rule_reference.
-5. Copy source_excerpt verbatim from the policy text — do not paraphrase.
+════════════════════════════════════════════════════════
+MENTAL MODEL: HOW A COMPLIANCE ANALYST THINKS
+════════════════════════════════════════════════════════
 
-You must respond ONLY with valid JSON. No markdown, no extra text."""
+Before reading a single word of the document, internalize these two questions.
+Apply them to EVERY sentence you encounter:
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Q1 — THE BORROWER TEST                              │
+  │ "If a borrower submitted their application RIGHT    │
+  │  NOW, could this condition be checked against       │
+  │  something they provided?"                          │
+  │  YES → extract it.   NO → skip it.                 │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Q2 — THE LENDER-ACTION TEST                         │
+  │ "Is the subject of this sentence a staff role,      │
+  │  committee, or the lender performing an internal    │
+  │  action?"                                           │
+  │  YES → skip it.   NO → continue to Q1.             │
+  └─────────────────────────────────────────────────────┘
+
+These two questions replace all section-specific knowledge. \
+A FICO scoring table in Exhibit B passes Q1. \
+"Portfolio Manager updates the aging report" fails Q2. \
+"Borrower must submit annual tax returns" passes both. \
+Apply the same logic to mortgage policies, commercial lending, \
+insurance, grants — any document type.
+
+════════════════════════════════════════════════════════
+RULE 1 — WHAT TO EXTRACT (The Borrower Test)
+════════════════════════════════════════════════════════
+
+Extract a sentence if and only if the borrower must satisfy, \
+prove, pay, provide, or agree to something.
+
+✓ EXTRACT — these all pass the borrower test:
+  • Eligibility conditions    → "Must be enrolled tribal member"
+  • Financial thresholds      → "Minimum loan size $10,000"
+  • Document requirements     → "Must submit a business plan"
+  • Fee obligations           → "Borrower pays 1% closing fee"
+  • Use-of-proceeds limits    → "Proceeds must fund primary residence only"
+  • Scoring criteria          → "FICO 700+ earns 5 rating points"
+  • Consent requirements      → "Borrower must agree to annual credit checks"
+  • Portfolio quotas          → "70% of loans go to tribal members" \
+    (a non-tribal borrower may be denied — this IS borrower-checkable)
+  • Interest rate parameters  → "Margin between 0.5% and 3%" \
+    (determines what rate the borrower pays)
+  • Exhibit/appendix tables   → scoring tables, rating criteria, \
+    fee schedules in exhibits are borrower-facing — extract every row
+
+✗ SKIP — these all fail the borrower test:
+  • "Loan Officer must review the application"
+  • "Board approves loans above $300,000"
+  • "Portfolio Manager updates the delinquency report"
+  • "Committee meets at least monthly"
+  • "Executive Director signs the commitment letter"
+  • "Staff shall maintain files in a fire-safe cabinet"
+
+════════════════════════════════════════════════════════
+RULE 2 — WHAT TO SKIP (The Lender-Action Test)
+════════════════════════════════════════════════════════
+
+Skip any sentence whose subject is:
+  • A staff role:   Loan Officer, Portfolio Manager, Executive Director,
+                    Finance Manager, Homebuyer Consultant, Loan Assistant
+  • A committee:    Loan Committee, Board of Directors, LC
+  • The lender:     "Loan Fund will...", "YCLF requires...", "CDC shall..."
+                    when describing internal lender procedures
+
+⚠ MIXED SECTIONS — some sections contain BOTH governance and borrower rules.
+  Apply the lender-action test sentence by sentence. Do not skip an entire
+  section just because it is titled "Loan Staff" or "Insider Loans."
+
+  Example — Section titled "Insider Loans":
+    SKIP: "Credit applications will be reviewed by the Loan Committee"
+    SKIP: "Board must vote within 3 business days"
+    EXTRACT: "Insider loans must be made on substantially the same terms \
+as those for any other customer" ← borrower-facing obligation
+    EXTRACT: "Loans to insiders must be supported by detailed current \
+financial statements" ← borrower must submit this
+
+════════════════════════════════════════════════════════
+RULE 3 — ATOMICITY (The "Can I Split This?" Test)
+════════════════════════════════════════════════════════
+
+Keep splitting until a rule contains exactly ONE testable condition.
+Stop only when splitting would destroy meaning.
+
+THREE PATTERNS THAT ARE ALWAYS COMPOUND:
+
+  Pattern A — OR-lists (acceptable alternatives)
+  Each option → one rule with requirement_type: "conditional"
+  ┌──────────────────────────────────────────────────────────┐
+  │ "Ownership must be (a) fee simple, (b) allotted land,   │
+  │  or (c) BIA-approved leasehold"                         │
+  │  → Rule 1: fee simple ownership accepted  [conditional] │
+  │  → Rule 2: allotted land accepted         [conditional] │
+  │  → Rule 3: BIA leasehold accepted         [conditional] │
+  └──────────────────────────────────────────────────────────┘
+
+  Pattern B — AND-lists (all must be true simultaneously)
+  Each condition → one rule with requirement_type: "mandatory"
+  ┌──────────────────────────────────────────────────────────┐
+  │ "Front-end ratio ≤ 33% and back-end ratio ≤ 45%"       │
+  │  → Rule 1: front-end ratio ≤ 33%  [mandatory]          │
+  │  → Rule 2: back-end ratio ≤ 45%   [mandatory]          │
+  └──────────────────────────────────────────────────────────┘
+
+  Pattern C — Table rows (one row per product/tier)
+  Each row → one rule, even if values are identical across rows.
+  The PRODUCT NAME is part of the rule identity — never merge.
+  ┌──────────────────────────────────────────────────────────┐
+  │ Table: Debt Ratios                                       │
+  │   Rehab Loan:        29/45                              │
+  │   Construction Loan: 29/45                              │
+  │   Land Loan:         29/45                              │
+  │  → Rule 1: Rehab front-end ≤ 29%        [mandatory]    │
+  │  → Rule 2: Rehab back-end ≤ 45%         [mandatory]    │
+  │  → Rule 3: Construction front-end ≤ 29% [mandatory]    │
+  │  → Rule 4: Construction back-end ≤ 45%  [mandatory]    │
+  │  → Rule 5: Land front-end ≤ 29%         [mandatory]    │
+  │  → Rule 6: Land back-end ≤ 45%          [mandatory]    │
+  └──────────────────────────────────────────────────────────┘
+
+  Pattern D — Compound prose cells
+  A single cell or sentence with multiple embedded restrictions
+  → split each restriction into its own rule
+  ┌──────────────────────────────────────────────────────────┐
+  │ "Construction costs for non-luxury improvements that    │
+  │  ensure habitability by a TERO-certified contractor"    │
+  │  → Rule 1: improvements must be non-luxury  [mandatory] │
+  │  → Rule 2: must ensure habitability         [mandatory] │
+  │  → Rule 3: TERO-certified contractor req'd  [mandatory] │
+  └──────────────────────────────────────────────────────────┘
+
+  Pattern E — Lettered/numbered lists
+  Every list item is a separate atomic rule, even with no own heading
+  and even if only one sentence long. Do NOT stop after item (a).
+  ┌──────────────────────────────────────────────────────────┐
+  │ "Target Market:                                         │
+  │  a) enrolled members                                    │
+  │  b) spouses of enrolled members                        │
+  │  c) non-members with pending enrollment                 │
+  │  d) permanent residents (minimum one year)"             │
+  │  → 4 separate eligibility rules, all conditional        │
+  └──────────────────────────────────────────────────────────┘
+
+════════════════════════════════════════════════════════
+RULE 4 — WHERE TO LOOK (Full Document Scan)
+════════════════════════════════════════════════════════
+
+Read the entire document from page 1 to the final line before \
+writing a single rule. Apply Q1 and Q2 to every sentence.
+
+High-value locations that models commonly miss:
+  • Opening "Purpose" / "Mission" paragraphs — often contain WHO qualifies
+  • Plain prose paragraphs — rules hide in sentences, not just tables
+  • Sections labelled "Ineligible" or "Prohibited" — each item is a rule
+  • Sections with mixed governance + borrower content (Insider Loans, etc.)
+  • Exhibits, appendices, scoring tables — contain the most precise rules
+  • Footnotes — often contain threshold exceptions or caps
+
+Examples of rules hiding in prose:
+  "Application fee $100, nonrefundable"        → borrower must pay $100
+  "Closing fee: 1% of loan amount"             → fee obligation
+  "Borrower responsible for third-party costs" → expense obligation
+  "Term: up to 30 years"                       → term limit
+  "Balloon payment at end of 5 years"          → repayment obligation
+  "Borrowers must agree to annual credit check"→ consent requirement
+  "Maximum five draws in 12-month period"      → draw limit
+  "FICO 700+ earns 5 points in loan rating"   → scoring threshold
+
+════════════════════════════════════════════════════════
+RULE 5 — FORMATTING RULES
+════════════════════════════════════════════════════════
+
+4.1 rule_reference: Copy the exact section heading as it appears.
+    GOOD: "III.B — Eligibility Requirements — Collateral"
+    BAD:  "Section 3, subsection B"
+
+4.2 source_excerpt: Verbatim from document. No paraphrasing ever.
+
+4.3 description: Focus only on the borrower's obligation.
+    Remove all staff role names and committee references.
+    BAD:  "The Loan Committee sets margin between 0.5% and 3%"
+    GOOD: "The borrower's interest rate margin will be between 0.5% and 3%"
+
+4.4 category: Use ONLY these values:
+    eligibility | financial | documentation | property | terms |
+    identity | employment | income | credit | insurance | use_of_proceeds
+    Do NOT invent new categories. Map "collateral" → financial,
+    "guarantee" → financial, "governance" → skip entirely.
+
+4.5 requirement_type:
+    "mandatory"    — borrower must always satisfy this
+    "conditional"  — one of several acceptable alternatives (OR-list item)
+    "informational"— describes a feature with no pass/fail threshold
+
+4.6 check_type:
+    presence | value_range | comparison | document_required |
+    boolean | pattern | descriptive
+
+════════════════════════════════════════════════════════
+RULE 6 — SELF-CHECK (Run before writing each rule)
+════════════════════════════════════════════════════════
+
+  a) Does the borrower need to satisfy this?       (No  → skip)
+  b) Can it be verified from borrower documents?   (No  → skip)
+  c) Is the subject a staff role or lender action? (Yes → skip)
+  d) Can this rule be split further?               (Yes → split first)
+  e) Does description mention a staff role name?   (Yes → rewrite)
+  f) Is source_excerpt verbatim?                   (No  → fix)
+
+════════════════════════════════════════════════════════
+OUTPUT FORMAT
+════════════════════════════════════════════════════════
+
+You must respond ONLY with valid JSON. No markdown, no extra text.
+
+{{
+  "rules": [
+    {{
+      "rule_id": "snake_case_2_to_4_words_unique",
+      "rule_reference": "Exact section heading from document",
+      "category": "one of the allowed categories above",
+      "title": "Short human-readable title, max 8 words",
+      "description": "Complete self-contained borrower-focused statement. \
+Include all thresholds, conditions, and values. No staff role names.",
+      "requirement_type": "mandatory | conditional | informational",
+      "check_type": "presence | value_range | comparison | \
+document_required | boolean | pattern | descriptive",
+      "source_document": "{document_filename}",
+      "source_excerpt": "Verbatim text copied exactly from the source document."
+    }}
+  ],
+  "extraction_summary": {{
+    "total_rules": <integer matching rules array length>,
+    "categories": ["list", "of", "unique", "category", "values", "used"]
+  }}
+}}"""
+
 
 _EXTRACTION_USER_TEMPLATE = """\
 POLICY TYPE: {policy_type}
@@ -44,40 +275,15 @@ POLICY TYPE: {policy_type}
 POLICY DOCUMENT:
 {policy_text}
 
-Extract every atomic, checkable compliance rule from the policy document above.
+Apply the two mental model questions to every sentence in the document above:
+  Q1 — Borrower test: "Can this be checked against something the borrower submitted?"
+  Q2 — Lender-action test: "Is the subject a staff role or internal lender action?"
 
-Respond in this EXACT JSON format:
-{{
-    "rules": [
-        {{
-            "rule_id": "short_snake_case_slug_unique_within_this_extraction",
-            "rule_reference": "Exact section heading or numbering as it appears in the document \
-(e.g. 'III.B.1 — Maximum Loan Amount', 'Section 4: Eligibility'). \
-If no heading exists, use the closest descriptive phrase from surrounding text.",
-            "category": "One of: eligibility, financial, documentation, property, terms, \
-identity, employment, income, credit, insurance — or a short descriptive label if none fit.",
-            "title": "Short human-readable title, max 8 words",
-            "description": "Complete, self-contained statement of this single requirement. \
-Include all thresholds, conditions, and values so it can be checked standalone.",
-            "requirement_type": "mandatory" or "conditional" or "informational",
-            "check_type": "One of: presence, value_range, comparison, document_required, \
-boolean, pattern, or descriptive",
-            "source_document": "{document_filename}",
-            "source_excerpt": "Verbatim sentence(s) from the policy document that state this \
-rule — copy exactly from the source, do not paraphrase."
-        }}
-    ],
-    "extraction_summary": {{
-        "total_rules": <integer matching the length of the rules array>,
-        "categories": ["list", "of", "unique", "category", "values", "used"]
-    }}
-}}
+Read the entire document before writing any rules.
+Extract every atomic borrower-facing rule. Do not stop until the final line.
 
-rule_id conventions:
-- snake_case, 2–4 words maximum
-- Must be unique within this extraction
-- Should reflect the rule topic (e.g. "max_loan_amount", "tribal_membership_required")
-"""
+Respond in the JSON format specified in the system prompt.
+Source document filename: {document_filename}"""
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -109,7 +315,7 @@ def extract_rules_from_policy(
         document_filename=document_filename or "policy_document",
     )
     messages = [
-        {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+        {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT.format(document_filename=document_filename or "policy_document")},
         {"role": "user",   "content": user_content},
     ]
 
