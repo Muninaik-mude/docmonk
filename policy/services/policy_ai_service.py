@@ -112,12 +112,27 @@ def safe_json_parse(text: str) -> dict:
             except json.JSONDecodeError:
                 pass
 
-    # Strategy 3: force-close all open structures
+    # Strategy 3: force-close all open structures (handles mid-string truncation)
     try:
         partial = text[start:] if start != -1 else text
-        # Strip trailing comma before closing
         partial = partial.rstrip().rstrip(",")
-        open_braces = partial.count("{") - partial.count("}")
+
+        # Count unescaped quotes to detect mid-string truncation.
+        # Odd count means the response was cut off inside a string value.
+        quote_count = 0
+        i = 0
+        while i < len(partial):
+            if partial[i] == "\\" :
+                i += 2
+                continue
+            if partial[i] == '"':
+                quote_count += 1
+            i += 1
+        if quote_count % 2 == 1:
+            partial += '"'  # close the dangling string
+
+        partial = partial.rstrip(",")  # strip any trailing comma left after string close
+        open_braces   = partial.count("{") - partial.count("}")
         open_brackets = partial.count("[") - partial.count("]")
         partial += "]" * max(open_brackets, 0)
         partial += "}" * max(open_braces, 0)
