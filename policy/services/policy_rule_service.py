@@ -13,6 +13,12 @@ from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_par
 
 logger = logging.getLogger(__name__)
 
+_CATEGORY_ALIASES = {"use_of_proceeds": "proceeds"}
+
+def _normalise_category(value: str) -> str:
+    v = value.strip().lower()
+    return _CATEGORY_ALIASES.get(v, v)
+
 # Hard cap to avoid overflowing the model's context window.
 # 80,000 chars ≈ 20,000 tokens at ~4 chars/token — safely within most providers.
 _MAX_POLICY_CHARS = 80_000
@@ -216,7 +222,7 @@ RULE 5 — FORMATTING RULES
 
 4.4 category: Use ONLY these values:
     eligibility | financial | documentation | property | terms |
-    identity | employment | income | credit | insurance | use_of_proceeds
+    identity | employment | income | credit | insurance | proceeds
     Do NOT invent new categories. Map "collateral" → financial,
     "guarantee" → financial, "governance" → skip entirely.
 
@@ -342,7 +348,7 @@ def extract_rules_from_policy(
             normalised.append({
                 "rule_id":          rule_id,
                 "rule_reference":   str(rule.get("rule_reference") or "").strip(),
-                "category":         str(rule.get("category") or "general").strip().lower(),
+                "category":         _normalise_category(str(rule.get("category") or "general")),
                 "title":            str(rule.get("title") or "").strip(),
                 "description":      str(rule.get("description") or "").strip(),
                 "requirement_type": str(rule.get("requirement_type") or "mandatory").strip().lower(),
