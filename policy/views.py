@@ -76,9 +76,17 @@ def _extract_text(doc_bytes: bytes, type_hint: str, job_id) -> tuple[str, str, R
     Extract text from doc_bytes.
     Returns (full_text, file_type, None) on success, ("", "", error_response) on failure.
     """
-    file_type   = pdf_service.detect_file_type(type_hint, doc_bytes)
-    text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
-    full_text   = pdf_service.get_full_text(text_blocks)
+    try:
+        file_type   = pdf_service.detect_file_type(type_hint, doc_bytes)
+        text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
+        full_text   = pdf_service.get_full_text(text_blocks)
+    except Exception as e:
+        logger.error("Policy job %s: text extraction failed: %s", job_id, e, exc_info=True)
+        return "", "", Response(
+            {"status": "error", "job_id": str(job_id), "message": f"Could not extract text from document: {type(e).__name__}"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     logger.info("Policy job %s: extracted %d text blocks from %s", job_id, len(text_blocks), file_type)
 
     if not full_text.strip():
@@ -340,6 +348,15 @@ class PolicyAnalyzerView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
                 headers={"Retry-After": "60"},
             )
+        except Exception as e:
+            job.status = "failed"
+            job.error_message = f"AI analysis failed: {type(e).__name__}"
+            job.save(update_fields=["status", "error_message", "updated_at"])
+            logger.exception("Policy job %s: AI analysis failed", job.job_id)
+            return Response(
+                {"status": "error", "job_id": str(job.job_id), "message": "AI analysis failed. Please retry."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         logger.info(
             "Policy job %s: analysis complete — verdict=%s, score=%s",
@@ -348,15 +365,12 @@ class PolicyAnalyzerView(APIView):
             policy_analysis.get("compliance_score"),
         )
 
-        job.policy_result = policy_analysis
-        job.save(update_fields=["policy_result", "updated_at"])
-
         # ── Step 4: Generate reports ───────────────────────────────────────────
         response_data: dict = {
-            "status": "completed",
             "job_id": str(job.job_id),
         }
 
+        report_succeeded = False
         try:
             md_report = policy_report_service.generate_policy_report(
                 policy_analysis,
@@ -374,16 +388,19 @@ class PolicyAnalyzerView(APIView):
             )
             policy_analysis.update(summary_json)
             response_data["report_md_base64"] = base64.b64encode(md_report.encode()).decode()
-            response_data["policy_analysis"]  = policy_analysis
+            report_succeeded = True
             logger.info("Policy job %s: report generated", job.job_id)
         except Exception as e:
             logger.error("Policy job %s: report generation failed: %s", job.job_id, e)
-            response_data["report_error"]    = "Report could not be generated."
-            response_data["policy_analysis"] = policy_analysis
+            response_data["report_error"] = "Report could not be generated."
 
-        # ── Finalize ───────────────────────────────────────────────────────────
+        response_data["status"]          = "completed" if report_succeeded else "partial"
+        response_data["policy_analysis"] = policy_analysis
+
+        # ── Finalize — save policy_result after summary mutation ───────────────
         with transaction.atomic():
-            job.status = "completed"
-            job.save(update_fields=["status", "updated_at"])
+            job.status        = "completed"
+            job.policy_result = policy_analysis
+            job.save(update_fields=["status", "policy_result", "updated_at"])
 
         return Response(response_data, status=status.HTTP_200_OK)

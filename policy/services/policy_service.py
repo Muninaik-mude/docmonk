@@ -169,9 +169,11 @@ def analyze_document_against_policy(
     except json.JSONDecodeError:
         logger.exception("Failed to parse AI JSON response for policy analysis")
         return _policy_fallback_result("AI response could not be parsed")
-    except Exception as e:
+    except PolicyRateLimitError:
+        raise
+    except Exception:
         logger.exception("AI call failed for policy analysis")
-        return _policy_fallback_result(f"AI analysis failed: {type(e).__name__}")
+        raise
 
 
 # ── Rules-based document analysis ─────────────────────────────────────────────
@@ -356,9 +358,9 @@ def analyze_document_against_rules(
         return _policy_fallback_result("AI response could not be parsed")
     except PolicyRateLimitError:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("AI call failed for rules-based analysis")
-        return _policy_fallback_result(f"AI analysis failed: {type(e).__name__}")
+        raise
 
 
 def _policy_fallback_result(reason: str) -> dict:

@@ -181,6 +181,11 @@ POLICY_AI_API_KEY  = os.getenv('POLICY_AI_API_KEY',  '')
 POLICY_AI_MODEL    = os.getenv('POLICY_AI_MODEL',    'gpt-4o')
 POLICY_AI_BASE_URL = os.getenv('POLICY_AI_BASE_URL', 'https://api.openai.com/v1')
 
+if not DEBUG and not POLICY_AI_API_KEY:
+    raise ImproperlyConfigured(
+        "POLICY_AI_API_KEY must be set in production. Set the POLICY_AI_API_KEY environment variable."
+    )
+
 # Annotated PDFs output directory (fallback when R2 is not configured)
 ANNOTATED_PDF_DIR = Path(os.getenv('ANNOTATED_PDF_DIR', str(BASE_DIR / 'annotated_pdfs')))
 try:

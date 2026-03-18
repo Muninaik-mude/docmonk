@@ -77,6 +77,8 @@ def call_ai(
             max_tokens=max_tokens,
             seed=seed,
         )
+        if not resp.choices:
+            raise RuntimeError("Policy AI returned empty choices (content filter or provider error)")
         return (resp.choices[0].message.content or "").strip()
     except RateLimitError as exc:
         raise PolicyRateLimitError(f"Policy AI rate-limited: {exc}") from exc
