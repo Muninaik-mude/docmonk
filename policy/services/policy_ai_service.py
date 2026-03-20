@@ -90,14 +90,50 @@ def call_ai(
 
 # ── JSON repair ────────────────────────────────────────────────────────────────
 
+def _escape_control_chars_in_strings(text: str) -> str:
+    """Escape literal control characters that appear inside JSON string values."""
+    _CTRL = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if ch == "\\":
+                result.append(ch)
+                if i + 1 < len(text):
+                    result.append(text[i + 1])
+                    i += 2
+                    continue
+            elif ch == '"':
+                in_string = False
+                result.append(ch)
+            elif ord(ch) < 0x20:
+                result.append(_CTRL.get(ch, f"\\u{ord(ch):04x}"))
+            else:
+                result.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+        i += 1
+    return "".join(result)
+
+
 def safe_json_parse(text: str) -> dict:
     """
-    Parse *text* as JSON.  Attempts three increasingly aggressive repair
-    strategies before giving up, so truncated AI responses don't hard-fail.
+    Parse *text* as JSON.  Attempts increasingly aggressive repair
+    strategies before giving up, so truncated/dirty AI responses don't hard-fail.
     """
     # Strategy 1: direct parse (happy path)
     try:
         return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 1b: escape literal control characters inside string values
+    try:
+        return json.loads(_escape_control_chars_in_strings(text))
     except json.JSONDecodeError:
         pass
 
@@ -130,7 +166,7 @@ def safe_json_parse(text: str) -> dict:
         quote_count = 0
         i = 0
         while i < len(partial):
-            if partial[i] == "\\" :
+            if partial[i] == "\\":
                 i += 2
                 continue
             if partial[i] == '"':
@@ -140,10 +176,35 @@ def safe_json_parse(text: str) -> dict:
             partial += '"'  # close the dangling string
 
         partial = partial.rstrip(",")  # strip any trailing comma left after string close
-        open_braces   = partial.count("{") - partial.count("}")
-        open_brackets = partial.count("[") - partial.count("]")
-        partial += "]" * max(open_brackets, 0)
-        partial += "}" * max(open_braces, 0)
+
+        # Build a stack of unclosed openers by scanning the (now valid-string)
+        # partial JSON, so we can close them in correct reverse order.
+        stack: list[str] = []
+        in_str = False
+        j = 0
+        while j < len(partial):
+            ch = partial[j]
+            if in_str:
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch == "}" and stack and stack[-1] == "{":
+                    stack.pop()
+                elif ch == "]" and stack and stack[-1] == "[":
+                    stack.pop()
+            j += 1
+
+        # Close open structures in reverse order (innermost first)
+        for opener in reversed(stack):
+            partial += "}" if opener == "{" else "]"
+
         return json.loads(partial)
     except (json.JSONDecodeError, Exception):
         pass

@@ -29,14 +29,66 @@ _MAX_POLICY_CHARS = 80_000
 _EXTRACTION_SYSTEM_PROMPT = """\
 You are a precise compliance analyst. Your task is to extract every atomic, \
 checkable compliance rule from ANY policy document — loan policies, grant \
-programs, insurance underwriting guides, or any other regulatory document.
+programs, insurance underwriting guides, lender checklists, or any other \
+regulatory document.
 
 ════════════════════════════════════════════════════════
-MENTAL MODEL: HOW A COMPLIANCE ANALYST THINKS
+STEP 0 — CLASSIFY THE DOCUMENT FIRST (Do this before extracting anything)
 ════════════════════════════════════════════════════════
 
-Before reading a single word of the document, internalize these two questions.
-Apply them to EVERY sentence you encounter:
+Before applying any extraction logic, identify what TYPE of document you are reading.
+The type determines how you interpret every sentence.
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ TYPE A — BORROWER-DIRECT POLICY                                 │
+  │ The subject of rules is the BORROWER.                           │
+  │ Rules say what the borrower must do/provide/satisfy.            │
+  │ Example sentences:                                              │
+  │   "Borrower must submit audited financials"                     │
+  │   "Minimum credit score: 650"                                   │
+  │   "Property must be primary residence"                          │
+  │ → Apply Q1/Q2 mental model as-is (below)                       │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ TYPE B — LENDER/UNDERWRITER CHECKLIST or EVALUATION GUIDE       │
+  │ The surface subject is the LENDER or CDFI or PROGRAM.           │
+  │ Rules say what the LENDER must evaluate or verify.              │
+  │ But the REAL rule is: what the BORROWER must demonstrate.       │
+  │ Example sentences:                                              │
+  │   "Underwriting must address governance of the borrower"        │
+  │   "The Eligible CDFI must evaluate debt service coverage"       │
+  │   "Lender must verify that all licenses are in place"           │
+  │ → The borrower IS the subject — the lender text is the wrapper  │
+  │ → "Lender must evaluate X" = "Borrower must demonstrate X"      │
+  │ → Q2 does NOT apply — lender-action text IS the rule trigger    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ TYPE C — PROGRAM REQUIREMENTS (Mixed)                           │
+  │ Contains BOTH internal lender procedures AND borrower rules.    │
+  │ Example: grant program docs, bond program guides                │
+  │ → Apply Q1/Q2 sentence-by-sentence                             │
+  │ → Skip pure internal procedures                                 │
+  │ → Extract anything the borrower must satisfy                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  HOW TO CLASSIFY: Read the first 2 pages. Ask:
+  "Are most of the 'must' sentences about what the LENDER does,
+   or about what the BORROWER provides?"
+  If LENDER → Type B. If BORROWER → Type A. If both → Type C.
+
+  ⚠ CRITICAL FOR TYPE B DOCUMENTS:
+  "The Eligible CDFI must address X in underwriting" means:
+   → RULE: "The Secondary Borrower/applicant must demonstrate X"
+  Extract X as the rule. The lender wrapper is just the framing.
+  The compliance question is always: "Does the applicant satisfy X?"
+
+════════════════════════════════════════════════════════
+STEP 1 — MENTAL MODEL (Apply after classifying)
+════════════════════════════════════════════════════════
+
+For TYPE A and TYPE C documents:
 
   ┌─────────────────────────────────────────────────────┐
   │ Q1 — THE BORROWER TEST                              │
@@ -50,201 +102,205 @@ Apply them to EVERY sentence you encounter:
   │ Q2 — THE LENDER-ACTION TEST                         │
   │ "Is the subject of this sentence a staff role,      │
   │  committee, or the lender performing an internal    │
-  │  action?"                                           │
+  │  action with no borrower obligation behind it?"     │
   │  YES → skip it.   NO → continue to Q1.             │
   └─────────────────────────────────────────────────────┘
 
-These two questions replace all section-specific knowledge. \
-A FICO scoring table in Exhibit B passes Q1. \
-"Portfolio Manager updates the aging report" fails Q2. \
-"Borrower must submit annual tax returns" passes both. \
-Apply the same logic to mortgage policies, commercial lending, \
-insurance, grants — any document type.
+For TYPE B documents — replace Q1/Q2 with:
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Q3 — THE EVALUATION-WRAPPER TEST                    │
+  │ "Does this sentence describe something the lender   │
+  │  must EVALUATE, VERIFY, ADDRESS, or ASSESS          │
+  │  about the borrower?"                               │
+  │  YES → extract it as a BORROWER obligation.         │
+  │  NO (pure internal admin) → skip it.                │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Q4 — SCOPE SPECIFICITY TEST (Type B only)           │
+  │ "Does this sentence name a SPECIFIC thing to        │
+  │  evaluate (governance, DSCR, licenses, key          │
+  │  personnel) OR is it just restating the section     │
+  │  header in prose?"                                  │
+  │  SPECIFIC → extract it as its own atomic rule.      │
+  │  RESTATEMENT → skip (the bullet items below it      │
+  │                will be the actual rules).           │
+  └─────────────────────────────────────────────────────┘
+
+  TYPE B examples to make Q3/Q4 concrete:
+  ┌──────────────────────────────────────────────────────────┐
+  │ "Underwriting must address governance"                   │
+  │   Q3: YES — evaluating borrower's governance            │
+  │   Q4: SPECIFIC — extract as "Borrower must demonstrate  │
+  │        adequate governance structure"            ✓      │
+  │                                                          │
+  │ "Underwriting must address all required licenses"        │
+  │   Q3: YES   Q4: SPECIFIC — extract               ✓      │
+  │                                                          │
+  │ "The Eligible CDFI must maintain loan policies"          │
+  │   Q3: NO — this is about the LENDER's own policies,     │
+  │        not evaluating the borrower            SKIP ✗    │
+  │                                                          │
+  │ "The Eligible CDFI's underwriting criteria must address  │
+  │  the following:"                                         │
+  │   Q4: RESTATEMENT of section heading — the bullets      │
+  │        below contain the actual rules        SKIP ✗     │
+  └──────────────────────────────────────────────────────────┘
 
 ════════════════════════════════════════════════════════
-RULE 1 — WHAT TO EXTRACT (The Borrower Test)
+STEP 2 — SECTION TRAVERSAL (Never stop early)
 ════════════════════════════════════════════════════════
 
-Extract a sentence if and only if the borrower must satisfy, \
-prove, pay, provide, or agree to something.
+This is the most common failure mode — stopping after Part I.
 
-✓ EXTRACT — these all pass the borrower test:
+RULE: Every numbered section, lettered sub-section, and bullet item
+      in the document is a POTENTIAL RULE SOURCE.
+
+For documents with multiple asset classes / loan types / sections:
+  → Treat each section as a SEPARATE extraction pass
+  → Do NOT assume a section is "the same" as a previous one
+  → Even if §3 and §4 look similar, extract each independently
+  → Rules with the same content but different asset classes are
+     DIFFERENT rules (the asset class is part of rule identity)
+
+Traversal checklist — before you finish, verify you have read:
+  □ All top-level numbered sections (1, 2, 3…)
+  □ All sub-sections (A, B, C… or i, ii, iii…)
+  □ All bullet lists within each section
+  □ All sub-bullets (indented items under bullets)
+  □ All exhibits and appendices
+  □ All footnotes
+  □ Any tables
+
+If the document has N distinct asset classes / loan programs,
+your output should contain ROUGHLY N × (rules per class) rules.
+If your count is far below that, you stopped early.
+
+════════════════════════════════════════════════════════
+STEP 3 — WHAT TO EXTRACT
+════════════════════════════════════════════════════════
+
+✓ ALWAYS EXTRACT:
   • Eligibility conditions    → "Must be enrolled tribal member"
   • Financial thresholds      → "Minimum loan size $10,000"
   • Document requirements     → "Must submit a business plan"
   • Fee obligations           → "Borrower pays 1% closing fee"
   • Use-of-proceeds limits    → "Proceeds must fund primary residence only"
   • Scoring criteria          → "FICO 700+ earns 5 rating points"
-  • Consent requirements      → "Borrower must agree to annual credit checks"
-  • Portfolio quotas          → "70% of loans go to tribal members" \
-    (a non-tribal borrower may be denied — this IS borrower-checkable)
-  • Interest rate parameters  → "Margin between 0.5% and 3%" \
-    (determines what rate the borrower pays)
-  • Exhibit/appendix tables   → scoring tables, rating criteria, \
-    fee schedules in exhibits are borrower-facing — extract every row
+  • Consent / agreement reqs  → "Borrower must agree to annual credit checks"
+  • Interest rate parameters  → "Margin between 0.5% and 3%"
+  • Exhibit/appendix tables   → every scoring row, fee row, threshold row
+  • Evaluation criteria       → (Type B) anything lender is required to assess
+  • Compliance requirements   → licenses, certifications, standings
+  • Quantitative thresholds   → DSCR, LTV, DTI, ratios, percentages
+  • Specific named regulations → "Must comply with 42 C.F.R. 405.2401"
 
-✗ SKIP — these all fail the borrower test:
-  • "Loan Officer must review the application"
-  • "Board approves loans above $300,000"
-  • "Portfolio Manager updates the delinquency report"
-  • "Committee meets at least monthly"
-  • "Executive Director signs the commitment letter"
-  • "Staff shall maintain files in a fire-safe cabinet"
-
-════════════════════════════════════════════════════════
-RULE 2 — WHAT TO SKIP (The Lender-Action Test)
-════════════════════════════════════════════════════════
-
-Skip any sentence whose subject is:
-  • A staff role:   Loan Officer, Portfolio Manager, Executive Director,
-                    Finance Manager, Homebuyer Consultant, Loan Assistant
-  • A committee:    Loan Committee, Board of Directors, LC
-  • The lender:     "Loan Fund will...", "YCLF requires...", "CDC shall..."
-                    when describing internal lender procedures
-
-⚠ MIXED SECTIONS — some sections contain BOTH governance and borrower rules.
-  Apply the lender-action test sentence by sentence. Do not skip an entire
-  section just because it is titled "Loan Staff" or "Insider Loans."
-
-  Example — Section titled "Insider Loans":
-    SKIP: "Credit applications will be reviewed by the Loan Committee"
-    SKIP: "Board must vote within 3 business days"
-    EXTRACT: "Insider loans must be made on substantially the same terms \
-as those for any other customer" ← borrower-facing obligation
-    EXTRACT: "Loans to insiders must be supported by detailed current \
-financial statements" ← borrower must submit this
+✗ ALWAYS SKIP:
+  • Pure internal lender admin: "Loan Officer files the report"
+  • Committee-only actions with no borrower obligation: "Board meets monthly"
+  • Informational lists with no checkable condition:
+    "The following asset classes are eligible: 1. Charter schools 2. CRE…"
+    (These are context/scope, not checkable rules — extract the rules
+     WITHIN each asset class section instead)
 
 ════════════════════════════════════════════════════════
-RULE 3 — ATOMICITY (The "Can I Split This?" Test)
+STEP 4 — ATOMICITY
 ════════════════════════════════════════════════════════
 
 Keep splitting until a rule contains exactly ONE testable condition.
-Stop only when splitting would destroy meaning.
 
-THREE PATTERNS THAT ARE ALWAYS COMPOUND:
+Pattern A — OR-lists → each option = one rule [requirement_type: conditional]
+Pattern B — AND-lists → each condition = one rule [requirement_type: mandatory]
+Pattern C — Table rows → each row = one rule (product name is part of identity)
+Pattern D — Compound prose → split each restriction into its own rule
+Pattern E — Lettered/numbered lists → every item = one rule
 
-  Pattern A — OR-lists (acceptable alternatives)
-  Each option → one rule with requirement_type: "conditional"
-  ┌──────────────────────────────────────────────────────────┐
-  │ "Ownership must be (a) fee simple, (b) allotted land,   │
-  │  or (c) BIA-approved leasehold"                         │
-  │  → Rule 1: fee simple ownership accepted  [conditional] │
-  │  → Rule 2: allotted land accepted         [conditional] │
-  │  → Rule 3: BIA leasehold accepted         [conditional] │
-  └──────────────────────────────────────────────────────────┘
-
-  Pattern B — AND-lists (all must be true simultaneously)
-  Each condition → one rule with requirement_type: "mandatory"
   ┌──────────────────────────────────────────────────────────┐
   │ "Front-end ratio ≤ 33% and back-end ratio ≤ 45%"       │
   │  → Rule 1: front-end ratio ≤ 33%  [mandatory]          │
   │  → Rule 2: back-end ratio ≤ 45%   [mandatory]          │
   └──────────────────────────────────────────────────────────┘
 
-  Pattern C — Table rows (one row per product/tier)
-  Each row → one rule, even if values are identical across rows.
-  The PRODUCT NAME is part of the rule identity — never merge.
   ┌──────────────────────────────────────────────────────────┐
-  │ Table: Debt Ratios                                       │
-  │   Rehab Loan:        29/45                              │
-  │   Construction Loan: 29/45                              │
-  │   Land Loan:         29/45                              │
-  │  → Rule 1: Rehab front-end ≤ 29%        [mandatory]    │
-  │  → Rule 2: Rehab back-end ≤ 45%         [mandatory]    │
-  │  → Rule 3: Construction front-end ≤ 29% [mandatory]    │
-  │  → Rule 4: Construction back-end ≤ 45%  [mandatory]    │
-  │  → Rule 5: Land front-end ≤ 29%         [mandatory]    │
-  │  → Rule 6: Land back-end ≤ 45%          [mandatory]    │
-  └──────────────────────────────────────────────────────────┘
-
-  Pattern D — Compound prose cells
-  A single cell or sentence with multiple embedded restrictions
-  → split each restriction into its own rule
-  ┌──────────────────────────────────────────────────────────┐
-  │ "Construction costs for non-luxury improvements that    │
-  │  ensure habitability by a TERO-certified contractor"    │
-  │  → Rule 1: improvements must be non-luxury  [mandatory] │
-  │  → Rule 2: must ensure habitability         [mandatory] │
-  │  → Rule 3: TERO-certified contractor req'd  [mandatory] │
-  └──────────────────────────────────────────────────────────┘
-
-  Pattern E — Lettered/numbered lists
-  Every list item is a separate atomic rule, even with no own heading
-  and even if only one sentence long. Do NOT stop after item (a).
-  ┌──────────────────────────────────────────────────────────┐
-  │ "Target Market:                                         │
-  │  a) enrolled members                                    │
-  │  b) spouses of enrolled members                        │
-  │  c) non-members with pending enrollment                 │
-  │  d) permanent residents (minimum one year)"             │
-  │  → 4 separate eligibility rules, all conditional        │
+  │ Type B: "Underwriting must address governance,          │
+  │  key personnel, and financial performance"              │
+  │  → Rule 1: Borrower must demonstrate adequate governance│
+  │  → Rule 2: Key personnel qualifications must be shown   │
+  │  → Rule 3: Financial performance must be demonstrated   │
   └──────────────────────────────────────────────────────────┘
 
 ════════════════════════════════════════════════════════
-RULE 4 — WHERE TO LOOK (Full Document Scan)
+STEP 5 — DESCRIPTION REWRITING (Type B only)
 ════════════════════════════════════════════════════════
 
-Read the entire document from page 1 to the final line before \
-writing a single rule. Apply Q1 and Q2 to every sentence.
+For Type B documents, the source text says "lender must evaluate X"
+but the rule description must say "borrower must demonstrate X".
 
-High-value locations that models commonly miss:
-  • Opening "Purpose" / "Mission" paragraphs — often contain WHO qualifies
-  • Plain prose paragraphs — rules hide in sentences, not just tables
-  • Sections labelled "Ineligible" or "Prohibited" — each item is a rule
-  • Sections with mixed governance + borrower content (Insider Loans, etc.)
-  • Exhibits, appendices, scoring tables — contain the most precise rules
-  • Footnotes — often contain threshold exceptions or caps
+REWRITING RULES:
+  "Underwriting must address X"       → "The borrower must demonstrate X"
+  "The CDFI must evaluate X"          → "The borrower must provide evidence of X"
+  "Lender must verify that X"         → "X must be demonstrated by the borrower"
+  "Must assess the capacity to Y"     → "The borrower must demonstrate capacity to Y"
+  "Must review current licenses"      → "All required licenses must be current and on file"
 
-Examples of rules hiding in prose:
-  "Application fee $100, nonrefundable"        → borrower must pay $100
-  "Closing fee: 1% of loan amount"             → fee obligation
-  "Borrower responsible for third-party costs" → expense obligation
-  "Term: up to 30 years"                       → term limit
-  "Balloon payment at end of 5 years"          → repayment obligation
-  "Borrowers must agree to annual credit check"→ consent requirement
-  "Maximum five draws in 12-month period"      → draw limit
-  "FICO 700+ earns 5 points in loan rating"   → scoring threshold
+  BAD:  "Underwriting must address governance and key personnel"
+  GOOD: "The Secondary Borrower must demonstrate adequate governance structure
+         and qualified key personnel in underwriting submissions"
+
+  The source_excerpt stays VERBATIM from the document.
+  The description is the REWRITTEN borrower-obligation version.
 
 ════════════════════════════════════════════════════════
-RULE 5 — FORMATTING RULES
+STEP 6 — FORMATTING RULES
 ════════════════════════════════════════════════════════
 
-4.1 rule_reference: Copy the exact section heading as it appears.
+6.1 rule_reference: Copy the exact section heading as it appears.
     GOOD: "III.B — Eligibility Requirements — Collateral"
+    GOOD: "2. CDFI-TO-FINANCING ENTITY LENDING"
     BAD:  "Section 3, subsection B"
 
-4.2 source_excerpt: Verbatim from document. No paraphrasing ever.
+6.2 source_excerpt: Verbatim from document. No paraphrasing ever.
+    Include the null byte \\u0000 if present. Copy exactly.
 
-4.3 description: Focus only on the borrower's obligation.
-    Remove all staff role names and committee references.
-    BAD:  "The Loan Committee sets margin between 0.5% and 3%"
-    GOOD: "The borrower's interest rate margin will be between 0.5% and 3%"
+6.3 description: Borrower-obligation framing always.
+    Remove all lender role names. Rewrite if Type B (see Step 5).
 
-4.4 category: Use ONLY these values:
+6.4 category: Use ONLY these values:
     eligibility | financial | documentation | property | terms |
-    identity | employment | income | credit | insurance | proceeds
-    Do NOT invent new categories. Map "collateral" → financial,
-    "guarantee" → financial, "governance" → skip entirely.
+    identity | employment | income | credit | insurance | proceeds |
+    governance | compliance | underwriting | management | risk_management |
+    collateral | reporting | performance | pricing
+    Map consistently: "collateral" = collateral, "license check" = compliance,
+    "governance review" = governance, "financial statements" = financial.
 
-4.5 requirement_type:
-    "mandatory"    — borrower must always satisfy this
-    "conditional"  — one of several acceptable alternatives (OR-list item)
-    "informational"— describes a feature with no pass/fail threshold
+6.5 requirement_type:
+    "mandatory"     — always required
+    "conditional"   — one of several acceptable alternatives (OR-list)
+    "informational" — feature description with no pass/fail
 
-4.6 check_type:
-    presence | value_range | comparison | document_required |
-    boolean | pattern | descriptive
+6.6 check_type:
+    existence       — something must exist or be present
+    descriptive     — qualitative narrative/assessment required
+    quantitative    — numeric threshold or ratio
+    document_required — specific document must be submitted
+    boolean         — yes/no binary check
+    value_range     — must fall within a range
 
 ════════════════════════════════════════════════════════
-RULE 6 — SELF-CHECK (Run before writing each rule)
+STEP 7 — SELF-CHECK (Run before writing each rule)
 ════════════════════════════════════════════════════════
 
-  a) Does the borrower need to satisfy this?       (No  → skip)
-  b) Can it be verified from borrower documents?   (No  → skip)
-  c) Is the subject a staff role or lender action? (Yes → skip)
-  d) Can this rule be split further?               (Yes → split first)
-  e) Does description mention a staff role name?   (Yes → rewrite)
-  f) Is source_excerpt verbatim?                   (No  → fix)
+  a) Have I classified the document type?           (No  → do Step 0 first)
+  b) Am I in a section I have not yet processed?    (Yes → process it now)
+  c) Does the borrower need to satisfy this?        (No  → skip)
+  d) Is this pure internal admin with no borrower
+     obligation behind it?                          (Yes → skip)
+  e) Can this rule be split further?                (Yes → split first)
+  f) Does description mention a staff role name?    (Yes → rewrite)
+  g) Is source_excerpt verbatim?                    (No  → fix)
+  h) Is my total count consistent with the number
+     of sections × items per section?               (No  → check for early stop)
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -259,17 +315,21 @@ You must respond ONLY with valid JSON. No markdown, no extra text.
       "rule_reference": "Exact section heading from document",
       "category": "one of the allowed categories above",
       "title": "Short human-readable title, max 8 words",
-      "description": "Complete self-contained borrower-focused statement. \
-Include all thresholds, conditions, and values. No staff role names.",
+      "description": "Complete self-contained borrower-obligation statement. \
+Include all thresholds, conditions, and values. No staff role names. \
+Rewritten from lender-evaluation framing if Type B document.",
       "requirement_type": "mandatory | conditional | informational",
-      "check_type": "presence | value_range | comparison | \
-document_required | boolean | pattern | descriptive",
+      "check_type": "existence | descriptive | quantitative | \
+document_required | boolean | value_range",
       "source_document": "{document_filename}",
       "source_excerpt": "Verbatim text copied exactly from the source document."
     }}
   ],
   "extraction_summary": {{
+    "document_type": "A | B | C",
+    "document_type_reasoning": "One sentence explaining why this classification",
     "total_rules": <integer matching rules array length>,
+    "sections_processed": ["list", "of", "all", "sections", "read"],
     "categories": ["list", "of", "unique", "category", "values", "used"]
   }}
 }}"""
@@ -281,16 +341,28 @@ POLICY TYPE: {policy_type}
 POLICY DOCUMENT:
 {policy_text}
 
-Apply the two mental model questions to every sentence in the document above:
-  Q1 — Borrower test: "Can this be checked against something the borrower submitted?"
-  Q2 — Lender-action test: "Is the subject a staff role or internal lender action?"
+─── EXTRACTION INSTRUCTIONS ───────────────────────────────────────────────────
 
-Read the entire document before writing any rules.
-Extract every atomic borrower-facing rule. Do not stop until the final line.
+STEP 0 FIRST: Classify this document as Type A, B, or C (see system prompt).
+Write your classification in extraction_summary.document_type before any rules.
+
+Then apply the appropriate mental model:
+  Type A/C → Q1 (borrower test) + Q2 (lender-action test)
+  Type B   → Q3 (evaluation-wrapper test) + Q4 (scope specificity test)
+
+SECTION TRAVERSAL:
+  Read the ENTIRE document — every section, every bullet, every sub-bullet.
+  Do NOT stop after the first section or first part.
+  If the document has multiple asset classes or loan programs,
+  extract rules from EACH of them separately.
+  Count your sections processed and report in extraction_summary.
+
+QUALITY BAR:
+  For a document with 10+ sections each containing 10+ bullet items,
+  expect 80–150+ rules. If your count is below 30, you have stopped early.
 
 Respond in the JSON format specified in the system prompt.
 Source document filename: {document_filename}"""
-
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 

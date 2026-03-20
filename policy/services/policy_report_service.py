@@ -1093,7 +1093,7 @@ def _pdf_to_html(doc_bytes: bytes, highlight_map: list) -> str:
 
             for candidate in candidates:
                 try:
-                    rects = page.search_for(candidate)
+                    rects = page.search_for(candidate) or []
                 except Exception:
                     rects = []
                 for r in rects:
