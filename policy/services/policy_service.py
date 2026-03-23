@@ -63,7 +63,7 @@ Respond in this EXACT JSON format:
 {{
     "overall_verdict": "COMPLIANT" or "NON_COMPLIANT" or "PARTIALLY_COMPLIANT",
     "compliance_score": <integer 0-100 reflecting percentage of requirements satisfied>,
-    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~Requires Review}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare. CRITICAL LANGUAGE RULE: NEVER write 'non-compliant', 'Non-Compliant', or 'NON_COMPLIANT' anywhere in the summary text. Instead, always wrap the verdict phrase in double curly braces: write '{{{{~requires review}}}}' (e.g. 'The application {{{{~requires review}}}} due to...'). The phrase 'requires review' must ALWAYS appear inside {{{{~...}}}} — never bare.",
+    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~Requires Review}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare. CRITICAL LANGUAGE RULE: NEVER write 'non-compliant', 'Non-Compliant', or 'NON_COMPLIANT' anywhere in the summary text. Instead of 'The application is non-compliant', write 'The application requires review'. Use 'Requires Review' as a noun label wrapped in {{{{~Requires Review}}}}, or 'requires review' as a verb phrase — never as a predicate adjective after 'is'.",
     "policy_requirements": [
         {{
             "requirement": "The specific policy requirement being checked",
@@ -178,21 +178,18 @@ def analyze_document_against_policy(
                     if r.get("status") == "VIOLATES" and r.get("recommendation")
                 ]
 
-        # Safety-net: executive summary must never say "Non-Compliant" — use "{{~Requires Review}}"
+        # Safety-net: executive summary must never say "Non-Compliant" — use "Requires Review"
         if isinstance(result.get("summary"), str):
             result["summary"] = (
                 result["summary"]
-                # Fix grammatical form: "is non-compliant" → "{{~requires review}}"
-                .replace("is NON_COMPLIANT", "{{~requires review}}")
-                .replace("is Non-Compliant", "{{~requires review}}")
-                .replace("is non-compliant", "{{~requires review}}")
-                # Fix bare verb phrase without "is": "requires review" → "{{~requires review}}"
-                .replace("requires review", "{{~requires review}}")
-                .replace("Requires review", "{{~requires review}}")
-                # Replace any remaining standalone label occurrences
-                .replace("NON_COMPLIANT", "{{~Requires Review}}")
-                .replace("Non-Compliant", "{{~Requires Review}}")
-                .replace("non-compliant", "{{~Requires Review}}")
+                # Fix grammatical form first: "is non-compliant" → "requires review"
+                .replace("is NON_COMPLIANT", "requires review")
+                .replace("is Non-Compliant", "requires review")
+                .replace("is non-compliant", "requires review")
+                # Then replace any remaining standalone occurrences
+                .replace("NON_COMPLIANT", "Requires Review")
+                .replace("Non-Compliant", "Requires Review")
+                .replace("non-compliant", "Requires Review")
             )
 
         return result
@@ -235,7 +232,7 @@ Respond in this EXACT JSON format:
 {{
     "overall_verdict": "COMPLIANT" or "NON_COMPLIANT" or "PARTIALLY_COMPLIANT",
     "compliance_score": <integer 0-100 reflecting percentage of CHECKABLE requirements satisfied>,
-    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~Requires Review}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare. CRITICAL LANGUAGE RULE: NEVER write 'non-compliant', 'Non-Compliant', or 'NON_COMPLIANT' anywhere in the summary text. Instead, always wrap the verdict phrase in double curly braces: write '{{{{~requires review}}}}' (e.g. 'The application {{{{~requires review}}}} due to...'). The phrase 'requires review' must ALWAYS appear inside {{{{~...}}}} — never bare.",
+    "summary": "2-3 sentence executive summary of the analysis outcome. Wrap BOTH key terms AND their actual values together in {{{{double curly braces}}}} with a sentiment prefix so the UI can color-code them. Prefix rules: use {{{{-term}}}} for negatives (violations, breaches, exceedances, failures, risks), use {{{{+term}}}} for positives (satisfied requirements, compliant values, approvals), use {{{{~term}}}} for neutral labels (verdict labels, policy names, document types). Examples: {{{{-loan amount of $162,000 exceeds cap}}}}, {{{{-LTV ratio of 102.5%}}}}, {{{{+down payment of 20% meets requirement}}}}, {{{{~Requires Review}}}}, {{{{~Housing Lending Policy}}}}. Rule: every dollar amount, percentage, date, and numeric threshold relevant to compliance MUST be wrapped — never leave a number or percentage bare. CRITICAL LANGUAGE RULE: NEVER write 'non-compliant', 'Non-Compliant', or 'NON_COMPLIANT' anywhere in the summary text. Instead of 'The application is non-compliant', write 'The application requires review'. Use 'Requires Review' as a noun label wrapped in {{{{~Requires Review}}}}, or 'requires review' as a verb phrase — never as a predicate adjective after 'is'.",
     "policy_requirements": [
         {{
             "rule_id": "same rule_id from the input rule",
@@ -382,21 +379,18 @@ def analyze_document_against_rules(
                     if r.get("status") == "VIOLATES" and r.get("recommendation")
                 ]
 
-        # Safety-net: executive summary must never say "Non-Compliant" — use "{{~Requires Review}}"
+        # Safety-net: executive summary must never say "Non-Compliant" — use "Requires Review"
         if isinstance(result.get("summary"), str):
             result["summary"] = (
                 result["summary"]
-                # Fix grammatical form: "is non-compliant" → "{{~requires review}}"
-                .replace("is NON_COMPLIANT", "{{~requires review}}")
-                .replace("is Non-Compliant", "{{~requires review}}")
-                .replace("is non-compliant", "{{~requires review}}")
-                # Fix bare verb phrase without "is": "requires review" → "{{~requires review}}"
-                .replace("requires review", "{{~requires review}}")
-                .replace("Requires review", "{{~requires review}}")
-                # Replace any remaining standalone label occurrences
-                .replace("NON_COMPLIANT", "{{~Requires Review}}")
-                .replace("Non-Compliant", "{{~Requires Review}}")
-                .replace("non-compliant", "{{~Requires Review}}")
+                # Fix grammatical form first: "is non-compliant" → "requires review"
+                .replace("is NON_COMPLIANT", "requires review")
+                .replace("is Non-Compliant", "requires review")
+                .replace("is non-compliant", "requires review")
+                # Then replace any remaining standalone occurrences
+                .replace("NON_COMPLIANT", "Requires Review")
+                .replace("Non-Compliant", "Requires Review")
+                .replace("non-compliant", "Requires Review")
             )
 
         return result
