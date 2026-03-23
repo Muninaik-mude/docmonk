@@ -407,7 +407,7 @@ def extract_rules_from_policy(
     ]
 
     try:
-        response_text = _call_ai(messages, max_tokens=16000, temperature=0, seed=42)
+        response_text = _call_ai(messages, temperature=0, seed=42)
         result = _safe_json_parse(response_text)
 
         rules = result.get("rules", [])
