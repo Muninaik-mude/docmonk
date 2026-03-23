@@ -133,7 +133,7 @@ def analyze_document_against_policy(
     ]
 
     try:
-        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
+        response_text = _call_ai(messages, temperature=0, seed=42)
         result = _sanitize(_safe_json_parse(response_text))
 
         # Normalize / validate fields
@@ -314,7 +314,7 @@ def analyze_document_against_rules(
     ]
 
     try:
-        response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
+        response_text = _call_ai(messages, temperature=0, seed=42)
         result = _sanitize(_safe_json_parse(response_text))
 
         # Normalise fields

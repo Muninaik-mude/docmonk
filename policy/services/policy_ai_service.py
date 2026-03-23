@@ -56,7 +56,6 @@ def _get_model() -> str:
 def call_ai(
     messages: list,
     *,
-    max_tokens: int = 8000,
     temperature: float = 0.1,
     seed: int | None = 42,
 ) -> str:
@@ -74,7 +73,6 @@ def call_ai(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
             seed=seed,
         )
         if not resp.choices:
