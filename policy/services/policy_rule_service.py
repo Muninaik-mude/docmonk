@@ -420,6 +420,13 @@ def extract_rules_from_policy(
         for idx, rule in enumerate(rules):
             if not isinstance(rule, dict):
                 continue
+            # Drop any rule missing required fields — no half-populated rules in output
+            if not all([
+                _clean(rule.get("description")),
+                _clean(rule.get("rule_reference")),
+                _clean(rule.get("source_excerpt")),
+            ]):
+                continue
             rule_id = _clean(rule.get("rule_id") or f"rule_{idx}")
             # Deduplicate IDs by appending a counter suffix
             if rule_id in seen_ids:

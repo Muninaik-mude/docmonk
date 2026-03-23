@@ -51,6 +51,21 @@ def _get_model() -> str:
     return getattr(settings, "POLICY_AI_MODEL", "gpt-4o")
 
 
+def _get_max_tokens() -> int:
+    """
+    Provider-level output token cap for rule extraction.
+    Override via POLICY_AI_MAX_TOKENS env var.
+
+    Provider limits (max_completion_tokens):
+      openai/gpt-oss-120b (Groq) — 65,536   ← current default target
+      llama-3.3-70b-versatile (Groq) — 32,768
+      llama-3.1-8b-instant (Groq)   — 131,072
+      gpt-4o (OpenAI)               — 16,384
+      Cerebras                      — 8,192
+    """
+    return int(getattr(settings, "POLICY_AI_MAX_TOKENS", 64000))
+
+
 # ── AI call ────────────────────────────────────────────────────────────────────
 
 def call_ai(
@@ -58,7 +73,10 @@ def call_ai(
     *,
     temperature: float = 0.1,
     seed: int | None = 42,
+    max_tokens: int | None = None,
 ) -> str:
+    if max_tokens is None:
+        max_tokens = _get_max_tokens()
     """
     Send *messages* to the configured provider and return the response text.
 
@@ -74,6 +92,7 @@ def call_ai(
             messages=messages,
             temperature=temperature,
             seed=seed,
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         )
         if not resp.choices:
             raise RuntimeError("Policy AI returned empty choices (content filter or provider error)")
