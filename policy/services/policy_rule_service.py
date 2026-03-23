@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 
 _CATEGORY_ALIASES = {"use_of_proceeds": "proceeds"}
 
+
+def _clean(value) -> str:
+    """Strip NUL bytes and Unicode surrogates that PostgreSQL rejects."""
+    s = str(value or "")
+    s = s.replace("\x00", "")
+    # Remove lone Unicode surrogates (U+D800–U+DFFF) which are invalid in UTF-8
+    s = s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    return s.strip()
+
 def _normalise_category(value: str) -> str:
     v = value.strip().lower()
     return _CATEGORY_ALIASES.get(v, v)
@@ -411,7 +420,7 @@ def extract_rules_from_policy(
         for idx, rule in enumerate(rules):
             if not isinstance(rule, dict):
                 continue
-            rule_id = str(rule.get("rule_id") or f"rule_{idx}").strip()
+            rule_id = _clean(rule.get("rule_id") or f"rule_{idx}")
             # Deduplicate IDs by appending a counter suffix
             if rule_id in seen_ids:
                 rule_id = f"{rule_id}_{idx}"
@@ -419,14 +428,14 @@ def extract_rules_from_policy(
 
             normalised.append({
                 "rule_id":          rule_id,
-                "rule_reference":   str(rule.get("rule_reference") or "").strip(),
-                "category":         _normalise_category(str(rule.get("category") or "general")),
-                "title":            str(rule.get("title") or "").strip(),
-                "description":      str(rule.get("description") or "").strip(),
-                "requirement_type": str(rule.get("requirement_type") or "mandatory").strip().lower(),
-                "check_type":       str(rule.get("check_type") or "descriptive").strip().lower(),
-                "source_document":  str(rule.get("source_document") or document_filename).strip(),
-                "source_excerpt":   str(rule.get("source_excerpt") or "").strip(),
+                "rule_reference":   _clean(rule.get("rule_reference")),
+                "category":         _normalise_category(_clean(rule.get("category")) or "general"),
+                "title":            _clean(rule.get("title")),
+                "description":      _clean(rule.get("description")),
+                "requirement_type": _clean(rule.get("requirement_type") or "mandatory").lower(),
+                "check_type":       _clean(rule.get("check_type") or "descriptive").lower(),
+                "source_document":  _clean(rule.get("source_document") or document_filename),
+                "source_excerpt":   _clean(rule.get("source_excerpt")),
             })
 
         # Recompute extraction_summary from actual normalised output

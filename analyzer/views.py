@@ -282,7 +282,7 @@ class ClauseAnalyzerView(APIView):
         type_hint   = doc_url or doc_filename
         file_type   = pdf_service.detect_file_type(type_hint, doc_bytes)
         text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
-        full_text   = pdf_service.get_full_text(text_blocks)
+        full_text   = pdf_service.get_full_text(text_blocks).replace("\x00", "")
         logger.info("Extracted %d text blocks from %s", len(text_blocks), file_type)
 
         if not full_text.strip():

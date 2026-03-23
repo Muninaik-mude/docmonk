@@ -12,6 +12,20 @@ from policy.services.policy_ai_service import call_ai as _call_ai, safe_json_par
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize(obj):
+    """Recursively strip NUL bytes and lone Unicode surrogates from all strings.
+    PostgreSQL rejects both in text and jsonb columns."""
+    if isinstance(obj, str):
+        s = obj.replace("\x00", "")
+        return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(item) for item in obj]
+    return obj
+
+
 # Hard cap to avoid overflowing the model's context window.
 # 80,000 chars ≈ 20,000 tokens at ~4 chars/token.
 _MAX_DOC_CHARS    = 80_000
@@ -120,7 +134,7 @@ def analyze_document_against_policy(
 
     try:
         response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
-        result = _safe_json_parse(response_text)
+        result = _sanitize(_safe_json_parse(response_text))
 
         # Normalize / validate fields
         if not isinstance(result.get("policy_requirements"), list):
@@ -292,7 +306,7 @@ def analyze_document_against_rules(
 
     try:
         response_text = _call_ai(messages, max_tokens=8000, temperature=0, seed=42)
-        result = _safe_json_parse(response_text)
+        result = _sanitize(_safe_json_parse(response_text))
 
         # Normalise fields
         if not isinstance(result.get("policy_requirements"), list):

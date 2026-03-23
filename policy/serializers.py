@@ -37,6 +37,9 @@ class PolicyAnalyzerSerializer(serializers.Serializer):
     )
     policy_text = serializers.CharField(required=False, allow_blank=True, default="")
 
+    def validate_policy_text(self, value):
+        return (value or "").replace("\x00", "")
+
     # Optional metadata
     agreement_type    = serializers.CharField(required=False, allow_blank=True, default="")
     agreement_details = serializers.DictField(required=False, allow_null=True, default=None)

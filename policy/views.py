@@ -79,7 +79,7 @@ def _extract_text(doc_bytes: bytes, type_hint: str, job_id) -> tuple[str, str, R
     try:
         file_type   = pdf_service.detect_file_type(type_hint, doc_bytes)
         text_blocks = pdf_service.extract_text_blocks(type_hint, doc_bytes)
-        full_text   = pdf_service.get_full_text(text_blocks)
+        full_text   = pdf_service.get_full_text(text_blocks).replace("\x00", "")
     except Exception as e:
         logger.error("Policy job %s: text extraction failed: %s", job_id, e, exc_info=True)
         return "", "", Response(
