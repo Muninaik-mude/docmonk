@@ -1,6 +1,6 @@
 # DocMonk — Product & API Specification
 
-> Last updated: 2026-03-06
+> Last updated: 2026-03-30
 
 ---
 
@@ -12,7 +12,9 @@ DocMonk is an AI-powered legal document backend. It provides three core services
 |---|---|---|
 | 1 | **Clause Analysis** — check contract clauses for compliance against an uploaded document | ✅ Live |
 | 2 | **Document Q&A** — ask freeform questions on an uploaded document | ✅ Live |
-| 3 | **Contract Generation** — generate a full contract document from structured input | 🔜 Planned |
+| 3 | **Policy Rule Extraction** — extract atomic policy rules from unstructured policy documents, return interactive HTML preview | ✅ Live |
+| 4 | **Policy Document Analysis** — analyze a subject document against extracted policy rules or raw policy text, return compliance report + score | ✅ Live |
+| 5 | **Contract Generation** — generate a full contract document from structured input | 🔜 Planned |
 
 ---
 
@@ -56,7 +58,7 @@ Accepts a base64-encoded document and a list of clauses. Runs full AI analysis p
 
 **Notes:**
 - `document_base64` preferred. `document_presigned_url` / `pdf_presigned_url` also accepted.
-- Report format is always **Markdown**. No PDF or DOCX generation.
+- `report_format` accepts `"markdown"` (default), `"pdf"`, `"docx"`, or `"both"`. The POST response always includes `report_md_base64` / `summary_md_base64`. PDF/DOCX files are uploaded to R2 and their presigned URLs are available via `GET /v1/jobs/{job_id}`.
 - Max 100 clauses per request. Max document size 100 MB.
 
 #### Response (slim — optimized for speed)
@@ -467,7 +469,225 @@ Streams the improved answer. Same SSE format as `/ask`.
 
 ---
 
-## 4. Planned API — Contract Generation
+## 4. Policy API
+
+**Status: ✅ Live**
+
+Two endpoints for policy-based document compliance. The recommended workflow is:
+1. Call `/extract-rules` on your policy document to get structured atomic rules.
+2. Call `/analyze` on the subject document, passing the extracted `rules` array.
+
+The legacy path allows passing `policy_text` (raw text) directly to `/analyze` without a prior rule extraction step.
+
+---
+
+### POST `/v1/policy/extract-rules`
+
+Accepts a policy document and extracts atomic, testable rules from it. Also generates an interactive HTML document with rules highlighted inline.
+
+#### Request Body
+
+```json
+{
+  "document_base64": "<base64-encoded PDF/DOCX/MD/TXT>",
+  "document_filename": "personal_loan_policy.pdf",
+  "policy_type": "Personal Loan"
+}
+```
+
+- `document_presigned_url` accepted as alternative to `document_base64`.
+- `policy_type` is optional — helps the AI classify and label rules accurately.
+- Max document size: 100 MB.
+
+#### Response `200 OK`
+
+```json
+{
+  "job_id": "uuid",
+  "status": "completed",
+  "policy_type": "Personal Loan",
+  "document_filename": "personal_loan_policy.pdf",
+  "extraction_summary": {
+    "total_rules": 12,
+    "categories": ["Eligibility", "Documentation", "Income Criteria"]
+  },
+  "rules": [
+    {
+      "rule_id": "rule_001",
+      "category": "Eligibility",
+      "title": "Minimum Age Requirement",
+      "description": "Borrower must be at least 21 years of age at the time of application."
+    }
+  ],
+  "rule_document_html_base64": "<base64-encoded interactive HTML>"
+}
+```
+
+**Error responses:**
+
+| Code | Reason |
+|---|---|
+| 400 | Missing document, invalid base64, unsupported file type, no extractable text |
+| 413 | File exceeds 100 MB |
+| 429 | AI rate limit exceeded — includes `Retry-After` header |
+| 500 | AI analysis failure |
+
+---
+
+### POST `/v1/policy/analyze`
+
+Analyzes a subject document (e.g., loan application, agreement) against policy rules. Returns a Markdown compliance report and a structured analysis JSON with per-rule verdicts and an overall compliance score.
+
+#### Request Body (preferred — rules-based)
+
+```json
+{
+  "document_base64": "<base64-encoded PDF/DOCX/MD/TXT>",
+  "document_filename": "loan_application.pdf",
+  "policy_type": "Personal Loan",
+  "rules": [
+    {
+      "rule_id": "rule_001",
+      "category": "Eligibility",
+      "title": "Minimum Age Requirement",
+      "description": "Borrower must be at least 21 years of age at the time of application."
+    }
+  ],
+  "agreement_type": "Personal Loan Agreement",
+  "agreement_details": { "agreement_date": "2026-01-15", "city": "Mumbai" },
+  "parties": { "borrower": { "name": "Rahul Sharma" } }
+}
+```
+
+#### Request Body (legacy — raw policy text)
+
+```json
+{
+  "document_base64": "<base64>",
+  "document_filename": "loan_application.pdf",
+  "policy_type": "Personal Loan",
+  "policy_text": "Borrower must be at least 21 years old. Monthly income must exceed INR 25,000..."
+}
+```
+
+Either `rules` (structured, preferred) **or** `policy_text` (raw string, legacy) is required.
+
+#### Response `200 OK`
+
+```json
+{
+  "job_id": "uuid",
+  "status": "completed",
+  "report_md_base64": "<base64-encoded Markdown report>",
+  "policy_analysis": {
+    "compliance_verdict": "Partially Compliant",
+    "compliance_score": 75,
+    "per_rule_analysis": [
+      {
+        "rule_id": "rule_001",
+        "rule_title": "Minimum Age Requirement",
+        "verdict": "PASS",
+        "reason": "Borrower's date of birth confirms age of 28.",
+        "relevant_text": "Date of Birth: 15 March 1997"
+      },
+      {
+        "rule_id": "rule_002",
+        "rule_title": "Minimum Monthly Income",
+        "verdict": "FAIL",
+        "reason": "Declared income of INR 18,000 is below the required INR 25,000.",
+        "relevant_text": "Monthly Income: INR 18,000"
+      }
+    ],
+    "total_rules": 12,
+    "passed_rules": 9,
+    "failed_rules": 3
+  }
+}
+```
+
+**Partial status:** If report generation fails, `status` is `"partial"`, `report_md_base64` is absent, and `report_error: "Report could not be generated."` is added. The `policy_analysis` JSON is still fully returned.
+
+**Error responses:**
+
+| Code | Reason |
+|---|---|
+| 400 | Missing document, missing rules/policy_text, invalid base64, unsupported file type, no extractable text |
+| 413 | File exceeds 100 MB |
+| 429 | AI rate limit exceeded — includes `Retry-After` header |
+| 500 | AI analysis failure |
+
+---
+
+### DB Models
+
+#### `PolicyRuleExtractionJob`
+
+| Field | Type | Notes |
+|---|---|---|
+| `job_id` | UUID PK | |
+| `status` | CharField | `pending` → `in_progress` → `completed` / `failed` |
+| `document_filename` | CharField | Original uploaded filename |
+| `full_text` | TextField | Extracted document text (cached) |
+| `policy_type` | CharField | Optional classification |
+| `extracted_rules` | JSONField | List of atomic rule objects from AI |
+| `error_message` | TextField | Populated if status = `failed` |
+| `created_at` / `updated_at` | DateTimeField | Auto |
+
+#### `PolicyAnalysisJob`
+
+| Field | Type | Notes |
+|---|---|---|
+| `job_id` | UUID PK | |
+| `status` | CharField | `pending` → `in_progress` → `completed` / `failed` |
+| `document_filename` | CharField | Analyzed document filename |
+| `full_text` | TextField | Extracted document text (cached) |
+| `policy_type` | CharField | Policy classification |
+| `policy_text` | TextField | Raw policy text — only populated in legacy (non-rules) path |
+| `agreement_type` | CharField | Optional |
+| `agreement_details` | JSONField | Optional metadata |
+| `parties` | JSONField | Optional party information |
+| `policy_result` | JSONField | Full AI analysis output (compliance verdict, score, per-rule analysis) |
+| `error_message` | TextField | Populated if status = `failed` |
+| `created_at` / `updated_at` | DateTimeField | Auto |
+
+---
+
+### Pipeline
+
+#### Rule Extraction
+1. Create `PolicyRuleExtractionJob` (status: `in_progress`)
+2. Decode base64 or download from presigned URL
+3. Validate file size (max 100 MB)
+4. Extract text via `pdf_service`
+5. `policy_rule_service.extract_rules_from_policy(full_text, policy_type, filename)` → atomic rules list + extraction_summary
+6. `policy_report_service.generate_rule_extraction_report(rules, ...)` → interactive HTML
+7. Save `extracted_rules`, update status → `completed`
+8. Return rules + HTML preview
+
+#### Policy Analysis
+1. Create `PolicyAnalysisJob` (status: `in_progress`)
+2. Decode base64 or download from presigned URL
+3. Validate file size
+4. Extract text via `pdf_service`
+5. AI analysis:
+   - Rules path: `policy_service.analyze_document_against_rules(full_text, policy_type, rules)`
+   - Legacy path: `policy_service.analyze_document_against_policy(full_text, policy_type, policy_text)`
+6. `policy_report_service.generate_policy_report(policy_analysis, ...)` → Markdown report
+7. `policy_report_service.build_policy_summary_json(policy_analysis, ...)` → summary merged into analysis
+8. Save `policy_result`, update status → `completed`
+9. Return `report_md_base64` + `policy_analysis`
+
+---
+
+### Service & URL Location
+
+- Services: `policy/services/` — `policy_service.py`, `policy_rule_service.py`, `policy_report_service.py`, `policy_ai_service.py`
+- Views: `policy/views.py`
+- URLs registered under `/v1/policy/` in `policy/urls.py`, included in `config/urls.py`
+
+---
+
+## 6. Planned API — Contract Generation
 
 ### POST `/v1/contracts/generate`
 
@@ -557,29 +777,32 @@ Generate a complete, legally-structured contract document from structured input.
 
 ---
 
-## 5. Response Time Optimization Strategies
+## 7. Response Time Optimization Strategies
 
-### Current bottlenecks (POST /v1/analyze)
-1. Sequential jurisdiction detection before parallel clause analysis
-2. Report generation (PDF especially) after AI analysis
-3. File upload to R2 after report generation
-4. Large response payload (analysis_summary) serialization
+### Applied strategies (POST /v1/analyze)
 
-### Applied strategies
-| Strategy | Status | Impact |
-|---|---|---|
-| Parallel clause analysis (ThreadPoolExecutor, 3 workers) | ✅ Done | High |
-| Multi-provider AI pool (4 clients, round-robin) | ✅ Done | Medium |
-| Slim POST response (no analysis_summary, no URLs) | ✅ Done | Medium |
-| 5,000-char context window per clause (not full doc) | ✅ Done | High |
-| Merged jurisdiction + clause AI calls | ✅ Done | Medium |
-| Store full_text in DB (resume without re-download) | ✅ Done | Medium |
+All major bottlenecks from the original design have been resolved:
+
+| Strategy | Status | Impact | What it solved |
+|---|---|---|---|
+| Parallel clause analysis (ThreadPoolExecutor, 3 workers) | ✅ Done | High | Clauses analyzed concurrently instead of one by one |
+| Merged jurisdiction + clause AI calls | ✅ Done | Medium | Jurisdiction detection no longer blocks clause analysis start |
+| Multi-provider AI pool (4 clients: 2× Groq + 2× Cerebras, round-robin) | ✅ Done | Medium | Distributes load, reduces per-key rate limit pressure |
+| Slim POST response (no analysis_summary, no report URLs) | ✅ Done | Medium | Eliminates serialization cost from hot path; full results via GET |
+| 5,000-char context window per clause (not full doc) | ✅ Done | High | Reduces AI token cost and latency per clause |
+| Store full_text in DB (resume without re-download) | ✅ Done | Medium | Partial failure recovery without re-fetching document |
+
+### Remaining bottlenecks
+| Bottleneck | Notes |
+|---|---|
+| Report generation (PDF/DOCX) after AI analysis | PDF rendering via ReportLab is slow; DOCX via python-docx is faster. Currently synchronous — runs before response is returned. |
+| File upload to R2 after report generation | R2 upload adds latency for PDF/DOCX formats; Markdown is returned inline so no upload needed. |
 
 ### Future strategies to consider
 | Strategy | Complexity | Impact |
 |---|---|---|
 | Increase parallel workers to 5–8 (monitor rate limits) | Low | Medium |
-| Skip PDF annotation on first call, generate lazily via GET | Low | Medium |
+| Move PDF/DOCX report generation + R2 upload to background task (return `job_id`, client polls GET) | Medium | High |
 | Async job processing (Celery/RQ) — POST returns `job_id` immediately, client polls | High | Very High |
 | Jurisdiction cache by document hash (same doc → skip detection) | Medium | Low |
 | Stream AI responses and process chunks | High | Medium |
@@ -587,8 +810,9 @@ Generate a complete, legally-structured contract document from structured input.
 
 ---
 
-## 6. Data Models Summary
+## 8. Data Models Summary
 
+**Clause Analyzer:**
 ```
 AnalysisJob          — top-level job (status, full_text, counters)
   └── JobClause[]    — one per clause (state machine)
@@ -598,9 +822,23 @@ AnalysisJob          — top-level job (status, full_text, counters)
   └── JobReport[]          — stored report files
 ```
 
+**Q&A:**
+```
+QADocument            — extracted text cache (keyed by document_id / S3 key)
+QASession             — one chat session per user
+  └── QASessionDocument — links session to 1 document (MAX_DOCS_PER_SESSION = 1)
+  └── QAMessage[]       — one row per Q&A exchange
+```
+
+**Policy:**
+```
+PolicyRuleExtractionJob  — rule extraction job (status, extracted_rules, full_text)
+PolicyAnalysisJob        — analysis job (status, policy_result, full_text, policy_text)
+```
+
 ---
 
-## 7. Compliance Status Reference
+## 9. Compliance Status Reference
 
 | Status | Color | Meaning |
 |---|---|---|
@@ -611,7 +849,7 @@ AnalysisJob          — top-level job (status, full_text, counters)
 
 ---
 
-## 8. Deployment
+## 10. Deployment
 
 - **Platform:** Railway
 - **Process:** `gunicorn config.wsgi:application --bind 0.0.0.0:8080 --workers 2 --timeout 120`
